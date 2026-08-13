@@ -81,6 +81,95 @@ fn rect_fs(in: RectOutput) -> @location(0) vec4<f32> {
     return in.color;
 }
 
+// ---- Decorations (chips, underline, strikethrough, squiggle) ----
+//
+// One pipeline, two draws per block: chips go under the glyphs and line
+// decorations over them. The kind switch is per decoration instance — a
+// handful per block — not per glyph, so unlike the glyph shader (where a
+// never-taken branch in the curve loop cost 25%) it is free in practice.
+//
+// `params` carries what the shape needs: a squiggle's amplitude, wavelength
+// and stroke thickness in px, a chip's corner radius in px. All coverage is
+// analytic: a signed distance in local px, divided by the px footprint of one
+// local unit (`fwidth` of the interpolated local position, taken before the
+// switch so derivatives stay in uniform control flow).
+
+const DECO_KIND_SOLID: u32 = 0u;
+const DECO_KIND_SQUIGGLE: u32 = 1u;
+const DECO_KIND_CHIP: u32 = 2u;
+
+const TAU: f32 = 6.2831853;
+
+struct DecoInstance {
+    @location(0) pos: vec2<f32>,
+    @location(1) size: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) kind: u32,
+};
+
+struct DecoOutput {
+    @builtin(position) clip: vec4<f32>,
+    // Position within the rect, in the rect's own pixels.
+    @location(0) local: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) params: vec4<f32>,
+    @location(3) @interpolate(flat) size: vec2<f32>,
+    @location(4) @interpolate(flat) kind: u32,
+};
+
+@vertex
+fn deco_vs(@builtin(vertex_index) vi: u32, inst: DecoInstance) -> DecoOutput {
+    let corner = quad_corner(vi);
+    var out: DecoOutput;
+    out.clip = to_clip(inst.pos + corner * inst.size);
+    out.local = corner * inst.size;
+    out.color = inst.color;
+    out.params = inst.params;
+    out.size = inst.size;
+    out.kind = inst.kind;
+    return out;
+}
+
+// Signed distance to a rounded rect, negative inside (Quilez's formulation).
+fn rounded_box_sdf(p: vec2<f32>, half: vec2<f32>, radius: f32) -> f32 {
+    let q = abs(p) - half + vec2<f32>(radius);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+@fragment
+fn deco_fs(in: DecoOutput) -> @location(0) vec4<f32> {
+    // Local units per pixel: 1.0 for an unscaled block. Sampled up front —
+    // derivatives may not be taken inside the switch below.
+    let aa = max(max(fwidth(in.local.x), fwidth(in.local.y)), 1e-6);
+
+    // Coverage as a signed distance, positive inside the shape.
+    var inside = aa; // a solid kind fills its rect
+    switch in.kind {
+        case DECO_KIND_SQUIGGLE: {
+            // Sine centerline through the middle of the band. The vertical
+            // distance is divided by sqrt(1 + slope²) — the first-order
+            // distance to the curve itself, which keeps the steep parts of the
+            // wave the same width as the flat parts.
+            let amplitude = in.params.x;
+            let wavelength = max(in.params.y, 1e-3);
+            let phase = in.local.x * TAU / wavelength;
+            let center = in.size.y * 0.5 + amplitude * sin(phase);
+            let slope = amplitude * cos(phase) * TAU / wavelength;
+            let dist = abs(in.local.y - center) * inverseSqrt(1.0 + slope * slope);
+            inside = in.params.z * 0.5 - dist;
+        }
+        case DECO_KIND_CHIP: {
+            let half = in.size * 0.5;
+            let radius = clamp(in.params.x, 0.0, min(half.x, half.y));
+            inside = -rounded_box_sdf(in.local - half, half, radius);
+        }
+        default: {}
+    }
+    let coverage = clamp(inside / aa + 0.5, 0.0, 1.0);
+    return vec4<f32>(in.color.rgb, in.color.a * coverage);
+}
+
 // ---- Glyphs (instanced quads sampling the atlas) ----
 
 const GLYPH_KIND_MASK: u32 = 0u;

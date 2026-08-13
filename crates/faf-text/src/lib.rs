@@ -9,6 +9,28 @@
 //!
 //! Everything is plain wgpu with WebGL2-safe choices (data textures instead of
 //! storage buffers), so the same code runs native, WebGPU, and WebGL2.
+//!
+//! # Layer order
+//!
+//! Content lives in blocks ([`TextRenderer::create_block`]), and a block draws
+//! its seven layers in this order — one draw call each, and each skipped when
+//! empty:
+//!
+//! 1. **under-rects** — selection backgrounds ([`RectLayer::Under`]).
+//! 2. **chips** — rounded-rect backgrounds ([`DecorationKind::Chip`]): inline
+//!    code, pills, tags. Behind the text they sit behind.
+//! 3. **vector glyphs** — outlines evaluated in the fragment shader.
+//! 4. **weight-blended vector glyphs** — the same, for glyphs carrying a
+//!    second variable-font master.
+//! 5. **atlas glyphs** — color emoji and anything without an outline.
+//! 6. **line decorations** — underline, strikethrough, squiggle. Over the
+//!    glyphs, so an underline crosses the descenders it passes through rather
+//!    than being hidden by them.
+//! 7. **over-rects** — highlight overlays and carets ([`RectLayer::Over`]).
+//!
+//! Layering is *within* a block; blocks composite in creation order. An
+//! underlay for a block's text therefore belongs either in that block's
+//! under-rects or in a block created before it.
 
 mod arena;
 mod atlas;
@@ -20,12 +42,12 @@ mod testing;
 mod view;
 
 pub use document::{CHUNK_LINES, DocCursor, DocStats, Document, RETAIN_CHUNKS, WINDOW_CHUNKS};
-pub use renderer::{BlockContent, BlockId, RectLayer, TextRenderer, UploadStats};
-pub use view::{Rect, TextView};
+pub use renderer::{BlockContent, BlockId, DecorationKind, RectLayer, TextRenderer, UploadStats};
+pub use view::{LineMetrics, Rect, TextView};
 
 pub use cosmic_text;
 pub use cosmic_text::{
-    Affinity, Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Weight,
+    Affinity, Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, UnderlineStyle, Weight,
 };
 
 /// Straight (non-premultiplied) RGBA color, 0..=1 per channel.

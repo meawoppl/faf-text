@@ -53,6 +53,30 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   `shape_until_scroll(&mut fs, false)` after mutations. `LayoutRun::highlight`
   has NO line-range guard — runs on lines outside the cursor range come back
   fully selected; `TextView::selection_rects` filters `line_i` for this.
+- cosmic-text 0.19 **does** carry text decorations end to end (the issue-7 spec
+  guessed it did not): `Attrs::underline(UnderlineStyle)/strikethrough()/
+  overline()` shape into `LayoutRun::decorations`, a `&[DecorationSpan]` of
+  glyph ranges plus offset/thickness **in em** (from skrifa's
+  `post`/`OS/2`). `push_run_decorations` turns those into instances, so
+  attributed text underlines itself; squiggles and chips have no attribute and
+  stay manual. Its y convention is `line_y - offset * font_size` — offsets are
+  y-up from the baseline at the *top* of the stroke.
+- swash's own copy of the same numbers (`font.as_swash().metrics(&[])`) is
+  `underline_offset` (post.underlinePosition), `strikeout_offset`
+  (OS/2.yStrikeoutPosition), `stroke_size` (post.underlineSize — post wins over
+  OS/2), all in design units, with `.scale(ppem)`/`.linear_scale(s)` to convert.
+  `view.rs` caches them per `fontdb::ID` divided by `units_per_em`, because
+  `decoration_rects` takes `&self` and `FontSystem::get_font` needs `&mut`.
+  DejaVu Sans: -40 / 530 / 90 over 2048 upem.
+- `font_system_from_fonts` scans system fonts on native, so `Family::SansSerif`
+  in a test resolves to whatever *this box* calls sans-serif (Noto Sans here),
+  not the embedded blob — tests that assert against a font's own metrics build
+  a `FontSystem::new_with_locale_and_db` over a one-face `fontdb::Database`.
+- WGSL derivatives must sit in uniform control flow, so `deco_fs` takes
+  `fwidth(local)` **before** the kind switch and every shape reduces to a
+  signed distance in local px; coverage is `clamp(d / aa + 0.5, 0, 1)`. The
+  switch itself is free — it runs per decoration instance, not per glyph, and
+  `examples/bench` is unmoved (0.643 ms/frame before and after).
 - Winding-rule shader: classify ray crossings by control-point sign pattern
   (masks 0x454/0x1510), NEVER by root-range checks — font coords are exact
   1/64 fractions and rays graze endpoints exactly (FreeMono 'p' rendered
@@ -109,6 +133,10 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   `CurveStore::relocations` (old base → new) lets compaction be patched in
   place, and the atlas's wholesale reset bumps `Atlas::generation`, which
   blanks retained atlas quads and marks those blocks stale.
+- A block owns seven arena spans, drawn in that order: under-rects, chips,
+  vector glyphs, blended glyphs, atlas glyphs, line decorations, over-rects.
+  Chips and line decorations are the same instance type and the same pipeline,
+  split into two spans purely so the glyphs can be drawn between them.
 - Per-block layering is *within* a block; blocks composite in creation order.
   A selection underlay therefore belongs in a block created *before* the text
   block, not in the text block's `under_rects` — which is why the web demo has

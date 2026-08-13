@@ -5,19 +5,60 @@
 use std::ops::Range;
 
 use faf_text::cosmic_text::{Attrs, Cursor, Family, Metrics};
-use faf_text::{BlockContent, BlockId, Color, FontSystem, Rect, TextRenderer, TextView};
+use faf_text::{
+    BlockContent, BlockId, Color, DecorationKind, FontSystem, Rect, TextRenderer, TextView,
+};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 const SELECTION: Color = Color::rgba(0.23, 0.39, 0.66, 1.0);
 const HIGHLIGHT: Color = Color::rgba(0.88, 0.69, 0.41, 0.38);
+/// Search marks that are a line rather than a wash of color want full alpha.
+const MARK: Color = Color::rgba(0.97, 0.46, 0.56, 1.0);
 const FOREGROUND: Color = Color::rgba(0.75, 0.79, 0.96, 1.0);
 const CARET: Color = Color::rgba(1.0, 0.62, 0.39, 1.0);
 const MARGIN: f32 = 24.0;
 /// The embedded variable font, whose `wght` masters the GPU can blend.
 const VARIABLE_FAMILY: &str = "Manrope";
-/// Caret thickness and composition underline thickness, in physical pixels.
+/// Caret thickness, in physical pixels.
 const CARET_WIDTH: f32 = 2.0;
+/// Corner radius of a search chip, in CSS pixels.
+const CHIP_RADIUS: f32 = 6.0;
+
+/// How a search match is marked. Everything but `Highlight` goes through the
+/// decoration pipeline.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SearchMode {
+    /// An alpha-blended rect over the glyphs — the original behaviour.
+    #[default]
+    Highlight,
+    Underline,
+    Squiggle,
+    /// A rounded chip behind... well, over: the search block composites above
+    /// the text block, so its chips read as rounded highlights.
+    Chip,
+}
+
+impl SearchMode {
+    fn parse(name: &str) -> Self {
+        match name {
+            "underline" => Self::Underline,
+            "squiggle" => Self::Squiggle,
+            "chip" => Self::Chip,
+            _ => Self::Highlight,
+        }
+    }
+
+    /// The decoration this mode draws, if it draws one.
+    fn kind(self, radius_px: f32) -> Option<DecorationKind> {
+        match self {
+            Self::Highlight => None,
+            Self::Underline => Some(DecorationKind::Underline),
+            Self::Squiggle => Some(DecorationKind::Squiggle),
+            Self::Chip => Some(DecorationKind::Chip { radius_px }),
+        }
+    }
+}
 
 /// Line separators cosmic-text splits paragraphs on, normalized to `\n` so
 /// that byte offsets in the backing string line up with buffer lines.
@@ -108,6 +149,7 @@ pub struct FafTextDemo {
     caret_visible: bool,
     dragging: bool,
     search: String,
+    search_mode: SearchMode,
     /// GPU weight blend for the whole view, and with it the family the text is
     /// shaped in: `None` is the static demo font, `Some(t)` the variable one.
     weight_blend: Option<f32>,
@@ -240,6 +282,7 @@ impl FafTextDemo {
             caret_visible: true,
             dragging: false,
             search: String::new(),
+            search_mode: SearchMode::default(),
             weight_blend: None,
             selection_block,
             text_block,
@@ -304,6 +347,18 @@ impl FafTextDemo {
             return;
         }
         self.search = needle.to_string();
+        self.dirty.search = true;
+    }
+
+    /// How search matches are marked: `highlight` (an alpha-blended rect over
+    /// the glyphs), or `underline`, `squiggle` or `chip` — the same cursor
+    /// ranges routed through the decoration pipeline instead.
+    pub fn set_search_mode(&mut self, mode: &str) {
+        let mode = SearchMode::parse(mode);
+        if self.search_mode == mode {
+            return;
+        }
+        self.search_mode = mode;
         self.dirty.search = true;
     }
 
@@ -621,15 +676,37 @@ impl FafTextDemo {
         }
 
         if std::mem::take(&mut self.dirty.search) {
+            // One cursor range per match, drawn as whichever primitive the
+            // mode picked: a rect over the glyphs, a line decoration, or a
+            // chip. Every mode is the same geometry — only the layer and the
+            // shape differ.
+            let radius = CHIP_RADIUS * self.dpr;
+            let kind = self.search_mode.kind(radius);
             let mut rects: Vec<(Rect, Color)> = Vec::new();
+            let mut chips: Vec<(Rect, f32, Color)> = Vec::new();
+            let mut decorations: Vec<(Rect, DecorationKind, Color)> = Vec::new();
             if !self.search.is_empty() {
                 for (a, b) in self.view.find_all(&self.search) {
-                    rects.extend(
-                        self.view
-                            .selection_rects(a, b)
-                            .into_iter()
-                            .map(|r| (self.local(r), HIGHLIGHT)),
-                    );
+                    match kind {
+                        None => rects.extend(
+                            self.view
+                                .selection_rects(a, b)
+                                .into_iter()
+                                .map(|r| (self.local(r), HIGHLIGHT)),
+                        ),
+                        Some(DecorationKind::Chip { .. }) => chips.extend(
+                            self.view
+                                .decoration_rects(a, b, DecorationKind::Chip { radius_px: radius })
+                                .into_iter()
+                                .map(|r| (self.local(r), radius, HIGHLIGHT)),
+                        ),
+                        Some(kind) => decorations.extend(
+                            self.view
+                                .decoration_rects(a, b, kind)
+                                .into_iter()
+                                .map(|r| (self.local(r), kind, MARK)),
+                        ),
+                    }
                 }
             }
             self.renderer.set_block_content(
@@ -638,6 +715,8 @@ impl FafTextDemo {
                 self.search_block,
                 &BlockContent {
                     over_rects: &rects,
+                    chips: &chips,
+                    decorations: &decorations,
                     ..Default::default()
                 },
             );
@@ -645,17 +724,18 @@ impl FafTextDemo {
 
         if std::mem::take(&mut self.dirty.caret) {
             let mut rects: Vec<(Rect, Color)> = Vec::new();
+            let mut decorations: Vec<(Rect, DecorationKind, Color)> = Vec::new();
             // IME preedit: underline the composing run so it reads as
-            // provisional.
+            // provisional. A real underline decoration, so it sits where the
+            // face wants it rather than at the bottom of the line box.
             if let Some(range) = self.composition.clone() {
                 let start = cursor_of(&self.text, range.start);
                 let end = cursor_of(&self.text, range.end);
-                for r in self.view.selection_rects(start, end) {
-                    let r = self.local(r);
-                    rects.push((
-                        [r[0], r[1] + r[3] - CARET_WIDTH, r[2], CARET_WIDTH],
-                        FOREGROUND,
-                    ));
+                for r in self
+                    .view
+                    .decoration_rects(start, end, DecorationKind::Underline)
+                {
+                    decorations.push((self.local(r), DecorationKind::Underline, FOREGROUND));
                 }
             }
             if let Some(r) = self
@@ -672,6 +752,7 @@ impl FafTextDemo {
                 self.caret_block,
                 &BlockContent {
                     over_rects: &rects,
+                    decorations: &decorations,
                     ..Default::default()
                 },
             );

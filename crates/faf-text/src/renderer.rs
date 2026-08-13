@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use cosmic_text::{Buffer, CacheKey, FontSystem};
+use cosmic_text::{Buffer, CacheKey, FontSystem, LayoutRun, UnderlineStyle};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Color;
@@ -80,6 +80,94 @@ struct VectorGlyphInstance {
     b_first: u32,
 }
 
+/// A decoration's shape. Every kind draws from one pipeline, so a block's
+/// decorations cost two draws however many shapes they mix.
+///
+/// Geometry comes from [`crate::TextView::decoration_rects`], which anchors
+/// the line kinds to the baseline using the font's own metrics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecorationKind {
+    /// A solid bar, drawn at the font's underline offset.
+    Underline,
+    /// A solid bar, drawn at the font's strikeout offset.
+    Strikethrough,
+    /// A sine wave — the diagnostics squiggle. Its stroke thickness,
+    /// amplitude and wavelength all follow from the height of the rect it is
+    /// given, so it scales with the text without a second set of knobs.
+    Squiggle,
+    /// A rounded-rect background: inline code, pills, tags. Drawn *under* the
+    /// glyphs, unlike the line kinds.
+    Chip { radius_px: f32 },
+}
+
+impl DecorationKind {
+    /// True for the kinds that draw behind the glyphs.
+    fn is_chip(self) -> bool {
+        matches!(self, DecorationKind::Chip { .. })
+    }
+}
+
+/// One decoration instance: a rect, a shape, and the shape's parameters.
+///
+/// `pos`/`size` are the box the shape is drawn in — for a solid bar that is
+/// the bar itself, for a squiggle the band its wave sweeps, for a chip the
+/// chip. `params` carries what the fragment shader needs beyond the box.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
+struct DecorationInstance {
+    pos: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+    /// Squiggle: amplitude, wavelength, stroke thickness (px). Chip: corner
+    /// radius (px). Unused by the solid kinds.
+    params: [f32; 4],
+    kind: u32,
+    _pad: [u32; 3],
+}
+
+// Shape codes, matching `DECO_KIND_*` in shaders.wgsl.
+const DECO_SOLID: u32 = 0;
+const DECO_SQUIGGLE: u32 = 1;
+const DECO_CHIP: u32 = 2;
+
+/// A squiggle's stroke thickness as a fraction of the band it is given, which
+/// leaves the same fraction again for the amplitude above and below the
+/// centerline: `thickness + 2 * amplitude` is exactly the band.
+const SQUIGGLE_THICKNESS: f32 = 1.0 / 3.0;
+/// A squiggle's wavelength, in band heights. Six stroke widths per period is
+/// the diagnostics-underline look.
+const SQUIGGLE_WAVELENGTH: f32 = 2.0;
+
+impl DecorationInstance {
+    fn new(rect: Rect, kind: DecorationKind, color: Color) -> Self {
+        let (code, params) = match kind {
+            DecorationKind::Underline | DecorationKind::Strikethrough => (DECO_SOLID, [0.0; 4]),
+            DecorationKind::Squiggle => {
+                let thickness = rect[3] * SQUIGGLE_THICKNESS;
+                let amplitude = (rect[3] - thickness) * 0.5;
+                (
+                    DECO_SQUIGGLE,
+                    [
+                        amplitude,
+                        rect[3] * SQUIGGLE_WAVELENGTH,
+                        thickness.max(1.0),
+                        0.0,
+                    ],
+                )
+            }
+            DecorationKind::Chip { radius_px } => (DECO_CHIP, [radius_px, 0.0, 0.0, 0.0]),
+        };
+        Self {
+            pos: [rect[0], rect[1]],
+            size: [rect[2], rect[3]],
+            color: color.0,
+            params,
+            kind: code,
+            _pad: [0; 3],
+        }
+    }
+}
+
 /// Which side of the text a rect layer renders on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RectLayer {
@@ -92,12 +180,19 @@ pub enum RectLayer {
 // The draw layers a block owns, in the order they render. Layering is
 // *within* a block: blocks themselves composite in insertion order, so a
 // selection underlay for text in block B belongs in a block created before B.
+//
+// Chips sit between the selection underlay and the glyphs (an inline-code
+// background belongs behind its text), and line decorations between the glyphs
+// and the highlight overlay (an underline belongs in front of the descenders
+// it crosses). Both feed the same pipeline, in two draws.
 const UNDER: usize = 0;
-const VECTOR: usize = 1;
-const BLEND: usize = 2;
-const ATLAS: usize = 3;
-const OVER: usize = 4;
-const LAYERS: usize = 5;
+const CHIPS: usize = 1;
+const VECTOR: usize = 2;
+const BLEND: usize = 3;
+const ATLAS: usize = 4;
+const LINE_DECOS: usize = 5;
+const OVER: usize = 6;
+const LAYERS: usize = 7;
 
 /// Handle to a retained block of content. Blocks composite in creation order,
 /// so creation order is z-order.
@@ -120,6 +215,14 @@ pub struct BlockContent<'a> {
     pub weight: Option<f32>,
     /// Rects drawn under this block's glyphs — selection backgrounds.
     pub under_rects: &'a [(Rect, Color)],
+    /// Rounded-rect chips drawn under this block's glyphs, after the
+    /// under-rects: inline-code backgrounds, pills, tags. Each entry is a
+    /// rect, a corner radius in px, and a color.
+    pub chips: &'a [(Rect, f32, Color)],
+    /// Underlines, strikethroughs and squiggles drawn over this block's
+    /// glyphs. A [`DecorationKind::Chip`] listed here still draws in the chip
+    /// layer, under the glyphs, where a background belongs.
+    pub decorations: &'a [(Rect, DecorationKind, Color)],
     /// Rects drawn over this block's glyphs — highlight overlays, carets.
     pub over_rects: &'a [(Rect, Color)],
 }
@@ -132,6 +235,8 @@ impl Default for BlockContent<'_> {
             default_color: Color::WHITE,
             weight: None,
             under_rects: &[],
+            chips: &[],
+            decorations: &[],
             over_rects: &[],
         }
     }
@@ -209,6 +314,8 @@ impl Block {
 struct Scratch {
     under: Vec<RectInstance>,
     over: Vec<RectInstance>,
+    chips: Vec<DecorationInstance>,
+    line_decos: Vec<DecorationInstance>,
     atlas: Vec<AtlasGlyphInstance>,
     vector: Vec<VectorGlyphInstance>,
     blend: Vec<VectorGlyphInstance>,
@@ -225,6 +332,8 @@ impl Scratch {
     fn clear(&mut self) {
         self.under.clear();
         self.over.clear();
+        self.chips.clear();
+        self.line_decos.clear();
         self.atlas.clear();
         self.vector.clear();
         self.blend.clear();
@@ -237,9 +346,11 @@ impl Scratch {
     fn counts(&self) -> [u32; LAYERS] {
         let mut counts = [0; LAYERS];
         counts[UNDER] = self.under.len() as u32;
+        counts[CHIPS] = self.chips.len() as u32;
         counts[VECTOR] = self.vector.len() as u32;
         counts[BLEND] = self.blend.len() as u32;
         counts[ATLAS] = self.atlas.len() as u32;
+        counts[LINE_DECOS] = self.line_decos.len() as u32;
         counts[OVER] = self.over.len() as u32;
         counts
     }
@@ -260,6 +371,8 @@ impl Scratch {
 /// internal block that is rebuilt every frame.
 pub struct TextRenderer {
     rect_pipeline: wgpu::RenderPipeline,
+    /// Chips and line decorations both draw with this one.
+    deco_pipeline: wgpu::RenderPipeline,
     atlas_pipeline: wgpu::RenderPipeline,
     vector_pipeline: wgpu::RenderPipeline,
     /// Same shaders with `BLEND_MASTERS` on, for the glyphs that have a
@@ -480,6 +593,7 @@ impl TextRenderer {
         };
 
         let rect_stride = std::mem::size_of::<RectInstance>();
+        let deco_stride = std::mem::size_of::<DecorationInstance>();
         let atlas_stride = std::mem::size_of::<AtlasGlyphInstance>();
         let vector_stride = std::mem::size_of::<VectorGlyphInstance>();
 
@@ -489,6 +603,16 @@ impl TextRenderer {
             "rect_fs",
             rect_stride as u64,
             &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+            &[],
+        );
+        let deco_pipeline = make_pipeline(
+            "faf-text decorations",
+            "deco_vs",
+            "deco_fs",
+            deco_stride as u64,
+            &wgpu::vertex_attr_array![
+                0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32
+            ],
             &[],
         );
         let atlas_pipeline = make_pipeline(
@@ -526,6 +650,7 @@ impl TextRenderer {
 
         let mut renderer = Self {
             rect_pipeline,
+            deco_pipeline,
             atlas_pipeline,
             vector_pipeline,
             blend_pipeline,
@@ -550,9 +675,11 @@ impl TextRenderer {
             curves,
             arenas: [
                 Arena::new("faf-text under rects", rect_stride),
+                Arena::new("faf-text chips", deco_stride),
                 Arena::new("faf-text vector glyphs", vector_stride),
                 Arena::new("faf-text blended glyphs", vector_stride),
                 Arena::new("faf-text atlas glyphs", atlas_stride),
+                Arena::new("faf-text line decorations", deco_stride),
                 Arena::new("faf-text over rects", rect_stride),
             ],
             blocks: FxHashMap::default(),
@@ -623,6 +750,12 @@ impl TextRenderer {
         }
         for &(rect, color) in content.over_rects {
             self.push_rect(rect, color, RectLayer::Over);
+        }
+        for &(rect, radius_px, color) in content.chips {
+            self.push_decoration(rect, DecorationKind::Chip { radius_px }, color);
+        }
+        for &(rect, kind, color) in content.decorations {
+            self.push_decoration(rect, kind, color);
         }
         if let Some(buffer) = content.buffer {
             self.push_text(
@@ -747,6 +880,20 @@ impl TextRenderer {
         self.transient_pending = true;
     }
 
+    /// Queue a decoration. Chips draw under the frame's glyphs, the line kinds
+    /// over them; [`crate::TextView::decoration_rects`] produces the geometry.
+    pub fn decoration(&mut self, rect: Rect, kind: DecorationKind, color: Color) {
+        self.push_decoration(rect, kind, color);
+        self.transient_pending = true;
+    }
+
+    /// Queue a rounded-rect chip under the glyphs — an inline-code background
+    /// or a pill. Shorthand for [`TextRenderer::decoration`] with
+    /// [`DecorationKind::Chip`].
+    pub fn chip(&mut self, rect: Rect, radius_px: f32, color: Color) {
+        self.decoration(rect, DecorationKind::Chip { radius_px }, color);
+    }
+
     /// Queue every glyph of a shaped buffer at `pos` (its top-left corner).
     ///
     /// Glyphs with outlines take the GPU vector path at exact fractional
@@ -835,15 +982,21 @@ impl TextRenderer {
     }
 
     /// Record draws into an open render pass: every visible block in creation
-    /// order, and within a block its selection rects, vector glyphs, atlas
-    /// glyphs and overlay rects.
+    /// order, and within a block the seven layers in the order listed on
+    /// [`TextRenderer`] — under-rects, chips, vector glyphs, weight-blended
+    /// glyphs, atlas glyphs, line decorations, over-rects.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(0, &self.bind_group, &[]);
+        // One entry per layer, in draw order: under-rects, chips, vector
+        // glyphs, weight-blended glyphs, atlas glyphs, line decorations,
+        // over-rects.
         let pipelines = [
             &self.rect_pipeline,
+            &self.deco_pipeline,
             &self.vector_pipeline,
             &self.blend_pipeline,
             &self.atlas_pipeline,
+            &self.deco_pipeline,
             &self.rect_pipeline,
         ];
         for id in &self.order {
@@ -889,6 +1042,15 @@ impl TextRenderer {
         }
     }
 
+    fn push_decoration(&mut self, rect: Rect, kind: DecorationKind, color: Color) {
+        let inst = DecorationInstance::new(rect, kind, color);
+        if kind.is_chip() {
+            self.scratch.chips.push(inst);
+        } else {
+            self.scratch.line_decos.push(inst);
+        }
+    }
+
     fn push_text(
         &mut self,
         queue: &wgpu::Queue,
@@ -900,6 +1062,7 @@ impl TextRenderer {
     ) {
         for run in buffer.layout_runs() {
             let baseline_y = pos[1] + run.line_y;
+            self.push_run_decorations(&run, pos, default_color);
             for glyph in run.glyphs.iter() {
                 let color = glyph
                     .color_opt
@@ -992,6 +1155,88 @@ impl TextRenderer {
         }
     }
 
+    /// Emit the solid lines the *attributes* asked for. cosmic-text 0.19 shapes
+    /// `Attrs::underline`/`strikethrough`/`overline` into per-run
+    /// [`DecorationSpan`]s carrying the face's own offset and thickness in em,
+    /// so styled text underlines itself with no help from the caller — the
+    /// manual [`TextRenderer::decoration`] path is for what attrs cannot say
+    /// (squiggles, chips, spans that are not attribute runs).
+    fn push_run_decorations(&mut self, run: &LayoutRun<'_>, pos: [f32; 2], default_color: Color) {
+        for span in run.decorations {
+            let Some(glyphs) = run.glyphs.get(span.glyph_range.clone()) else {
+                continue;
+            };
+            // Glyph x is already visual, so the extent is right under BiDi.
+            let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
+            for glyph in glyphs {
+                x0 = x0.min(glyph.x);
+                x1 = x1.max(glyph.x + glyph.w);
+            }
+            if x1 <= x0 {
+                continue;
+            }
+            let (x, w) = (pos[0] + x0, x1 - x0);
+            let baseline_y = pos[1] + run.line_y;
+            let size = span.font_size;
+            let deco = &span.data;
+            let color = |explicit: Option<cosmic_text::Color>| {
+                explicit
+                    .or(span.color_opt)
+                    .map(Color::from_cosmic)
+                    .unwrap_or(default_color)
+            };
+            // Offsets are em, y-up from the baseline; thickness is em too, and
+            // never rounds away to nothing.
+            let bar = |metrics: &cosmic_text::DecorationMetrics| {
+                let thickness = (metrics.thickness * size).max(1.0);
+                (baseline_y - metrics.offset * size, thickness)
+            };
+
+            let underlines = match deco.text_decoration.underline {
+                UnderlineStyle::None => 0,
+                UnderlineStyle::Single => 1,
+                UnderlineStyle::Double => 2,
+            };
+            if underlines > 0 {
+                let (y, thickness) = bar(&deco.underline_metrics);
+                let color = color(deco.text_decoration.underline_color_opt);
+                for i in 0..underlines {
+                    // The gap between a double underline's two bars is one
+                    // bar, which is what cosmic-text's own renderer draws.
+                    let y = y + i as f32 * thickness * 2.0;
+                    self.push_solid_line([x, y, w, thickness], color);
+                }
+            }
+            if deco.text_decoration.strikethrough {
+                let (y, thickness) = bar(&deco.strikethrough_metrics);
+                self.push_solid_line(
+                    [x, y, w, thickness],
+                    color(deco.text_decoration.strikethrough_color_opt),
+                );
+            }
+            if deco.text_decoration.overline {
+                let thickness = (deco.underline_metrics.thickness * size).max(1.0);
+                // Clamped into the line box, like cosmic-text's renderer: a
+                // tall ascent would otherwise overline the row above.
+                let y = (baseline_y - deco.ascent * size).max(pos[1] + run.line_top);
+                self.push_solid_line(
+                    [x, y, w, thickness],
+                    color(deco.text_decoration.overline_color_opt),
+                );
+            }
+        }
+    }
+
+    /// A solid bar in the line-decoration layer. Underline, strikeout and
+    /// overline differ only in where the rect is.
+    fn push_solid_line(&mut self, rect: Rect, color: Color) {
+        self.scratch.line_decos.push(DecorationInstance::new(
+            rect,
+            DecorationKind::Underline,
+            color,
+        ));
+    }
+
     /// Move the staged instances into a block's arena ranges.
     fn commit(&mut self, id: BlockId) {
         {
@@ -1015,9 +1260,11 @@ impl TextRenderer {
                 arenas[layer].alloc(&mut block.spans[layer], count);
             }
             arenas[UNDER].write(block.spans[UNDER], &scratch.under);
+            arenas[CHIPS].write(block.spans[CHIPS], &scratch.chips);
             arenas[VECTOR].write(block.spans[VECTOR], &scratch.vector);
             arenas[BLEND].write(block.spans[BLEND], &scratch.blend);
             arenas[ATLAS].write(block.spans[ATLAS], &scratch.atlas);
+            arenas[LINE_DECOS].write(block.spans[LINE_DECOS], &scratch.line_decos);
             arenas[OVER].write(block.spans[OVER], &scratch.over);
             block.content_dirty = true;
             block.stale = scratch.stale;
@@ -1267,7 +1514,9 @@ mod tests {
     use super::*;
     use crate::curves::CURVE_TEX_WIDTH;
     use crate::testing;
-    use crate::{Attrs, Family, Metrics, TextView};
+    use crate::{Attrs, Cursor, Family, Metrics, TextView, UnderlineStyle};
+
+    const RED: Color = Color::rgba(1.0, 0.0, 0.0, 1.0);
 
     const W: u32 = 220;
     const H: u32 = 220;
@@ -1762,6 +2011,189 @@ mod tests {
         assert_eq!(
             before, after,
             "a retained block must survive a curve relocation"
+        );
+    }
+
+    // ---- Decorations ----
+
+    /// Red channel of one pixel.
+    fn at(pixels: &[u8], x: u32, y: u32) -> u8 {
+        pixels[((y * W + x) * 4) as usize]
+    }
+
+    /// Pixels that came out fully lit — glyph interiors, and nothing that has
+    /// been blended over.
+    fn pure_white(pixels: &[u8]) -> usize {
+        pixels
+            .chunks_exact(4)
+            .filter(|px| px[..3] == [255, 255, 255])
+            .count()
+    }
+
+    #[test]
+    fn decoration_instances_encode_their_shape_parameters() {
+        let mut renderer = renderer(2048, 2048);
+        renderer.begin();
+        renderer.chip([10.0, 20.0, 60.0, 24.0], 6.0, Color::WHITE);
+        renderer.decoration(
+            [10.0, 50.0, 60.0, 2.0],
+            DecorationKind::Underline,
+            Color::WHITE,
+        );
+        renderer.decoration([10.0, 60.0, 60.0, 9.0], DecorationKind::Squiggle, RED);
+
+        assert_eq!(renderer.scratch.chips.len(), 1, "a chip is not a line");
+        assert_eq!(renderer.scratch.line_decos.len(), 2);
+
+        let chip = renderer.scratch.chips[0];
+        assert_eq!(chip.kind, DECO_CHIP);
+        assert_eq!([chip.pos, chip.size], [[10.0, 20.0], [60.0, 24.0]]);
+        assert_eq!(chip.params, [6.0, 0.0, 0.0, 0.0], "corner radius, px");
+
+        let underline = renderer.scratch.line_decos[0];
+        assert_eq!(underline.kind, DECO_SOLID);
+        assert_eq!(underline.params, [0.0; 4], "a bar is just its rect");
+
+        // A 9 px band is a 3 px stroke swinging 3 px either side of the
+        // centerline, over an 18 px period.
+        let squiggle = renderer.scratch.line_decos[1];
+        assert_eq!(squiggle.kind, DECO_SQUIGGLE);
+        assert_eq!(squiggle.params, [3.0, 18.0, 3.0, 0.0]);
+        assert_eq!(squiggle.color, RED.0);
+    }
+
+    #[test]
+    fn chips_draw_under_the_glyphs_and_line_decorations_over_them() {
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Ag", 40.0, [6.0, 6.0]);
+        let mut renderer = renderer(2048, 2048);
+        let (_, queue) = testing::gpu();
+        // Comfortably around the glyphs.
+        let over_the_text = [0.0, 0.0, 120.0, 60.0];
+
+        let mut draw = |chip: bool, line: bool, renderer: &mut TextRenderer| {
+            renderer.begin();
+            if chip {
+                renderer.chip(over_the_text, 0.0, RED);
+            }
+            renderer.text(
+                queue,
+                &mut font_system,
+                &sample.buffer,
+                sample.pos,
+                Color::WHITE,
+            );
+            if line {
+                renderer.decoration(over_the_text, DecorationKind::Underline, RED);
+            }
+            testing::render_pixels(renderer, W, H)
+        };
+
+        let text_only = draw(false, false, &mut renderer);
+        let chipped = draw(true, false, &mut renderer);
+        let covered = draw(false, true, &mut renderer);
+
+        assert!(pure_white(&text_only) > 0, "the glyphs drew something");
+        assert_eq!(
+            pure_white(&chipped),
+            pure_white(&text_only),
+            "a chip goes behind the glyphs, so their interiors stay white"
+        );
+        assert!(
+            at(&chipped, 118, 58) > 128,
+            "and the chip itself covers the rest of its rect"
+        );
+        assert_eq!(
+            pure_white(&covered),
+            0,
+            "an opaque line decoration goes in front of the glyphs"
+        );
+    }
+
+    #[test]
+    fn a_chip_rounds_its_corners_and_a_squiggle_waves() {
+        let mut renderer = renderer(2048, 2048);
+        renderer.begin();
+        // 100x60 at (20, 20), corners rounded by a third of the height.
+        renderer.chip([20.0, 20.0, 100.0, 60.0], 20.0, Color::WHITE);
+        // A 12 px band at (20, 100): a 4 px stroke, 4 px of swing, 24 px period.
+        renderer.decoration([20.0, 100.0, 120.0, 12.0], DecorationKind::Squiggle, RED);
+        let px = testing::render_pixels(&mut renderer, W, H);
+
+        assert_eq!(at(&px, 70, 50), 255, "the middle of a chip is solid");
+        assert_eq!(at(&px, 70, 21), 255, "so is its edge between the corners");
+        assert_eq!(at(&px, 22, 50), 255, "and its side");
+        for (x, y) in [(21, 21), (118, 21), (21, 78), (118, 78)] {
+            assert_eq!(at(&px, x, y), 0, "corner ({x}, {y}) should be rounded off");
+        }
+
+        // A quarter period in, the wave is at the bottom of its band; three
+        // quarters in, the top. A solid bar would light both rows at both x.
+        assert!(at(&px, 26, 110) > 128 && at(&px, 26, 102) < 128, "crest");
+        assert!(at(&px, 38, 102) > 128 && at(&px, 38, 110) < 128, "trough");
+    }
+
+    #[test]
+    fn attribute_decorations_shape_themselves() {
+        let mut font_system = testing::font_system();
+        let plain = Attrs::new().family(Family::SansSerif);
+        let mut sample = TextView::new(&mut font_system, Metrics::new(40.0, 50.0));
+        sample.pos = [6.0, 6.0];
+        sample.set_rich_text(
+            &mut font_system,
+            [
+                ("plain ", plain.clone()),
+                ("under", plain.clone().underline(UnderlineStyle::Single)),
+                (" struck", plain.clone().strikethrough()),
+            ],
+            &plain,
+        );
+
+        let mut renderer = renderer(2048, 2048);
+        let (_, queue) = testing::gpu();
+        renderer.begin();
+        renderer.text(
+            queue,
+            &mut font_system,
+            &sample.buffer,
+            sample.pos,
+            Color::WHITE,
+        );
+
+        assert_eq!(
+            renderer.scratch.line_decos.len(),
+            2,
+            "one bar per decorated span, none for the plain one"
+        );
+        let (underline, strike) = (
+            renderer.scratch.line_decos[0],
+            renderer.scratch.line_decos[1],
+        );
+        let baseline = sample.pos[1] + sample.buffer.layout_runs().next().unwrap().line_y;
+        assert!(
+            underline.pos[1] > baseline,
+            "underlines go below the baseline"
+        );
+        assert!(strike.pos[1] < baseline, "strikeouts cross the glyphs");
+        assert!(underline.pos[0] < strike.pos[0], "spans keep their order");
+        assert!(
+            underline.pos[0] > sample.pos[0],
+            "the plain span is not underlined"
+        );
+
+        // The attribute path (cosmic-text's shaped metrics) and the manual one
+        // (this crate's swash cache) must land the bar in the same place.
+        let manual = sample.decoration_rects(
+            Cursor::new(0, 6),
+            Cursor::new(0, 11),
+            DecorationKind::Underline,
+        );
+        assert_eq!(manual.len(), 1);
+        assert!(
+            (manual[0][1] - underline.pos[1]).abs() < 0.01
+                && (manual[0][0] - underline.pos[0]).abs() < 0.01
+                && (manual[0][2] - underline.size[0]).abs() < 0.01,
+            "manual {manual:?} vs attribute {underline:?}"
         );
     }
 

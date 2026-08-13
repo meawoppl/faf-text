@@ -1,8 +1,58 @@
-use cosmic_text::{Affinity, Attrs, Buffer, Cursor, FontSystem, LayoutRun, Metrics, Shaping};
+use cosmic_text::{
+    Affinity, Attrs, Buffer, Cursor, FontSystem, LayoutRun, Metrics, Shaping, fontdb,
+};
+use rustc_hash::FxHashMap;
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::renderer::DecorationKind;
 
 /// A positioned rectangle in screen pixels: [x, y, width, height].
 pub type Rect = [f32; 4];
+
+/// Where a face wants its decoration lines, in em units — multiply by a run's
+/// font size for pixels.
+///
+/// Offsets are y-up from the baseline and mark the **top** of the stroke,
+/// which is swash's convention (`Metrics::underline_offset`,
+/// `strikeout_offset`, `stroke_size`): an underline offset is negative
+/// (below the baseline), a strikeout offset positive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineMetrics {
+    pub underline_offset: f32,
+    pub strikeout_offset: f32,
+    pub thickness: f32,
+}
+
+impl LineMetrics {
+    /// What a face that declares no decoration metrics gets: an underline a
+    /// tenth of an em below the baseline, a strikeout a little above the
+    /// x-height's middle, both 0.06 em thick.
+    pub const FALLBACK: LineMetrics = LineMetrics {
+        underline_offset: -0.1,
+        strikeout_offset: 0.28,
+        thickness: 0.06,
+    };
+
+    /// Read a face's metrics, in em. swash reports them in design units, so
+    /// everything is divided by the head table's units per em; a field the
+    /// face leaves at zero falls back rather than collapsing the decoration.
+    fn of_font(font: &cosmic_text::Font) -> Self {
+        let metrics = font.as_swash().metrics(&[]);
+        let upem = f32::from(metrics.units_per_em);
+        if upem <= 0.0 {
+            return Self::FALLBACK;
+        }
+        let em = |value: f32, fallback: f32| {
+            let value = value / upem;
+            if value == 0.0 { fallback } else { value }
+        };
+        Self {
+            underline_offset: em(metrics.underline_offset, Self::FALLBACK.underline_offset),
+            strikeout_offset: em(metrics.strikeout_offset, Self::FALLBACK.strikeout_offset),
+            thickness: em(metrics.stroke_size, Self::FALLBACK.thickness),
+        }
+    }
+}
 
 /// Where a cursor lands on a laid-out visual row.
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +108,20 @@ fn run_caret_x(run: &LayoutRun, index: usize) -> f32 {
     if run.rtl { 0.0 } else { run.line_w }
 }
 
+/// The glyph a decoration over `[x, x + width)` should take its metrics from:
+/// the largest one the span covers, which is the one a reader's eye follows.
+fn dominant_glyph<'a>(
+    run: &LayoutRun<'a>,
+    x: f32,
+    width: f32,
+) -> Option<&'a cosmic_text::LayoutGlyph> {
+    run.glyphs
+        .iter()
+        .filter(|g| g.x < x + width && g.x + g.w > x)
+        .max_by(|a, b| a.font_size.total_cmp(&b.font_size))
+        .or_else(|| run.glyphs.first())
+}
+
 /// True when a piece of text carries no word content (pure whitespace).
 fn is_blank(s: &str) -> bool {
     s.chars().all(char::is_whitespace)
@@ -69,6 +133,11 @@ pub struct TextView {
     pub buffer: Buffer,
     /// Top-left corner in screen pixels.
     pub pos: [f32; 2],
+    /// Decoration metrics of every face the shaped text uses, keyed by
+    /// `fontdb::ID`. Filled in after each re-shape, because
+    /// [`TextView::decoration_rects`] takes `&self` and reading a face's
+    /// metrics needs the font system.
+    line_metrics: FxHashMap<fontdb::ID, LineMetrics>,
 }
 
 impl TextView {
@@ -76,12 +145,30 @@ impl TextView {
         Self {
             buffer: Buffer::new(font_system, metrics),
             pos: [0.0, 0.0],
+            line_metrics: FxHashMap::default(),
         }
     }
 
     pub fn set_text(&mut self, font_system: &mut FontSystem, text: &str, attrs: &Attrs) {
         self.buffer.set_text(text, attrs, Shaping::Advanced, None);
-        self.buffer.shape_until_scroll(font_system, false);
+        self.reshaped(font_system);
+    }
+
+    /// Shape a run of differently attributed spans. Attributes that carry a
+    /// text decoration (`Attrs::underline`, `strikethrough`, `overline`) draw
+    /// themselves — [`crate::TextRenderer`] turns the shaped decoration spans
+    /// into instances with no further help.
+    pub fn set_rich_text<'r, 's, I>(
+        &mut self,
+        font_system: &mut FontSystem,
+        spans: I,
+        default_attrs: &Attrs<'_>,
+    ) where
+        I: IntoIterator<Item = (&'s str, Attrs<'r>)>,
+    {
+        self.buffer
+            .set_rich_text(spans, default_attrs, Shaping::Advanced, None);
+        self.reshaped(font_system);
     }
 
     /// Constrain layout width/height (px) and re-shape.
@@ -92,12 +179,43 @@ impl TextView {
         height: Option<f32>,
     ) {
         self.buffer.set_size(width, height);
-        self.buffer.shape_until_scroll(font_system, false);
+        self.reshaped(font_system);
     }
 
     pub fn set_metrics(&mut self, font_system: &mut FontSystem, metrics: Metrics) {
         self.buffer.set_metrics(metrics);
+        self.reshaped(font_system);
+    }
+
+    /// Lay the buffer out and top up the decoration-metrics cache with any
+    /// face the new layout brought in. Faces already cached are not read
+    /// again, so a re-shape of the same text is one hash lookup per glyph.
+    fn reshaped(&mut self, font_system: &mut FontSystem) {
         self.buffer.shape_until_scroll(font_system, false);
+        let mut missing: Vec<(fontdb::ID, fontdb::Weight)> = Vec::new();
+        for run in self.buffer.layout_runs() {
+            for glyph in run.glyphs {
+                if !self.line_metrics.contains_key(&glyph.font_id)
+                    && !missing.iter().any(|&(id, _)| id == glyph.font_id)
+                {
+                    missing.push((glyph.font_id, glyph.font_weight));
+                }
+            }
+        }
+        for (id, weight) in missing {
+            let metrics = font_system
+                .get_font(id, weight)
+                .map_or(LineMetrics::FALLBACK, |font| LineMetrics::of_font(&font));
+            self.line_metrics.insert(id, metrics);
+        }
+    }
+
+    /// The decoration metrics cached for a face, or the fallbacks.
+    pub fn line_metrics(&self, font_id: fontdb::ID) -> LineMetrics {
+        self.line_metrics
+            .get(&font_id)
+            .copied()
+            .unwrap_or(LineMetrics::FALLBACK)
     }
 
     /// Map a screen-pixel position to the closest text cursor.
@@ -123,6 +241,58 @@ impl TextView {
                     width,
                     run.line_height,
                 ]);
+            }
+        }
+        rects
+    }
+
+    /// Screen-pixel rectangles to draw `kind` over the text between two
+    /// cursors (any order) — the same BiDi-aware, one-per-run spans
+    /// [`Self::selection_rects`] produces, but anchored to the baseline at the
+    /// offset and thickness the face asks for.
+    ///
+    /// The line kinds come back as the bar (or, for a squiggle, the band its
+    /// wave sweeps) and nothing more; a chip comes back as the whole line box,
+    /// which is what an inline-code background wants. Feed the rects to
+    /// [`crate::TextRenderer::decoration`].
+    ///
+    /// Metrics are per span, from the largest glyph the span covers on that
+    /// run, so a decoration under mixed sizes follows the text that dominates
+    /// it.
+    pub fn decoration_rects(&self, a: Cursor, b: Cursor, kind: DecorationKind) -> Vec<Rect> {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let fallback_size = self.buffer.metrics().font_size;
+        let mut rects = Vec::new();
+        for run in self.buffer.layout_runs() {
+            // Same guard as selection_rects: highlight() trusts the caller to
+            // have checked that the run's line is in range.
+            if run.line_i < start.line || run.line_i > end.line {
+                continue;
+            }
+            for (x, width) in run.highlight(start, end) {
+                let (font_id, size) = dominant_glyph(&run, x, width)
+                    .map_or((None, fallback_size), |g| (Some(g.font_id), g.font_size));
+                let metrics = font_id.map_or(LineMetrics::FALLBACK, |id| self.line_metrics(id));
+                let baseline = self.pos[1] + run.line_y;
+                // A sub-pixel bar would blink in and out along the line.
+                let thickness = (metrics.thickness * size).max(1.0);
+                let (y, height) = match kind {
+                    DecorationKind::Underline => {
+                        (baseline - metrics.underline_offset * size, thickness)
+                    }
+                    DecorationKind::Strikethrough => {
+                        (baseline - metrics.strikeout_offset * size, thickness)
+                    }
+                    // The band is three strokes tall — one for the stroke,
+                    // one for the swing either side of it — and is centered
+                    // on where the underline would have sat.
+                    DecorationKind::Squiggle => {
+                        let center = baseline - metrics.underline_offset * size + thickness * 0.5;
+                        (center - thickness * 1.5, thickness * 3.0)
+                    }
+                    DecorationKind::Chip { .. } => (self.pos[1] + run.line_top, run.line_height),
+                };
+                rects.push([self.pos[0] + x, y, width, height]);
             }
         }
         rects

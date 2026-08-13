@@ -1,5 +1,5 @@
-use faf_text::TextView;
-use faf_text::cosmic_text::{Affinity, Attrs, Cursor, Family, Metrics};
+use faf_text::cosmic_text::{Affinity, Attrs, Cursor, Family, Metrics, fontdb};
+use faf_text::{DecorationKind, TextView};
 
 /// A ZWJ emoji cluster: one grapheme, 18 bytes, one shaped glyph.
 const FAMILY: &str = "👩‍👩‍👧";
@@ -305,4 +305,163 @@ fn find_all_locates_matches() {
     assert_eq!(matches[2].0.line, 1);
     assert!(v.find_all("").is_empty());
     assert!(v.find_all("zebra").is_empty());
+}
+
+// ---- Decorations ----
+//
+// DejaVu Sans, read straight out of the font's own tables: `post`
+// underlinePosition/underlineThickness and `OS/2` yStrikeoutPosition, over
+// 2048 units per em. swash reports these three as `underline_offset`,
+// `stroke_size` and `strikeout_offset`, y-up from the baseline, at the *top*
+// of the stroke.
+const UPEM: f32 = 2048.0;
+const UNDERLINE_POSITION: f32 = -40.0;
+const UNDERLINE_THICKNESS: f32 = 90.0;
+const STRIKEOUT_POSITION: f32 = 530.0;
+
+/// Big enough that the font's own thickness clears the 1 px floor.
+const DECO_SIZE: f32 = 64.0;
+
+/// A font system holding the embedded DejaVu Sans and nothing else, so the
+/// numbers above are the numbers the shaper uses.
+/// `font_system_from_fonts` would also scan this machine's system fonts, and
+/// `Family::SansSerif` would resolve to whatever they call sans-serif.
+fn deco_font_system() -> faf_text::FontSystem {
+    let mut db = fontdb::Database::new();
+    db.load_font_data(faf_text::FONT_DEJAVU_SANS.to_vec());
+    let family = db.faces().next().unwrap().families[0].0.clone();
+    db.set_sans_serif_family(family);
+    faf_text::FontSystem::new_with_locale_and_db("en-US".to_string(), db)
+}
+
+fn deco_view(text: &str) -> (faf_text::FontSystem, TextView) {
+    let mut fs = deco_font_system();
+    let mut v = TextView::new(&mut fs, Metrics::new(DECO_SIZE, DECO_SIZE * 1.5));
+    v.pos = [7.0, 11.0];
+    v.set_text(&mut fs, text, &Attrs::new().family(Family::SansSerif));
+    (fs, v)
+}
+
+/// Screen y of the first row's baseline.
+fn baseline(v: &TextView) -> f32 {
+    v.pos[1] + v.buffer.layout_runs().next().unwrap().line_y
+}
+
+fn close(a: f32, b: f32) -> bool {
+    (a - b).abs() < 1e-3
+}
+
+#[test]
+fn decoration_rects_hang_off_the_faces_own_metrics() {
+    let (_fs, v) = deco_view("hello world");
+    let (a, b) = (Cursor::new(0, 0), Cursor::new(0, 5));
+    let thickness = UNDERLINE_THICKNESS / UPEM * DECO_SIZE;
+    assert!(thickness > 1.0, "the test size must clear the 1px floor");
+
+    let under = v.decoration_rects(a, b, DecorationKind::Underline);
+    assert_eq!(under.len(), 1);
+    assert!(
+        close(
+            under[0][1],
+            baseline(&v) - UNDERLINE_POSITION / UPEM * DECO_SIZE
+        ),
+        "underline top belongs at the font's underline offset: {under:?}"
+    );
+    assert!(close(under[0][3], thickness));
+    assert!(
+        under[0][1] > baseline(&v),
+        "an underline sits below the baseline"
+    );
+
+    let strike = v.decoration_rects(a, b, DecorationKind::Strikethrough);
+    assert!(
+        close(
+            strike[0][1],
+            baseline(&v) - STRIKEOUT_POSITION / UPEM * DECO_SIZE
+        ),
+        "strikeout top belongs at the font's strikeout offset: {strike:?}"
+    );
+    assert!(close(strike[0][3], thickness));
+    assert!(
+        strike[0][1] < baseline(&v) && strike[0][1] > v.pos[1],
+        "a strikeout crosses the glyphs, above the baseline and inside the row"
+    );
+
+    // The horizontal span is the selection's, to the pixel — same BiDi-aware
+    // run geometry, only the vertical placement differs.
+    let selection = v.selection_rects(a, b);
+    assert_eq!(
+        [under[0][0], under[0][2]],
+        [selection[0][0], selection[0][2]]
+    );
+    assert_eq!(
+        v.decoration_rects(b, a, DecorationKind::Underline),
+        under,
+        "cursor order must not matter"
+    );
+}
+
+#[test]
+fn a_squiggle_band_is_centered_on_the_underline_it_replaces() {
+    let (_fs, v) = deco_view("misspelled");
+    let (a, b) = (Cursor::new(0, 0), Cursor::new(0, 10));
+    let under = v.decoration_rects(a, b, DecorationKind::Underline)[0];
+    let wave = v.decoration_rects(a, b, DecorationKind::Squiggle)[0];
+
+    assert!(
+        close(wave[3], under[3] * 3.0),
+        "the band is one stroke plus a stroke of swing either side"
+    );
+    assert!(
+        close(wave[1] + wave[3] * 0.5, under[1] + under[3] * 0.5),
+        "and it is centered where the underline would have been"
+    );
+    assert_eq!([wave[0], wave[2]], [under[0], under[2]]);
+}
+
+#[test]
+fn a_chip_covers_the_whole_line_box() {
+    let (_fs, v) = deco_view("code");
+    let (a, b) = (Cursor::new(0, 0), Cursor::new(0, 4));
+    let chip = v.decoration_rects(a, b, DecorationKind::Chip { radius_px: 4.0 });
+    assert_eq!(
+        chip,
+        v.selection_rects(a, b),
+        "a chip is a rounded selection"
+    );
+}
+
+#[test]
+fn decorations_span_lines_the_way_selections_do() {
+    let (_fs, v) = deco_view("first line\nsecond line\nthird line");
+    let (a, b) = (Cursor::new(0, 6), Cursor::new(2, 5));
+    let rects = v.decoration_rects(a, b, DecorationKind::Underline);
+    assert_eq!(rects.len(), 3);
+    for pair in rects.windows(2) {
+        assert!(pair[1][1] > pair[0][1], "one rect per row, top to bottom");
+    }
+    // A range inside line 0 decorates line 0 alone.
+    let one = v.decoration_rects(
+        Cursor::new(0, 0),
+        Cursor::new(0, 5),
+        DecorationKind::Underline,
+    );
+    assert_eq!(one.len(), 1);
+}
+
+#[test]
+fn a_face_without_metrics_falls_back_to_the_em_defaults() {
+    let fallback = faf_text::LineMetrics::FALLBACK;
+    assert_eq!(fallback.underline_offset, -0.1);
+    assert_eq!(fallback.strikeout_offset, 0.28);
+    assert_eq!(fallback.thickness, 0.06);
+
+    // An id no font system ever handed out has nothing cached.
+    let (_fs, v) = deco_view("x");
+    let id = v.buffer.layout_runs().next().unwrap().glyphs[0].font_id;
+    assert_ne!(
+        v.line_metrics(id),
+        fallback,
+        "DejaVu Sans declares its own metrics"
+    );
 }

@@ -27,6 +27,10 @@
     border-radius: 6px; padding: 4px 10px; width: 160px;
   }
   input[type="range"] { accent-color: #7aa2f7; }
+  select {
+    background: #1f2130; color: #c0caf5; border: 1px solid #2a2c3a;
+    border-radius: 6px; padding: 4px 8px;
+  }
   #canvas {
     display: block; width: 100%; height: calc(100vh - 57px);
     cursor: text; touch-action: none; outline: none;
@@ -51,7 +55,13 @@
     <span id="sizeval" class="stat">18px</span></label>
   <label><input type="checkbox" id="pulse"> animate zoom</label>
   <label><input type="checkbox" id="wave"> weight wave</label>
-  <label>highlight <input type="text" id="search" value="winding" placeholder="search text"></label>
+  <label>highlight <input type="text" id="search" value="winding" placeholder="search text">
+    <select id="mode" title="how matches are marked">
+      <option value="highlight">highlight</option>
+      <option value="underline">underline</option>
+      <option value="squiggle">squiggle</option>
+      <option value="chip">chip</option>
+    </select></label>
   <span class="badge">click the text and type — it's editable</span>
 </header>
 <canvas id="canvas" tabindex="0"></canvas>
@@ -68,7 +78,7 @@ const SAMPLE = `faf-text — a GPU text renderer that is fast as f***.
 
 Every glyph on this page is drawn by a fragment shader deciding inside/outside against the glyph's quadratic Bézier curves with the non-zero winding rule. There is no glyph atlas for outlines, no re-rasterization on zoom, and antialiasing is analytic — the clamp of a crossing distance, not MSAA. Drag the font-size slider (or hit "animate zoom") and watch letterforms stay perfect at every scale; the curve data uploaded to the GPU never changes.
 
-Selection is an instanced rect layer under the glyphs — click and drag to select. Highlights are an alpha-blended rect layer over the glyphs — type in the highlight box to mark every occurrence live. Both come from the same BiDi-aware cursor geometry, so mixed scripts select correctly.
+Selection is an instanced rect layer under the glyphs — click and drag to select. Highlights are an alpha-blended rect layer over the glyphs — type in the highlight box to mark every occurrence live. Switch the dropdown next to it to underline, squiggle or chip and the same matches come back out of the decoration pipeline instead: a solid bar at the font's own underline offset, a sine wave antialiased in the fragment shader, or a rounded-rect SDF. All of it is the same BiDi-aware cursor geometry, so mixed scripts mark correctly.
 
 Shaping is cosmic-text (pure Rust, compiled to wasm): Ελληνικά, кириллица, tiếng Việt, ﬁ ﬂ ligatures, and math like ∮ E⋅da = Q or ∀x∈ℝ: x² ≥ 0 all shape and render on the same code path. One draw call renders every solid rect, one draws every glyph.
 
@@ -107,6 +117,7 @@ async function main() {
   window.demo = demo;  // console/debug access
   demo.set_text(SAMPLE);
   demo.set_search(document.getElementById('search').value);
+  demo.set_search_mode(document.getElementById('mode').value);
 
   window.addEventListener('resize', () => {
     fit();
@@ -175,6 +186,10 @@ async function main() {
   });
   document.getElementById('search').addEventListener('input',
     e => demo.set_search(e.target.value));
+  // Same matches, different primitive: a rect over the glyphs, or an
+  // underline/squiggle/chip out of the decoration pipeline.
+  document.getElementById('mode').addEventListener('change',
+    e => demo.set_search_mode(e.target.value));
 
   // Paste inserts at the caret, replacing any selection.
   document.addEventListener('paste', e => {

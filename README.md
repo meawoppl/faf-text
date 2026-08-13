@@ -57,9 +57,20 @@ the glyphs, highlight overlays render *over* them with alpha blending, both
 instanced. Hit-testing (pixel → cursor) and cursor-range → rect geometry are
 BiDi-aware, courtesy of cosmic-text's shaping and layout.
 
+**Decorations are shapes, not rects.** Underline, strikethrough, squiggle and
+rounded chip are one more instanced pipeline whose fragment shader switches on
+a kind: a fill, a sine centerline the fragment measures its distance to, or a
+rounded-rect SDF — both antialiased by `fwidth`, so a squiggle is exact at any
+size and a chip's corners never stair-step. Underline and strikeout offsets and
+thickness come from the face's own metrics (cached per font), with em-relative
+fallbacks for faces that declare none; `TextView::decoration_rects` returns
+baseline-anchored geometry for a cursor range, and text whose *attributes* ask
+for an underline or strikeout decorates itself. Chips draw under the glyphs and
+the line kinds over them.
+
 **The scene is retained, and damage-tracked.** Content lives in blocks; each
-block owns a range of every instance arena (under-rects, vector glyphs,
-weight-blended glyphs, atlas glyphs, over-rects) and one entry in a
+block owns a range of every instance arena (under-rects, chips, vector glyphs,
+weight-blended glyphs, atlas glyphs, line decorations, over-rects) and one entry in a
 dynamic-offset uniform buffer. Setting a block's content re-uploads that
 block's ranges and nothing else, so typing in a search box does not touch the
 document's glyphs. Moving a block writes 16 bytes of uniform — no instance is
@@ -69,9 +80,10 @@ repacks itself once more than half of it is holes. When nothing changed at
 all, `damaged()` says so and the host can skip recording and presenting
 entirely — an idle window costs zero draw calls.
 
-A block draws in at most five calls (under-rects, vector glyphs, weight-blended
-vector glyphs, atlas glyphs, over-rects) and blocks composite in creation
-order. The immediate-mode `begin`/`rect`/`text`/`finish` API is still there,
+A block draws in at most seven calls, in this order — under-rects, **chips**,
+vector glyphs, weight-blended vector glyphs, atlas glyphs, **line
+decorations**, over-rects — and blocks composite in creation order. The
+immediate-mode `begin`/`rect`/`text`/`decoration`/`finish` API is still there,
 as a wrapper over one block that is rebuilt every frame.
 
 ## Compatibility
