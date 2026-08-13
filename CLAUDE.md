@@ -20,8 +20,13 @@ algorithm change. Roadmap lives in issues #2–#11.
   --out-dir ../../web/pkg --release` (wasm-pack is in ~/.cargo/bin, which is
   NOT on PATH). Release builds spend minutes in wasm-opt; run in background.
 - Serve demo: `python3 -m http.server -d web <port>`.
-- `shaders.wgsl` constants `CURVE_TEX_WIDTH` must match `curves.rs`. Only the
-  width is shared — the curve texture's height changes at runtime.
+- `shaders.wgsl` constants `CURVE_TEX_WIDTH`, `BANDS` and `BANDED_FLAG` must
+  match `curves.rs`; `curves::tests::shader_constants_match_the_record_layout`
+  greps the WGSL source to enforce it. Only the width is shared — the curve
+  texture's height changes at runtime.
+- Fragment-shader benchmark: `cargo run --release --example stress -p faf-text`
+  (a full 960×600 frame of 11px text, ~7.9k glyphs, timed over 200 serialized
+  frames).
 - GPU unit tests are fine and expected: `src/testing.rs` (cfg(test)) hands out
   one shared headless device plus `render_pixels` for readback comparisons.
   `cargo test -p faf-text` exercises curve-texture growth and eviction on the
@@ -46,6 +51,18 @@ algorithm change. Roadmap lives in issues #2–#11.
   mirrored-looking garbage until fixed). Hairline stems need the 3-tap path
   below ~24px.
 - Glyph outlines extracted at size 1.0 + DISABLE_HINTING = pure em units.
+- Curve-texture addressing is by *texel*, not curve record: `GlyphCurves.first`
+  is a glyph's base texel and everything stored in the block (band header
+  entries, index-list entries) is an offset from it, so compaction relocates a
+  glyph by memcpy + rewriting `first`. Blocks are always an even number of
+  texels so a two-texel curve record never straddles a row.
+- Band tables (>16 curves) split the glyph's **em bbox**, not the instance
+  quad: the quad's 1.5px pad is a size-dependent number of em, and bands are
+  baked once per glyph. The renderer passes `band_scale`/`band_bias` to map the
+  quad corner into band space. A band gets every curve whose control-point
+  range overlaps it ±5% of a band height — leave a curve out and its winding
+  contribution is exactly 0.0, which is why banding is bit-for-bit
+  pixel-identical to the flat loop (assert this with the offscreen example).
 - Glyph stores never evict mid-frame: queued instances hold raw `first` indices
   and atlas UVs, so overflow sets a flag, falls back for that frame, and the
   eviction runs in `begin_frame`. Growth/compaction bump `CurveStore.generation`

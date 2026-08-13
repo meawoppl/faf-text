@@ -22,6 +22,11 @@ shader decides inside/outside per pixel:
   count each crossing exactly once.
 - Below ~24 px/em, three parallel rays per axis recover hairline stems that
   single sampling drops. Larger glyphs use the cheap single-ray path.
+- Glyphs past 16 curves carry per-axis **band tables** ahead of their curve
+  data: eight bands per axis, each listing only the curves that can cross a ray
+  in it, so a fragment loops over a fraction of the glyph instead of all of it.
+  Coverage is unchanged to the bit — a curve a band leaves out contributes
+  exactly zero.
 
 Because coverage is analytic, glyphs get **true subpixel positioning** (no
 snapping, no subpixel atlas bins) and **free scaling** — zooming re-rasterizes

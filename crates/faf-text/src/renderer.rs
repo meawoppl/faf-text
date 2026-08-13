@@ -41,8 +41,15 @@ struct VectorGlyphInstance {
     em_size: [f32; 2],
     color: [f32; 4],
     first: u32,
+    /// Curve count, tagged with `BANDED_FLAG` when band tables lead the block.
     count: u32,
-    _pad: [u32; 2],
+    /// Maps the unit-quad corner to band space: 0..1 across the glyph's em
+    /// bbox, which is the extent `curves.rs` splits into bands. The quad is
+    /// the bbox plus a 1.5 px pad, so the two only differ by the pad — but the
+    /// pad is a size-dependent number of em, and the bands are baked once per
+    /// glyph, so the vertex shader divides it back out.
+    band_scale: [f32; 2],
+    band_bias: [f32; 2],
 }
 
 /// Which side of the text a rect layer renders on.
@@ -277,7 +284,8 @@ impl TextRenderer {
             std::mem::size_of::<VectorGlyphInstance>() as u64,
             &wgpu::vertex_attr_array![
                 0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
-                3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32
+                3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32,
+                7 => Float32x2, 8 => Float32x2
             ],
         );
 
@@ -373,6 +381,10 @@ impl TextRenderer {
                     let max_x = gc.bbox[2] + pad;
                     let max_y = gc.bbox[3] + pad;
 
+                    // Band space is the unpadded bbox, y-up like the em coords.
+                    let band_w = (gc.bbox[2] - gc.bbox[0]).max(f32::MIN_POSITIVE);
+                    let band_h = (gc.bbox[3] - gc.bbox[1]).max(f32::MIN_POSITIVE);
+
                     self.vector_glyphs.push(VectorGlyphInstance {
                         pos: [origin_x + min_x * font_size, origin_y - max_y * font_size],
                         size: [(max_x - min_x) * font_size, (max_y - min_y) * font_size],
@@ -380,8 +392,9 @@ impl TextRenderer {
                         em_size: [max_x - min_x, -(max_y - min_y)],
                         color: color.0,
                         first: gc.first,
-                        count: gc.count,
-                        _pad: [0; 2],
+                        count: gc.instance_count(),
+                        band_scale: [(max_x - min_x) / band_w, -(max_y - min_y) / band_h],
+                        band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
                     });
                     continue;
                 }
@@ -543,6 +556,43 @@ mod tests {
             renderer.text(queue, font_system, &filler.buffer, filler.pos, Color::WHITE);
         }
         testing::render_pixels(renderer, W, H)
+    }
+
+    #[test]
+    fn band_tables_do_not_move_a_single_pixel() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        // Every one of these glyphs clears the 16-curve banding threshold. 11px
+        // takes the three-tap path, where a tap's ray offset can land in
+        // another band; 30px takes the single-ray one.
+        for size in [11.0, 30.0] {
+            let sample = view(&mut font_system, "Q@g&%8", size, [6.0, 6.0]);
+            let mut with_bands = renderer(2048, 2048);
+            let banded = frame(&mut with_bands, &mut font_system, &sample, None);
+
+            let mut store = CurveStore::with_size(device, CURVE_TEX_WIDTH, 2048, 2048);
+            store.band_min_curves = u32::MAX; // every glyph keeps the flat layout
+            let mut without =
+                TextRenderer::with_stores(device, testing::FORMAT, Atlas::new(device), store);
+            let flat = frame(&mut without, &mut font_system, &sample, None);
+
+            assert!(banded.iter().any(|&b| b != 0), "the sample drew something");
+            assert!(
+                with_bands
+                    .vector_glyphs
+                    .iter()
+                    .any(|g| g.count & crate::curves::BANDED_FLAG != 0),
+                "the sample should exercise the banded path at {size}px"
+            );
+            assert!(
+                without
+                    .vector_glyphs
+                    .iter()
+                    .all(|g| g.count & crate::curves::BANDED_FLAG == 0),
+                "the reference render must be unbanded"
+            );
+            assert_eq!(banded, flat, "banding changed coverage at {size}px");
+        }
     }
 
     #[test]

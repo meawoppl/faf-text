@@ -10,6 +10,11 @@ struct Globals {
 
 // Must match CURVE_TEX_WIDTH in curves.rs.
 const CURVE_TEX_WIDTH: u32 = 256u;
+// Bands per axis. Must match BANDS in curves.rs.
+const BANDS: u32 = 8u;
+// Set in a vector instance's `count` field when the glyph's block opens with
+// band tables instead of curve records. Must match BANDED_FLAG in curves.rs.
+const BANDED_FLAG: u32 = 0x80000000u;
 
 // Unit-quad corner from the vertex index (two CCW triangles, 6 vertices).
 fn quad_corner(vi: u32) -> vec2<f32> {
@@ -96,11 +101,24 @@ fn glyph_fs(in: GlyphOutput) -> @location(0) vec4<f32> {
 
 // ---- Vector glyphs: per-pixel inside/outside against quadratic Béziers ----
 //
-// Each glyph instance references a run of quadratics in `curve_tex`, stored in
-// em units (y-up, baseline origin). The fragment shader casts an axis ray
+// Each glyph instance references a block of quadratics in `curve_tex`, stored
+// in em units (y-up, baseline origin). The fragment shader casts an axis ray
 // through the sample point, solves y(t) = 0 for every curve, and accumulates
 // signed, clamped crossing distances — the non-zero winding rule with analytic
 // antialiasing baked into the clamp. No MSAA, no atlas, no re-raster on zoom.
+//
+// `first` is the block's base texel and `count` the number of quadratics. When
+// `count` carries BANDED_FLAG the block opens with band tables (see the
+// record-layout comment in curves.rs) and each ray reads only the curves that
+// can cross it, instead of the whole glyph:
+//
+//   [header: BANDS y-band then BANDS x-band entries, 2 per texel]
+//   [index lists: texel-aligned, in header order]
+//   [curve records: 2 texels each]
+//
+// A header entry is (list offset in texels from `first`, curve count); a list
+// entry is a curve record's texel offset from `first`. Bands split the glyph's
+// em bbox uniformly — `fraction` is the sample's position in that box.
 
 struct VectorInstance {
     @location(0) pos: vec2<f32>,      // quad top-left, px
@@ -109,7 +127,9 @@ struct VectorInstance {
     @location(3) em_size: vec2<f32>,  // em delta across quad (y negative)
     @location(4) color: vec4<f32>,
     @location(5) first: u32,
-    @location(6) count: u32,
+    @location(6) count: u32,          // high bit: BANDED_FLAG
+    @location(7) band_scale: vec2<f32>, // quad corner -> band space (0..1 over
+    @location(8) band_bias: vec2<f32>,  // the bbox; the quad's pad falls outside)
 };
 
 struct VectorOutput {
@@ -118,6 +138,9 @@ struct VectorOutput {
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) first: u32,
     @location(3) @interpolate(flat) count: u32,
+    @location(4) fraction: vec2<f32>,
+    // Band-space units per em, for moving a tap's ray offset into band space.
+    @location(5) @interpolate(flat) frac_per_em: vec2<f32>,
 };
 
 @vertex
@@ -129,7 +152,13 @@ fn vector_vs(@builtin(vertex_index) vi: u32, inst: VectorInstance) -> VectorOutp
     out.color = inst.color;
     out.first = inst.first;
     out.count = inst.count;
+    out.fraction = inst.band_bias + corner * inst.band_scale;
+    out.frac_per_em = inst.band_scale / inst.em_size;
     return out;
+}
+
+fn texel_coord(texel: u32) -> vec2<i32> {
+    return vec2<i32>(i32(texel % CURVE_TEX_WIDTH), i32(texel / CURVE_TEX_WIDTH));
 }
 
 // Crossing-count tables indexed by the sign pattern of (p0.y, p1.y, p2.y):
@@ -186,6 +215,70 @@ fn curve_winding(p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>, inv_diameter: f32)
     return alpha;
 }
 
+// One curve's contribution to a ray. `record` is its texel offset from the
+// block base; `swap` casts the vertical ray by exchanging the coordinates.
+fn record_winding(
+    base: u32,
+    record: f32,
+    em: vec2<f32>,
+    offset: vec2<f32>,
+    inv_diameter: f32,
+    swap: bool,
+) -> f32 {
+    let texel = base + u32(record);
+    let t0 = textureLoad(curve_tex, texel_coord(texel), 0);
+    let t1 = textureLoad(curve_tex, texel_coord(texel + 1u), 0);
+    var p0 = t0.xy - em;
+    var p1 = t0.zw - em;
+    var p2 = t1.xy - em;
+    if swap {
+        p0 = p0.yx;
+        p1 = p1.yx;
+        p2 = p2.yx;
+    }
+    return curve_winding(p0 - offset, p1 - offset, p2 - offset, inv_diameter);
+}
+
+// Header entry `slot` (y-bands 0..BANDS, then x-bands): two entries per texel.
+fn band_entry(base: u32, slot: u32) -> vec2<f32> {
+    let texel = textureLoad(curve_tex, texel_coord(base + slot / 2u), 0);
+    return select(texel.zw, texel.xy, (slot & 1u) == 0u);
+}
+
+fn band_of(coord: f32) -> u32 {
+    return u32(clamp(i32(coord * f32(BANDS)), 0, i32(BANDS) - 1));
+}
+
+// Winding of every curve in one band's list. Indices come four to a texel;
+// the list order matches the flat loop's, and the curves it leaves out
+// contribute exactly zero, so both paths sum the same terms in the same order.
+fn band_winding(
+    base: u32,
+    entry: vec2<f32>,
+    em: vec2<f32>,
+    offset: vec2<f32>,
+    inv_diameter: f32,
+    swap: bool,
+) -> f32 {
+    let list = base + u32(entry.x);
+    let count = u32(entry.y);
+    var wind = 0.0;
+    for (var i = 0u; i < count; i += 4u) {
+        let indices = textureLoad(curve_tex, texel_coord(list + i / 4u), 0);
+        wind += record_winding(base, indices.x, em, offset, inv_diameter, swap);
+        if i + 1u < count {
+            wind += record_winding(base, indices.y, em, offset, inv_diameter, swap);
+        }
+        if i + 2u < count {
+            wind += record_winding(base, indices.z, em, offset, inv_diameter, swap);
+        }
+        if i + 3u < count {
+            wind += record_winding(base, indices.w, em, offset, inv_diameter, swap);
+        }
+    }
+    return wind;
+}
+
 @fragment
 fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
     // Em units per pixel, per axis; derivatives taken before any control flow.
@@ -200,23 +293,39 @@ fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
 
     var wind_x = array<f32, 3>(0.0, 0.0, 0.0);
     var wind_y = array<f32, 3>(0.0, 0.0, 0.0);
-    for (var i = 0u; i < in.count; i += 1u) {
-        let texel = (in.first + i) * 2u;
-        let coord0 = vec2<i32>(i32(texel % CURVE_TEX_WIDTH), i32(texel / CURVE_TEX_WIDTH));
-        let coord1 = vec2<i32>(coord0.x + 1, coord0.y);
-        let t0 = textureLoad(curve_tex, coord0, 0);
-        let t1 = textureLoad(curve_tex, coord1, 0);
-        let p0 = t0.xy - in.em;
-        let p1 = t0.zw - in.em;
-        let p2 = t1.xy - in.em;
+    // Uniform per primitive, so the branch stays coherent across the quad.
+    if (in.count & BANDED_FLAG) != 0u {
         for (var tap = 0u; tap < taps; tap += 1u) {
             let off = (f32(tap) + 0.5) / f32(taps) - 0.5;
-            // Horizontal ray, offset perpendicular (in y)…
+            // A tap can shift the ray across a band boundary at small sizes,
+            // so the band is picked from the tapped coordinate, not the
+            // fragment's — one extra header fetch buys exactness.
             let oy = vec2<f32>(0.0, off * fw.y);
-            wind_x[tap] += curve_winding(p0 - oy, p1 - oy, p2 - oy, inv_diameter.x);
-            // …and vertical ray (coords swapped), offset in x.
+            let y_band = band_of(in.fraction.y + off * fw.y * in.frac_per_em.y);
+            wind_x[tap] = band_winding(
+                in.first, band_entry(in.first, y_band), in.em, oy, inv_diameter.x, false);
             let ox = vec2<f32>(0.0, off * fw.x);
-            wind_y[tap] += curve_winding(p0.yx - ox, p1.yx - ox, p2.yx - ox, inv_diameter.y);
+            let x_band = band_of(in.fraction.x + off * fw.x * in.frac_per_em.x);
+            wind_y[tap] = band_winding(
+                in.first, band_entry(in.first, BANDS + x_band), in.em, ox, inv_diameter.y, true);
+        }
+    } else {
+        for (var i = 0u; i < in.count; i += 1u) {
+            let texel = in.first + i * 2u;
+            let t0 = textureLoad(curve_tex, texel_coord(texel), 0);
+            let t1 = textureLoad(curve_tex, texel_coord(texel + 1u), 0);
+            let p0 = t0.xy - in.em;
+            let p1 = t0.zw - in.em;
+            let p2 = t1.xy - in.em;
+            for (var tap = 0u; tap < taps; tap += 1u) {
+                let off = (f32(tap) + 0.5) / f32(taps) - 0.5;
+                // Horizontal ray, offset perpendicular (in y)…
+                let oy = vec2<f32>(0.0, off * fw.y);
+                wind_x[tap] += curve_winding(p0 - oy, p1 - oy, p2 - oy, inv_diameter.x);
+                // …and vertical ray (coords swapped), offset in x.
+                let ox = vec2<f32>(0.0, off * fw.x);
+                wind_y[tap] += curve_winding(p0.yx - ox, p1.yx - ox, p2.yx - ox, inv_diameter.y);
+            }
         }
     }
     // abs() makes the result winding-orientation agnostic (TrueType and CFF

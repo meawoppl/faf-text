@@ -13,30 +13,92 @@ pub const CURVE_TEX_HEIGHT: u32 = 2048;
 pub const CURVE_TEX_MAX_HEIGHT: u32 = 8192;
 
 // --- Record layout. Everything that knows how a curve maps to texels lives
-// here, so band tables (#3) and master interleaving (#8) can change it in one
-// place.
+// here, so band tables and master interleaving (#8) can change it in one place.
+//
+// A glyph owns one contiguous, even-texel-aligned block of the texture;
+// `GlyphCurves::first` is the block's base texel and every offset stored inside
+// it is relative to that base, so compaction relocates a glyph by moving its
+// texels and rewriting `first` alone.
+//
+// Flat block (`count` <= `BAND_MIN_CURVES`):
+//
+//     [curve record 0][curve record 1]…            2 texels each
+//
+// Banded block (`count` > `BAND_MIN_CURVES`):
+//
+//     [header]              BANDS texels: BANDS y-band then BANDS x-band
+//                           entries, each (list offset in texels from the
+//                           block base, curve count) — 2 entries per texel
+//     [index lists]         the 2*BANDS lists in header order, each starting
+//                           on a texel boundary, region padded to even
+//     [curve record 0]…     2 texels each
+//
+// A list entry is the texel offset of that curve's record from the block base
+// (float, exact to 2^24 — a glyph would need 8M texels to lose precision), so
+// the shader resolves a curve without knowing where the record region starts.
+// The two shapes are told apart by [`BANDED_FLAG`] in the instance's `count`.
 
+/// Floats per RGBA32F texel.
+const FLOATS_PER_TEXEL: usize = 4;
 /// Two RGBA32F texels (8 floats) per quadratic: [p0.xy p1.xy] [p2.xy pad pad].
-const FLOATS_PER_CURVE: usize = 8;
+const TEXELS_PER_CURVE: usize = 2;
+const FLOATS_PER_CURVE: usize = TEXELS_PER_CURVE * FLOATS_PER_TEXEL;
+
+/// Bands per axis. Must match `BANDS` in `shaders.wgsl`.
+pub const BANDS: usize = 8;
+/// Texels the band header occupies: 2*BANDS entries × 2 floats, 4 floats per
+/// texel.
+const HEADER_TEXELS: usize = BANDS * 2 * 2 / FLOATS_PER_TEXEL;
+/// Glyphs with more curves than this get band tables; at or below it the flat
+/// loop is cheaper than the indirection.
+const BAND_MIN_CURVES: u32 = 16;
+/// A band's interval is widened by this fraction of a band's height before
+/// curve overlap is tested. Control-point ranges already bound the curve, so
+/// the test is conservative; the slack only has to cover fp disagreement
+/// between these boundaries and the shader's interpolated band coordinate.
+const BAND_EPSILON: f32 = 0.05;
+/// Set in the vector instance's `count` field when the glyph's block is
+/// banded. Must match `BANDED_FLAG` in `shaders.wgsl`.
+pub const BANDED_FLAG: u32 = 0x8000_0000;
 
 /// Floats in one texture row.
 const fn floats_per_row(width: u32) -> usize {
-    width as usize * 4
+    width as usize * FLOATS_PER_TEXEL
 }
 
-/// How many curve records fit in a `width × height` texture.
-const fn curve_capacity(width: u32, height: u32) -> usize {
-    (width as usize * height as usize) * 4 / FLOATS_PER_CURVE
+/// How many texels a `width × height` texture holds.
+const fn texel_capacity(width: u32, height: u32) -> usize {
+    width as usize * height as usize
 }
 
 /// A glyph's quadratic Bézier set inside the curve texture, in em units
 /// (y-up, origin at the glyph's baseline origin).
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphCurves {
+    /// Base texel of the glyph's block.
     pub first: u32,
+    /// Quadratics in the block. Never carries [`BANDED_FLAG`] — the shader
+    /// wants [`GlyphCurves::instance_count`].
     pub count: u32,
-    /// Em-space bounds: [min_x, min_y, max_x, max_y].
+    /// Em-space bounds: [min_x, min_y, max_x, max_y]. Also the extent the
+    /// bands split, so the renderer must map quad-local coordinates into it.
     pub bbox: [f32; 4],
+    /// Whether the block starts with band tables.
+    pub banded: bool,
+    /// Length of the whole block in texels — what compaction moves.
+    texels: u32,
+}
+
+impl GlyphCurves {
+    /// The `count` field for the vector instance: the curve count, tagged with
+    /// [`BANDED_FLAG`] when the shader should read band tables first.
+    pub fn instance_count(&self) -> u32 {
+        if self.banded {
+            self.count | BANDED_FLAG
+        } else {
+            self.count
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,6 +154,9 @@ pub struct CurveStore {
     width: u32,
     height: u32,
     max_height: u32,
+    /// Curve count past which a glyph gets band tables. Tests raise it to
+    /// render the same glyph both ways.
+    pub(crate) band_min_curves: u32,
     frame: u64,
     /// An allocation failed at cap this frame; compact at the next frame edge.
     needs_compact: bool,
@@ -132,6 +197,7 @@ impl CurveStore {
             width,
             height,
             max_height,
+            band_min_curves: BAND_MIN_CURVES,
             frame: 0,
             needs_compact: false,
         }
@@ -211,8 +277,10 @@ impl CurveStore {
             return Extracted::Done(None);
         };
 
-        let first = (self.data.len() / FLOATS_PER_CURVE) as u32;
-        let mut flat = Flattener::new(&mut self.data);
+        // Flattened into a scratch buffer first: the band tables go in front of
+        // the records, and the curve count decides whether there are any.
+        let mut records = Vec::new();
+        let mut flat = Flattener::new(&mut records);
         for command in commands.iter() {
             match *command {
                 Command::MoveTo(p) => flat.move_to([p.x, p.y]),
@@ -227,36 +295,58 @@ impl CurveStore {
         flat.close();
         let bbox = flat.bbox;
 
-        let count = (self.data.len() / FLOATS_PER_CURVE) as u32 - first;
+        let count = (records.len() / FLOATS_PER_CURVE) as u32;
         if count == 0 {
             return Extracted::Done(Some(GlyphCurves {
-                first,
+                first: 0,
                 count: 0,
                 bbox: [0.0; 4],
+                banded: false,
+                texels: 0,
             }));
         }
-        let used = self.data.len() / FLOATS_PER_CURVE;
+
+        let banded = count > self.band_min_curves;
+        let block = if banded {
+            banded_block(&records, bbox)
+        } else {
+            records
+        };
+        debug_assert_eq!(block.len() % FLOATS_PER_CURVE, 0, "blocks are even texels");
+
+        // Every block is an even number of texels long, so this base is even
+        // and no curve record ever straddles a texture row.
+        let first = (self.data.len() / FLOATS_PER_TEXEL) as u32;
+        let texels = (block.len() / FLOATS_PER_TEXEL) as u32;
+        self.data.extend_from_slice(&block);
+        let used = self.data.len() / FLOATS_PER_TEXEL;
         if used > self.capacity() && !self.grow_to_fit(used) {
-            self.data.truncate(first as usize * FLOATS_PER_CURVE);
+            self.data.truncate(first as usize * FLOATS_PER_TEXEL);
             return Extracted::Overflow;
         }
-        Extracted::Done(Some(GlyphCurves { first, count, bbox }))
+        Extracted::Done(Some(GlyphCurves {
+            first,
+            count,
+            bbox,
+            banded,
+            texels,
+        }))
     }
 
     fn capacity(&self) -> usize {
-        curve_capacity(self.width, self.height)
+        texel_capacity(self.width, self.height)
     }
 
     /// Double the texture height (repeatedly, up to the cap) until `needed`
-    /// curves fit, then re-create it and schedule a full re-upload from the
+    /// texels fit, then re-create it and schedule a full re-upload from the
     /// CPU mirror. Returns false — leaving the texture untouched — if the cap
     /// is too small.
     fn grow_to_fit(&mut self, needed: usize) -> bool {
         let mut height = self.height;
-        while height < self.max_height && curve_capacity(self.width, height) < needed {
+        while height < self.max_height && texel_capacity(self.width, height) < needed {
             height = (height * 2).min(self.max_height);
         }
-        if curve_capacity(self.width, height) < needed {
+        if texel_capacity(self.width, height) < needed {
             return false;
         }
         self.height = height;
@@ -295,9 +385,11 @@ impl CurveStore {
                 curves.first = 0;
                 continue;
             }
-            let start = curves.first as usize * FLOATS_PER_CURVE;
-            let end = start + curves.count as usize * FLOATS_PER_CURVE;
-            curves.first = (packed.len() / FLOATS_PER_CURVE) as u32;
+            // Whole blocks move, band tables and all; the offsets inside them
+            // are base-relative, so only `first` needs rewriting.
+            let start = curves.first as usize * FLOATS_PER_TEXEL;
+            let end = start + curves.texels as usize * FLOATS_PER_TEXEL;
+            curves.first = (packed.len() / FLOATS_PER_TEXEL) as u32;
             packed.extend_from_slice(&data[start..end]);
         }
         self.data = packed;
@@ -360,6 +452,66 @@ fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Textu
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+/// Curve indices per band along one axis of `[min, max]` (`axis` 0 = x,
+/// 1 = y), for curves already packed as flat records.
+///
+/// A curve joins every band its control-point range overlaps, widened by
+/// [`BAND_EPSILON`] of a band's height. The control points bound the curve
+/// (convex hull), so a curve left out of band `i` cannot cross any ray inside
+/// band `i` — the shader's winding sum is unchanged, term for term.
+fn band_lists(records: &[f32], axis: usize, min: f32, max: f32) -> Vec<Vec<u32>> {
+    let height = ((max - min) / BANDS as f32).max(f32::MIN_POSITIVE);
+    let eps = height * BAND_EPSILON;
+    let last_band = (BANDS - 1) as f32;
+    let mut lists = vec![Vec::new(); BANDS];
+    for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
+        let coords = [record[axis], record[2 + axis], record[4 + axis]];
+        let lo = coords.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = coords.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let first = (((lo - eps - min) / height).floor()).clamp(0.0, last_band) as usize;
+        let last = (((hi + eps - min) / height).floor()).clamp(0.0, last_band) as usize;
+        for list in &mut lists[first..=last] {
+            list.push(index as u32);
+        }
+    }
+    lists
+}
+
+/// Lay out a banded block: header, index lists, then the curve records. See
+/// the record-layout comment at the top of this file.
+fn banded_block(records: &[f32], bbox: [f32; 4]) -> Vec<f32> {
+    let mut lists = band_lists(records, 1, bbox[1], bbox[3]);
+    lists.extend(band_lists(records, 0, bbox[0], bbox[2]));
+
+    // Lists start on texel boundaries (the shader walks them four at a time)
+    // and the region as a whole is padded to an even texel count, which keeps
+    // the records that follow two-texel aligned.
+    let list_texels: usize = lists
+        .iter()
+        .map(|list| list.len().div_ceil(FLOATS_PER_TEXEL))
+        .sum::<usize>()
+        .next_multiple_of(TEXELS_PER_CURVE);
+    let records_offset = HEADER_TEXELS + list_texels;
+
+    let mut block = Vec::with_capacity(records_offset * FLOATS_PER_TEXEL + records.len());
+    let mut offset = HEADER_TEXELS;
+    for list in &lists {
+        block.push(offset as f32);
+        block.push(list.len() as f32);
+        offset += list.len().div_ceil(FLOATS_PER_TEXEL);
+    }
+    debug_assert_eq!(block.len(), HEADER_TEXELS * FLOATS_PER_TEXEL);
+    for list in &lists {
+        for &index in list {
+            block.push((records_offset + index as usize * TEXELS_PER_CURVE) as f32);
+        }
+        block.resize(block.len().next_multiple_of(FLOATS_PER_TEXEL), 0.0);
+    }
+    block.resize(records_offset * FLOATS_PER_TEXEL, 0.0);
+    block.extend_from_slice(records);
+    block
 }
 
 /// Flattens a zeno path into padded quadratic records, tracking the bbox.
@@ -484,9 +636,10 @@ mod tests {
         }
     }
 
+    /// The glyph's whole block — band tables included.
     fn slice_of(store: &CurveStore, curves: &GlyphCurves) -> Vec<f32> {
-        let start = curves.first as usize * FLOATS_PER_CURVE;
-        let end = start + curves.count as usize * FLOATS_PER_CURVE;
+        let start = curves.first as usize * FLOATS_PER_TEXEL;
+        let end = start + curves.texels as usize * FLOATS_PER_TEXEL;
         store.data[start..end].to_vec()
     }
 
@@ -605,7 +758,7 @@ mod tests {
             if curves.count == 0 {
                 continue;
             }
-            live_floats += curves.count as usize * FLOATS_PER_CURVE;
+            live_floats += curves.texels as usize * FLOATS_PER_TEXEL;
             assert_eq!(
                 &slice_of(&store, &curves),
                 before.get(key).expect("survivor was extracted earlier"),
@@ -621,7 +774,7 @@ mod tests {
         let mut font_system = testing::font_system();
         let font_id = testing::font_id(&font_system);
         let mut store = CurveStore::with_size(device, CURVE_TEX_WIDTH, 8, 32);
-        let cap = curve_capacity(CURVE_TEX_WIDTH, 32);
+        let cap = texel_capacity(CURVE_TEX_WIDTH, 32);
 
         // 100 glyphs × 20 weights, a frame per weight. Every combination is a
         // distinct entry, so this churns many times the texture's worth.
@@ -637,16 +790,195 @@ mod tests {
                 );
                 if let Some(curves) = curves {
                     assert!(
-                        (curves.first + curves.count) as usize <= cap,
-                        "curve range escaped the texture"
+                        (curves.first + curves.texels) as usize <= cap,
+                        "curve block escaped the texture"
                     );
                 }
             }
             assert!(
-                store.data.len() / FLOATS_PER_CURVE <= cap,
+                store.data.len() / FLOATS_PER_TEXEL <= cap,
                 "the mirror outgrew the texture"
             );
             assert!(store.height <= 32, "growth respects the cap");
+        }
+    }
+
+    /// Records for curves with the given (x-range, y-range), as flat quads
+    /// whose control points span exactly that box.
+    fn records_spanning(ranges: &[([f32; 2], [f32; 2])]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for ([x0, x1], [y0, y1]) in ranges {
+            let mid = [(x0 + x1) * 0.5, (y0 + y1) * 0.5];
+            out.extend_from_slice(&[*x0, *y0, mid[0], mid[1], *x1, *y1, 0.0, 0.0]);
+        }
+        out
+    }
+
+    #[test]
+    fn bands_take_every_curve_overlapping_them_plus_an_epsilon_margin() {
+        // Eight bands over [0, 8]: band i is [i, i+1], epsilon 0.05.
+        let records = records_spanning(&[
+            ([0.0, 1.0], [0.0, 0.4]),  // 0: inside band 0
+            ([0.0, 1.0], [2.5, 4.5]),  // 1: straddles bands 2, 3, 4
+            ([0.0, 1.0], [3.0, 3.0]),  // 2: exactly on the 2|3 boundary
+            ([0.0, 1.0], [6.96, 7.9]), // 3: within epsilon of band 6
+            ([0.0, 1.0], [0.0, 8.0]),  // 4: spans everything
+        ]);
+        let lists = band_lists(&records, 1, 0.0, 8.0);
+
+        assert_eq!(lists[0], vec![0, 4]);
+        assert_eq!(lists[1], vec![4]);
+        assert_eq!(lists[2], vec![1, 2, 4], "the boundary curve joins band 2");
+        assert_eq!(lists[3], vec![1, 2, 4], "…and band 3");
+        assert_eq!(lists[4], vec![1, 4]);
+        assert_eq!(lists[5], vec![4]);
+        assert_eq!(lists[6], vec![3, 4], "6.96 is inside band 7 but within eps");
+        assert_eq!(lists[7], vec![3, 4]);
+
+        // The x-ranges are identical, so every x-band holds every curve.
+        for list in band_lists(&records, 0, 0.0, 1.0) {
+            assert_eq!(list, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn a_curve_outside_a_band_cannot_cross_any_ray_inside_it() {
+        // The property the shader relies on: what a band leaves out has all
+        // three control points on one side of every ray through that band.
+        let mut records = Vec::new();
+        for i in 0..40u32 {
+            let y = i as f32 * 0.1;
+            records.extend(records_spanning(&[([0.0, 1.0], [y, y + 0.25])]));
+        }
+        let lists = band_lists(&records, 1, 0.0, 4.0);
+        let height = 4.0 / BANDS as f32;
+        for (band, list) in lists.iter().enumerate() {
+            let (lo, hi) = (band as f32 * height, (band as f32 + 1.0) * height);
+            for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
+                if list.contains(&(index as u32)) {
+                    continue;
+                }
+                let ys = [record[1], record[3], record[5]];
+                let below = ys.iter().all(|y| *y < lo);
+                let above = ys.iter().all(|y| *y > hi);
+                assert!(below || above, "curve {index} straddles band {band}");
+            }
+        }
+    }
+
+    /// Decode a banded block the way the shader does: header entry per band,
+    /// index list, curve records. Returns each band's resolved curve indices.
+    fn decode_bands(block: &[f32], count: u32, bbox: [f32; 4]) -> Vec<Vec<u32>> {
+        let records_offset = block.len() / FLOATS_PER_TEXEL - count as usize * TEXELS_PER_CURVE;
+        let mut decoded = Vec::new();
+        for slot in 0..2 * BANDS {
+            let list = block[slot * 2] as usize;
+            let len = block[slot * 2 + 1] as usize;
+            assert!(list >= HEADER_TEXELS && list + len.div_ceil(4) <= records_offset);
+            let axis = if slot < BANDS { 1 } else { 0 };
+            let band = slot % BANDS;
+            let height = (bbox[axis + 2] - bbox[axis]) / BANDS as f32;
+            let (lo, hi) = (
+                bbox[axis] + band as f32 * height,
+                bbox[axis] + (band as f32 + 1.0) * height,
+            );
+            let eps = height * BAND_EPSILON;
+
+            let mut indices = Vec::new();
+            for i in 0..len {
+                let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
+                assert!(texel >= records_offset, "list entry points into the header");
+                assert_eq!((texel - records_offset) % TEXELS_PER_CURVE, 0);
+                let start = texel * FLOATS_PER_TEXEL;
+                let record = &block[start..start + FLOATS_PER_CURVE];
+                let coords = [record[axis], record[2 + axis], record[4 + axis]];
+                let curve_lo = coords.iter().copied().fold(f32::INFINITY, f32::min);
+                let curve_hi = coords.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    curve_hi >= lo - eps && curve_lo <= hi + eps,
+                    "band {slot} lists a curve it does not overlap"
+                );
+                indices.push(((texel - records_offset) / TEXELS_PER_CURVE) as u32);
+            }
+            decoded.push(indices);
+        }
+        decoded
+    }
+
+    #[test]
+    fn only_glyphs_past_the_threshold_are_banded_and_their_headers_round_trip() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let mut banded: Option<GlyphCurves> = None;
+        let mut flat: Option<GlyphCurves> = None;
+        for glyph_id in 36..200 {
+            let Some(curves) = get(&mut store, &mut font_system, font_id, glyph_id) else {
+                continue;
+            };
+            if curves.count == 0 {
+                continue;
+            }
+            if curves.banded {
+                banded.get_or_insert(curves);
+            } else {
+                flat.get_or_insert(curves);
+            }
+        }
+        let banded = banded.expect("some glyph exceeds the banding threshold");
+        let flat = flat.expect("some glyph stays under it");
+
+        assert!(flat.count <= BAND_MIN_CURVES);
+        assert_eq!(
+            flat.instance_count(),
+            flat.count,
+            "flat glyphs are unflagged"
+        );
+        assert_eq!(
+            flat.texels as usize,
+            flat.count as usize * TEXELS_PER_CURVE,
+            "a flat block is nothing but records"
+        );
+
+        assert!(banded.count > BAND_MIN_CURVES);
+        assert_eq!(banded.instance_count(), banded.count | BANDED_FLAG);
+        assert_eq!(banded.first % 2, 0, "records must not straddle a row");
+        assert_eq!(banded.texels % 2, 0);
+
+        // Every band resolves to curves it overlaps (checked in decode_bands),
+        // and no curve that overlaps a band is missing from it.
+        let block = slice_of(&store, &banded);
+        let decoded = decode_bands(&block, banded.count, banded.bbox);
+        let records = &block[block.len() - banded.count as usize * FLOATS_PER_CURVE..];
+        for (slot, indices) in decoded.iter().enumerate() {
+            let axis = if slot < BANDS { 1 } else { 0 };
+            let expected =
+                &band_lists(records, axis, banded.bbox[axis], banded.bbox[axis + 2])[slot % BANDS];
+            assert_eq!(indices, expected, "band {slot} lost curves");
+        }
+        assert!(
+            decoded
+                .iter()
+                .any(|band| band.len() < banded.count as usize),
+            "banding should cut some band's loop below the full curve set"
+        );
+    }
+
+    #[test]
+    fn shader_constants_match_the_record_layout() {
+        let src = include_str!("shaders.wgsl");
+        for expected in [
+            format!("const CURVE_TEX_WIDTH: u32 = {CURVE_TEX_WIDTH}u;"),
+            format!("const BANDS: u32 = {BANDS}u;"),
+            format!("const BANDED_FLAG: u32 = 0x{BANDED_FLAG:08X}u;"),
+        ] {
+            assert!(
+                src.contains(&expected),
+                "shaders.wgsl is missing `{expected}`"
+            );
         }
     }
 
