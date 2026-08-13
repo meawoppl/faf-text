@@ -49,6 +49,11 @@ enum Rasterized {
 pub struct Atlas {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
+    /// Bumped by the wholesale reset, the one event that invalidates a UV a
+    /// retained instance is holding. Ordinary eviction cannot: the renderer
+    /// touches the keys its blocks reference at every frame edge, so a live
+    /// glyph is never stale enough to be dropped.
+    pub generation: u64,
     size: u32,
     allocator: AtlasAllocator,
     entries: FxHashMap<CacheKey, Entry>,
@@ -84,6 +89,7 @@ impl Atlas {
         Self {
             texture,
             view,
+            generation: 0,
             size,
             allocator: AtlasAllocator::new(size2(size as i32, size as i32)),
             entries: FxHashMap::default(),
@@ -101,6 +107,20 @@ impl Atlas {
             self.needs_reset = false;
             self.allocator.clear();
             self.entries.clear();
+            self.generation += 1;
+        }
+    }
+
+    /// Stamp a glyph as used on `frame` without looking anything up.
+    ///
+    /// Eviction drops whatever was not drawn this frame or last, and a
+    /// retained block bakes its UVs once instead of asking again every frame —
+    /// so the renderer touches the keys its live blocks reference with the
+    /// frame about to start, or the shelf under them would be handed to another
+    /// glyph.
+    pub fn touch(&mut self, key: &CacheKey, frame: u64) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = frame;
         }
     }
 

@@ -129,11 +129,27 @@ impl GlyphCurves {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GlyphKey {
+pub struct GlyphKey {
     font_id: fontdb::ID,
     glyph_id: u16,
     weight: u16,
     flags: CacheKeyFlags,
+}
+
+impl GlyphKey {
+    pub fn new(
+        font_id: fontdb::ID,
+        glyph_id: u16,
+        weight: fontdb::Weight,
+        flags: CacheKeyFlags,
+    ) -> Self {
+        Self {
+            font_id,
+            glyph_id,
+            weight: weight.0,
+            flags,
+        }
+    }
 }
 
 /// A cached extraction: the curve range (or `None` for an outline-less glyph)
@@ -171,6 +187,15 @@ pub struct CurveStore {
     /// Bumped whenever `texture`/`view` are replaced or the packing is
     /// rewritten. Renderers compare it to decide on a bind-group rebuild.
     pub generation: u64,
+    /// Bumped only when compaction *moves* glyphs, which is the event that
+    /// invalidates a base texel a retained instance is holding. Growth
+    /// re-uploads the same packing to a taller texture and leaves every `first`
+    /// alone, so it deliberately does not bump this.
+    pub layout_generation: u64,
+    /// Old base texel → new base texel, for the glyphs that survived the last
+    /// compaction. Retained blocks patch their instances through this; a base
+    /// that is missing belonged to an evicted glyph.
+    pub relocations: FxHashMap<u32, u32>,
     device: wgpu::Device,
     /// CPU mirror of the packed curve floats; the un-uploaded tail is flushed
     /// to the texture by `flush`.
@@ -216,6 +241,8 @@ impl CurveStore {
             texture,
             view,
             generation: 0,
+            layout_generation: 0,
+            relocations: FxHashMap::default(),
             device: device.clone(),
             data: Vec::new(),
             entries: FxHashMap::default(),
@@ -278,6 +305,26 @@ impl CurveStore {
                 None
             }
         }
+    }
+
+    /// Stamp a glyph as used on `frame` without looking anything up.
+    ///
+    /// Retained blocks bake `first` into their instances once and never call
+    /// [`CurveStore::get_or_insert`] again, so to the LRU their glyphs would
+    /// look colder every frame. The renderer touches the keys its live blocks
+    /// reference with the frame about to start — before [`CurveStore::
+    /// begin_frame`] runs the deferred compaction — so retained content is
+    /// never among the coldest half that compaction drops.
+    pub fn touch(&mut self, key: &GlyphKey, frame: u64) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = frame;
+        }
+    }
+
+    /// True once an allocation has failed at the cap: glyphs are falling back
+    /// to the bitmap atlas until the next frame edge compacts the store.
+    pub fn overflowed(&self) -> bool {
+        self.needs_compact
     }
 
     /// A glyph's outline in em units at one point on the `wght` axis. Size 1.0
@@ -436,8 +483,12 @@ impl CurveStore {
     /// Drop the least recently used half of the entries and repack the CPU
     /// mirror densely, rewriting `first` in the survivors. Only ever called at
     /// a frame edge, so no queued instance can reference what we move.
+    ///
+    /// Retained instances *do* outlive a frame edge, so every move is recorded
+    /// in [`CurveStore::relocations`] for the renderer to patch them through.
     fn compact(&mut self) {
         self.needs_compact = false;
+        self.relocations.clear();
         let mut order: Vec<(u64, GlyphKey)> = self
             .entries
             .iter()
@@ -448,7 +499,12 @@ impl CurveStore {
             self.entries.remove(key);
         }
 
-        let Self { entries, data, .. } = self;
+        let Self {
+            entries,
+            data,
+            relocations,
+            ..
+        } = self;
         let mut packed = Vec::with_capacity(data.len());
         for entry in entries.values_mut() {
             let Some(curves) = entry.curves.as_mut() else {
@@ -462,12 +518,15 @@ impl CurveStore {
             // are base-relative, so only `first` needs rewriting.
             let start = curves.first as usize * FLOATS_PER_TEXEL;
             let end = start + curves.texels as usize * FLOATS_PER_TEXEL;
-            curves.first = (packed.len() / FLOATS_PER_TEXEL) as u32;
+            let moved = (packed.len() / FLOATS_PER_TEXEL) as u32;
+            relocations.insert(curves.first, moved);
+            curves.first = moved;
             packed.extend_from_slice(&data[start..end]);
         }
         self.data = packed;
         self.uploaded_rows = 0;
         self.generation += 1;
+        self.layout_generation += 1;
     }
 
     /// Upload any rows of curve data added since the last flush.

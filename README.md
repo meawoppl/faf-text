@@ -57,8 +57,22 @@ the glyphs, highlight overlays render *over* them with alpha blending, both
 instanced. Hit-testing (pixel → cursor) and cursor-range → rect geometry are
 BiDi-aware, courtesy of cosmic-text's shaping and layout.
 
-A full frame is at most five draw calls: under-rects, vector glyphs, weight-
-blended vector glyphs, atlas glyphs, over-rects.
+**The scene is retained, and damage-tracked.** Content lives in blocks; each
+block owns a range of every instance arena (under-rects, vector glyphs,
+weight-blended glyphs, atlas glyphs, over-rects) and one entry in a
+dynamic-offset uniform buffer. Setting a block's content re-uploads that
+block's ranges and nothing else, so typing in a search box does not touch the
+document's glyphs. Moving a block writes 16 bytes of uniform — no instance is
+rebuilt, which is what makes scrolling and (later) 3D pane placement free.
+Dropping blocks frees their ranges to a per-arena free list, and an arena
+repacks itself once more than half of it is holes. When nothing changed at
+all, `damaged()` says so and the host can skip recording and presenting
+entirely — an idle window costs zero draw calls.
+
+A block draws in at most five calls (under-rects, vector glyphs, weight-blended
+vector glyphs, atlas glyphs, over-rects) and blocks composite in creation
+order. The immediate-mode `begin`/`rect`/`text`/`finish` API is still there,
+as a wrapper over one block that is rebuilt every frame.
 
 ## Compatibility
 
@@ -95,7 +109,13 @@ python3 -m http.server -d web 8000
 
 - A glyph that overflows a capped store falls back for the frame it overflowed
   in (curves → atlas, atlas → skipped glyph); it renders normally from the next
-  frame on, once eviction has made room.
+  frame on, once eviction has made room. A retained block built during such a
+  frame keeps the fallback until its content is set again — `block_stale()`
+  reports which blocks are in that state.
+- A retained block's glyphs are kept warm in both stores and follow the curve
+  texture through compaction, but the atlas's last-resort wholesale reset
+  invalidates every UV: blocks with emoji in them lose those glyphs (and go
+  stale) until they are re-set.
 - Weight blending moves outlines, not advances: those come from shaping, at
   the attrs weight. Blending far from it reads tight or loose, so animate
   around the shaped weight rather than across the whole axis.

@@ -8,6 +8,20 @@ struct Globals {
 @group(0) @binding(2) var atlas_samp: sampler;
 @group(0) @binding(3) var curve_tex: texture_2d<f32>;
 
+// Where a retained block sits. One uniform buffer holds every block's copy and
+// the draw loop binds this at the block's dynamic offset — uniform buffers
+// with dynamic offsets are WebGL2-clean, storage buffers are not.
+//
+// Headroom: the buffer's stride is a full 256 bytes, so issue #9 can widen
+// this to a mat4x4 (a pane placed in 3D) without touching the layout, the bind
+// group or the draw loop — `place` becomes a matrix multiply and every vertex
+// entry point below already routes through it.
+struct BlockXform {
+    offset: vec2<f32>,
+    _pad: vec2<f32>,
+};
+@group(1) @binding(0) var<uniform> block_xf: BlockXform;
+
 // Must match CURVE_TEX_WIDTH in curves.rs.
 const CURVE_TEX_WIDTH: u32 = 256u;
 // Bands per axis. Must match BANDS in curves.rs.
@@ -30,8 +44,14 @@ fn quad_corner(vi: u32) -> vec2<f32> {
     return corners[vi];
 }
 
+// Block-local pixels to screen pixels. Adding zero is exact, so a block parked
+// at the origin renders bit-for-bit like the unplaced geometry did.
+fn place(px: vec2<f32>) -> vec2<f32> {
+    return px + block_xf.offset;
+}
+
 fn to_clip(px: vec2<f32>) -> vec4<f32> {
-    let ndc = px / globals.screen_size * 2.0 - 1.0;
+    let ndc = place(px) / globals.screen_size * 2.0 - 1.0;
     return vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
 }
 

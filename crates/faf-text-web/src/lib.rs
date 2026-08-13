@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use faf_text::cosmic_text::{Attrs, Cursor, Family, Metrics};
-use faf_text::{Color, FontSystem, RectLayer, TextRenderer, TextView};
+use faf_text::{BlockContent, BlockId, Color, FontSystem, Rect, TextRenderer, TextView};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -53,6 +53,37 @@ fn cursor_of(text: &str, offset: usize) -> Cursor {
     Cursor::new(0, 0)
 }
 
+/// Which retained blocks a mutation invalidated. Everything the demo draws
+/// lives in one of four blocks, and a change to one of them re-uploads that
+/// block's instances and nothing else — typing in the search box never touches
+/// the text block's several thousand glyphs.
+#[derive(Clone, Copy, Default)]
+struct Dirty {
+    text: bool,
+    selection: bool,
+    search: bool,
+    caret: bool,
+}
+
+impl Dirty {
+    /// A re-shape moves every piece of geometry, so it dirties everything.
+    fn all() -> Self {
+        Self {
+            text: true,
+            selection: true,
+            search: true,
+            caret: true,
+        }
+    }
+
+    /// The caret moved: selection geometry and the caret follow it, the text
+    /// does not.
+    fn cursor(&mut self) {
+        self.selection = true;
+        self.caret = true;
+    }
+}
+
 #[wasm_bindgen]
 pub struct FafTextDemo {
     surface: wgpu::Surface<'static>,
@@ -80,6 +111,14 @@ pub struct FafTextDemo {
     /// GPU weight blend for the whole view, and with it the family the text is
     /// shaped in: `None` is the static demo font, `Some(t)` the variable one.
     weight_blend: Option<f32>,
+    /// The scene, in z-order. Selection sits in its own block *below* the text
+    /// because blocks composite in creation order — a block's own under-rects
+    /// only go under its own glyphs. Search highlights and the caret go above.
+    selection_block: BlockId,
+    text_block: BlockId,
+    search_block: BlockId,
+    caret_block: BlockId,
+    dirty: Dirty,
 }
 
 #[wasm_bindgen]
@@ -159,7 +198,11 @@ impl FafTextDemo {
         };
         surface.configure(&device, &config);
 
-        let renderer = TextRenderer::new(&device, format);
+        let mut renderer = TextRenderer::new(&device, format);
+        let selection_block = renderer.create_block();
+        let text_block = renderer.create_block();
+        let search_block = renderer.create_block();
+        let caret_block = renderer.create_block();
         let mut font_system = faf_text::font_system_from_fonts(&[
             faf_text::FONT_DEJAVU_SANS,
             faf_text::FONT_DEJAVU_SANS_MONO,
@@ -198,6 +241,11 @@ impl FafTextDemo {
             dragging: false,
             search: String::new(),
             weight_blend: None,
+            selection_block,
+            text_block,
+            search_block,
+            caret_block,
+            dirty: Dirty::all(),
         })
     }
 
@@ -219,10 +267,14 @@ impl FafTextDemo {
     }
 
     pub fn set_font_size(&mut self, size: f32) {
+        if self.font_size == size {
+            return;
+        }
         self.font_size = size;
         let px = size * self.dpr;
         self.view
             .set_metrics(&mut self.font_system, Metrics::new(px, px * 1.5));
+        self.dirty = Dirty::all();
     }
 
     /// Blend the whole view between the variable font's lightest and boldest
@@ -233,14 +285,26 @@ impl FafTextDemo {
     pub fn set_weight_blend(&mut self, t: Option<f32>) {
         // Only the font swap needs a re-shape; the blend itself is free.
         let reshape = t.is_some() != self.weight_blend.is_some();
-        self.weight_blend = t.map(|t| t.clamp(0.0, 1.0));
+        let t = t.map(|t| t.clamp(0.0, 1.0));
+        if t == self.weight_blend {
+            return;
+        }
+        self.weight_blend = t;
         if reshape {
             self.reshape();
+        } else {
+            // The blend is baked into each glyph instance, so animating it is
+            // one block's worth of re-upload and no shaping at all.
+            self.dirty.text = true;
         }
     }
 
     pub fn set_search(&mut self, needle: &str) {
+        if self.search == needle {
+            return;
+        }
         self.search = needle.to_string();
+        self.dirty.search = true;
     }
 
     pub fn resize(&mut self, width: u32, height: u32, dpr: f32) {
@@ -257,6 +321,7 @@ impl FafTextDemo {
             Some(self.config.width as f32 - 2.0 * MARGIN * dpr),
             None,
         );
+        self.dirty = Dirty::all();
     }
 
     /// Pointer coordinates are CSS px relative to the canvas.
@@ -302,7 +367,11 @@ impl FafTextDemo {
     /// Caret blink is host-side: JS toggles this on a timer and resets it on
     /// every edit or motion.
     pub fn set_caret_visible(&mut self, visible: bool) {
+        if self.caret_visible == visible {
+            return;
+        }
         self.caret_visible = visible;
+        self.dirty.caret = true;
     }
 
     /// Handle a `keydown`. `key` is the raw `KeyboardEvent.key` value; any
@@ -383,6 +452,7 @@ impl FafTextDemo {
                 self.anchor = Cursor::new(0, 0);
                 self.cursor = cursor_of(&self.text, self.text.len());
                 self.sticky_x = None;
+                self.dirty.cursor();
                 true
             }
             // Copy/cut/paste stay with the browser's clipboard events.
@@ -441,7 +511,10 @@ impl FafTextDemo {
         }
     }
 
-    pub fn render(&mut self) -> Result<(), JsValue> {
+    /// Draw a frame, unless nothing changed since the last one. Returns whether
+    /// anything was actually rendered and presented — an idle demo renders
+    /// zero frames per second and the canvas still shows the right thing.
+    pub fn render(&mut self) -> Result<bool, JsValue> {
         self.render_frame()
     }
 }
@@ -461,6 +534,7 @@ impl FafTextDemo {
             &self.text,
             &Attrs::new().family(family),
         );
+        self.dirty = Dirty::all();
     }
 
     /// Move the caret; `extend` keeps the selection anchor put (Shift+motion).
@@ -469,6 +543,7 @@ impl FafTextDemo {
         if !extend {
             self.anchor = cursor;
         }
+        self.dirty.cursor();
     }
 
     fn selection_range(&self) -> Option<Range<usize>> {
@@ -491,60 +566,135 @@ impl FafTextDemo {
         self.set_cursor(cursor_of(&self.text, end), false);
     }
 
-    fn render_frame(&mut self) -> Result<(), JsValue> {
+    /// Rect in block-local pixels: every block is parked at the text origin, so
+    /// the margin (and any future scroll) is a uniform, not geometry.
+    fn local(&self, r: Rect) -> Rect {
+        [r[0] - self.view.pos[0], r[1] - self.view.pos[1], r[2], r[3]]
+    }
+
+    /// Push whatever changed since the last frame into the blocks that own it.
+    fn sync_blocks(&mut self) {
+        let origin = self.view.pos;
+        for block in [
+            self.selection_block,
+            self.text_block,
+            self.search_block,
+            self.caret_block,
+        ] {
+            self.renderer.set_block_offset(block, origin);
+        }
+
+        if std::mem::take(&mut self.dirty.text) {
+            self.renderer.set_block_content(
+                &self.queue,
+                &mut self.font_system,
+                self.text_block,
+                &BlockContent {
+                    buffer: Some(&self.view.buffer),
+                    pos: [0.0, 0.0],
+                    default_color: FOREGROUND,
+                    weight: self.weight_blend,
+                    ..Default::default()
+                },
+            );
+        }
+
+        if std::mem::take(&mut self.dirty.selection) {
+            let rects: Vec<(Rect, Color)> = match self.selection_range() {
+                Some(_) => self
+                    .view
+                    .selection_rects(self.anchor, self.cursor)
+                    .into_iter()
+                    .map(|r| (self.local(r), SELECTION))
+                    .collect(),
+                None => Vec::new(),
+            };
+            self.renderer.set_block_content(
+                &self.queue,
+                &mut self.font_system,
+                self.selection_block,
+                &BlockContent {
+                    under_rects: &rects,
+                    ..Default::default()
+                },
+            );
+        }
+
+        if std::mem::take(&mut self.dirty.search) {
+            let mut rects: Vec<(Rect, Color)> = Vec::new();
+            if !self.search.is_empty() {
+                for (a, b) in self.view.find_all(&self.search) {
+                    rects.extend(
+                        self.view
+                            .selection_rects(a, b)
+                            .into_iter()
+                            .map(|r| (self.local(r), HIGHLIGHT)),
+                    );
+                }
+            }
+            self.renderer.set_block_content(
+                &self.queue,
+                &mut self.font_system,
+                self.search_block,
+                &BlockContent {
+                    over_rects: &rects,
+                    ..Default::default()
+                },
+            );
+        }
+
+        if std::mem::take(&mut self.dirty.caret) {
+            let mut rects: Vec<(Rect, Color)> = Vec::new();
+            // IME preedit: underline the composing run so it reads as
+            // provisional.
+            if let Some(range) = self.composition.clone() {
+                let start = cursor_of(&self.text, range.start);
+                let end = cursor_of(&self.text, range.end);
+                for r in self.view.selection_rects(start, end) {
+                    let r = self.local(r);
+                    rects.push((
+                        [r[0], r[1] + r[3] - CARET_WIDTH, r[2], CARET_WIDTH],
+                        FOREGROUND,
+                    ));
+                }
+            }
+            if let Some(r) = self
+                .view
+                .cursor_rect(self.cursor)
+                .filter(|_| self.caret_visible)
+            {
+                let r = self.local(r);
+                rects.push(([r[0], r[1], CARET_WIDTH, r[3]], CARET));
+            }
+            self.renderer.set_block_content(
+                &self.queue,
+                &mut self.font_system,
+                self.caret_block,
+                &BlockContent {
+                    over_rects: &rects,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    fn render_frame(&mut self) -> Result<bool, JsValue> {
+        self.renderer.begin_frame();
+        self.sync_blocks();
+        // Nothing changed: what is on the canvas is still right, so there is
+        // no pass to record and no frame to present.
+        if !self.renderer.damaged() {
+            return Ok(false);
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             // Transient states: skip this frame and let rAF try again.
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         let target = frame.texture.create_view(&Default::default());
 
-        self.renderer.begin();
-
-        if self.selection_range().is_some() {
-            for r in self.view.selection_rects(self.anchor, self.cursor) {
-                self.renderer
-                    .rect([r[0], r[1]], [r[2], r[3]], SELECTION, RectLayer::Under);
-            }
-        }
-        // IME preedit: underline the composing run so it reads as provisional.
-        if let Some(range) = self.composition.clone() {
-            let start = cursor_of(&self.text, range.start);
-            let end = cursor_of(&self.text, range.end);
-            for r in self.view.selection_rects(start, end) {
-                self.renderer.rect(
-                    [r[0], r[1] + r[3] - CARET_WIDTH],
-                    [r[2], CARET_WIDTH],
-                    FOREGROUND,
-                    RectLayer::Over,
-                );
-            }
-        }
-        if !self.search.is_empty() {
-            for (a, b) in self.view.find_all(&self.search) {
-                for r in self.view.selection_rects(a, b) {
-                    self.renderer
-                        .rect([r[0], r[1]], [r[2], r[3]], HIGHLIGHT, RectLayer::Over);
-                }
-            }
-        }
-        if let Some(r) = self
-            .view
-            .cursor_rect(self.cursor)
-            .filter(|_| self.caret_visible)
-        {
-            self.renderer
-                .rect([r[0], r[1]], [CARET_WIDTH, r[3]], CARET, RectLayer::Over);
-        }
-        self.renderer.text_with_weight(
-            &self.queue,
-            &mut self.font_system,
-            &self.view.buffer,
-            self.view.pos,
-            FOREGROUND,
-            self.weight_blend,
-        );
         self.renderer.finish(
             &self.device,
             &self.queue,
@@ -578,6 +728,6 @@ impl FafTextDemo {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
-        Ok(())
+        Ok(true)
     }
 }

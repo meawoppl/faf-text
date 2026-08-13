@@ -7,7 +7,7 @@ emoji, rect layers for selection/highlight. See README.md for architecture.
 Project goal: a rich text interface usable in 2D panes and eventually 3D
 spaces. The fwidth-based analytic AA is perspective-correct by construction,
 so 3D is plumbing (per-pane matrices, ray hit-testing — issue #9), not an
-algorithm change. Roadmap lives in issues #2–#11.
+algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) performance follow-ups in #12–#15.
 
 ## Repo patterns
 
@@ -30,7 +30,15 @@ algorithm change. Roadmap lives in issues #2–#11.
 - GPU unit tests are fine and expected: `src/testing.rs` (cfg(test)) hands out
   one shared headless device plus `render_pixels` for readback comparisons.
   `cargo test -p faf-text` exercises curve-texture growth and eviction on the
-  real GPU.
+  real GPU. The clear color is opaque black, so readbacks come back with alpha
+  255 everywhere: "drew nothing" must be asserted on RGB (`tests::drew`), never
+  on "every byte is zero".
+- Browser check: `python3 -m http.server -d web PORT` plus `google-chrome
+  --headless=new --use-angle=swiftshader --enable-unsafe-swiftshader
+  --enable-logging=stderr --screenshot=… --virtual-time-budget=60000`. The
+  budget has to be generous: with the damage fast-out an idle demo presents
+  nothing, virtual time races ahead, and a smaller budget screenshots before
+  the first rAF tick even runs. `console.log` shows up as `INFO:CONSOLE`.
 
 ## Hard-won knowledge
 
@@ -83,6 +91,28 @@ algorithm change. Roadmap lives in issues #2–#11.
   and `TextRenderer::finish` rebuilds the bind group when it changes.
 - `wgpu::Device` is `Clone` (an Arc handle), so `CurveStore` keeps its own copy
   and can recreate its texture without threading a `&Device` through `text()`.
+- Retained scene graph (`renderer.rs` + `arena.rs`): a block owns one `Span`
+  (start/cap/len, in instances) per arena and one slot in a dynamic-offset
+  uniform buffer, stride `max(256, min_uniform_buffer_offset_alignment)`.
+  Screen size stayed a separate global rather than being duplicated per block,
+  so a resize writes 16 bytes instead of dirtying every block; the block
+  uniform holds only placement, which is what #9 widens to a mat4.
+- Arena mirrors are `Vec<u32>`, not `Vec<u8>`: a byte vec is only 1-aligned and
+  `bytemuck::cast_slice` to an instance type may panic on it.
+- **WebGL2 has no base-instance draw**, so a block's range is addressed by
+  offsetting the vertex buffer (`buffer.slice(byte_offset..)`, `draw(0..6,
+  0..len)`), never by `draw(.., first..last)`.
+- Retained instances bake raw curve texel bases and atlas UVs, which the stores
+  are otherwise free to move at a frame edge. Three things keep that honest:
+  `begin_frame` touches every live block's glyph keys *before* the stores
+  evict (so live content is never in the LRU's cold half),
+  `CurveStore::relocations` (old base → new) lets compaction be patched in
+  place, and the atlas's wholesale reset bumps `Atlas::generation`, which
+  blanks retained atlas quads and marks those blocks stale.
+- Per-block layering is *within* a block; blocks composite in creation order.
+  A selection underlay therefore belongs in a block created *before* the text
+  block, not in the text block's `under_rects` — which is why the web demo has
+  four blocks (selection, text, search, caret) rather than three.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.

@@ -10,6 +10,7 @@
 //! Everything is plain wgpu with WebGL2-safe choices (data textures instead of
 //! storage buffers), so the same code runs native, WebGPU, and WebGL2.
 
+mod arena;
 mod atlas;
 mod curves;
 mod document;
@@ -19,7 +20,7 @@ mod testing;
 mod view;
 
 pub use document::{CHUNK_LINES, DocCursor, DocStats, Document, RETAIN_CHUNKS, WINDOW_CHUNKS};
-pub use renderer::{RectLayer, TextRenderer};
+pub use renderer::{BlockContent, BlockId, RectLayer, TextRenderer, UploadStats};
 pub use view::{Rect, TextView};
 
 pub use cosmic_text;

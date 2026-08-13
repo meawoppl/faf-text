@@ -207,10 +207,13 @@ async function main() {
     const box = canvas.getBoundingClientRect();
     ime.style.left = `${box.left + cx}px`;
     ime.style.top = `${box.top + cy + ch}px`;
-    demo.render();
-    frames++;
+    // render() returns false when the scene graph reports no damage: nothing
+    // was re-recorded and nothing was presented, so it does not count as a
+    // drawn frame. An idle demo sits at "idle" — that is the point.
+    if (demo.render()) frames++;
     if (now - last > 500) {
-      fpsEl.textContent = `${(frames * 1000 / (now - last)).toFixed(0)} fps`;
+      const fps = frames * 1000 / (now - last);
+      fpsEl.textContent = frames === 0 ? 'idle' : `${fps.toFixed(0)} fps`;
       frames = 0; last = now;
     }
     requestAnimationFrame(tick);
