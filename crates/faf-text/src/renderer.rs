@@ -17,6 +17,110 @@ struct Globals {
     _pad: [f32; 2],
 }
 
+/// The space glyph coverage is composited in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoverageBlend {
+    /// Blend in the target's own encoding — for the usual 8-bit sRGB surface,
+    /// that means blending sRGB values directly. Physically wrong and what
+    /// every browser and desktop toolkit does; it is also the only thing a
+    /// non-sRGB target *can* do. The default, and the only mode that leaves
+    /// output identical to pre-#11 faf-text.
+    #[default]
+    Gamma,
+    /// Blend in linear light: pipelines render into the sRGB *view* of the
+    /// target (see [`RendererOptions::target_format`]), so the hardware
+    /// decodes, blends and re-encodes, and instance colors are converted
+    /// sRGB → linear on the CPU. Coverage gets a contrast correction first —
+    /// linear blending on its own thins dark-on-light stems.
+    Linear,
+}
+
+/// LCD subpixel coverage: one coverage value per color stripe instead of one
+/// per pixel, which triples the effective horizontal resolution of small text
+/// on a striped LCD (and looks like colored fringes on anything else).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Subpixel {
+    /// One grayscale coverage per pixel. The default.
+    #[default]
+    Off,
+    /// Three coverages per pixel for the horizontal (R, G, B left to right)
+    /// stripe order, which is what almost every desktop LCD uses.
+    ///
+    /// Vector glyphs only — the bitmap atlas path (color emoji) stays
+    /// grayscale — and only on blocks whose placement is still an axis-aligned
+    /// scale and translation: a rotated or perspective-projected pane has no
+    /// stripe axis to sample along, so those blocks silently draw grayscale.
+    Rgb,
+}
+
+/// Construction-time quality options for [`TextRenderer::with_options`].
+///
+/// Both settings pick *pipeline variants* rather than shader uniforms — the
+/// fragment shader for glyphs is the hot path, where even a never-taken branch
+/// has measured 25% — so neither can change after the renderer is built. What
+/// a host actually got is [`TextRenderer::effective_options`], which reports
+/// the fallback when the device cannot do what was asked.
+///
+/// # Host obligations
+///
+/// - [`CoverageBlend::Linear`] renders into `format.add_srgb_suffix()`. A
+///   surface has to be configured with that format in its `view_formats` (and
+///   an offscreen texture created the same way) or the pipelines will not be
+///   compatible with the attachment. See [`RendererOptions::target_format`].
+/// - [`Subpixel::Rgb`] needs [`wgpu::Features::DUAL_SOURCE_BLENDING`] on the
+///   device — request it only when the adapter reports it, which
+///   [`RendererOptions::required_features`] spells out. WebGL2 never has it,
+///   so the web build silently gets [`Subpixel::Off`].
+/// - Subpixel output also assumes an unrotated, integer-scale, horizontally
+///   striped RGB target. The renderer polices the first part per block (see
+///   [`Subpixel::Rgb`]); the panel's stripe order and geometry it cannot know.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RendererOptions {
+    pub blend: CoverageBlend,
+    pub subpixel: Subpixel,
+}
+
+impl RendererOptions {
+    /// Device features these options need. Hosts pass this to
+    /// `request_device` — after intersecting it with the adapter's own
+    /// features, since asking for a missing feature fails device creation
+    /// outright, while the renderer falls back gracefully.
+    pub fn required_features(&self) -> wgpu::Features {
+        match self.subpixel {
+            Subpixel::Off => wgpu::Features::empty(),
+            Subpixel::Rgb => wgpu::Features::DUAL_SOURCE_BLENDING,
+        }
+    }
+
+    /// The format the renderer's pipelines write to, given the host's surface
+    /// format. Identical to `format` except under [`CoverageBlend::Linear`],
+    /// which needs the sRGB view of it — a host must then list this in the
+    /// surface configuration's `view_formats` (or its offscreen texture's) and
+    /// render into a view created with it.
+    ///
+    /// A format with no sRGB counterpart (`Rgba16Float`, say) comes back
+    /// unchanged: such a target already blends in linear light, so linear mode
+    /// is just the CPU-side color conversion plus the contrast correction.
+    pub fn target_format(&self, format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+        match self.blend {
+            CoverageBlend::Gamma => format,
+            CoverageBlend::Linear => format.add_srgb_suffix(),
+        }
+    }
+}
+
+/// The sRGB electro-optical transfer function (IEC 61966-2-1): encoded value
+/// to linear light. Used on instance colors under [`CoverageBlend::Linear`],
+/// where the hardware re-encodes on the way out, so a color a host wrote as
+/// `#c0caf5` still lands as `#c0caf5` where coverage is 1.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Per-block data, one copy per block in a single uniform buffer bound at a
 /// dynamic offset. Uniform buffers with dynamic offsets are WebGL2-clean;
 /// storage buffers are not, so this stays a uniform however big it gets.
@@ -156,7 +260,7 @@ const SQUIGGLE_THICKNESS: f32 = 1.0 / 3.0;
 const SQUIGGLE_WAVELENGTH: f32 = 2.0;
 
 impl DecorationInstance {
-    fn new(rect: Rect, kind: DecorationKind, color: Color) -> Self {
+    fn new(rect: Rect, kind: DecorationKind, color: [f32; 4]) -> Self {
         let (code, params) = match kind {
             DecorationKind::Underline | DecorationKind::Strikethrough => (DECO_SOLID, [0.0; 4]),
             DecorationKind::Squiggle => {
@@ -177,7 +281,7 @@ impl DecorationInstance {
         Self {
             pos: [rect[0], rect[1]],
             size: [rect[2], rect[3]],
-            color: color.0,
+            color,
             params,
             kind: code,
             _pad: [0; 3],
@@ -296,6 +400,12 @@ struct Block {
     visible: bool,
     /// Index of this block's uniform in the per-block uniform buffer.
     slot: u32,
+    /// Whether this block's placement still has an LCD stripe axis to sample
+    /// along — derived from the composed matrix alongside the snap flag, so it
+    /// follows the block's transform *and* the scene's projection. Blocks that
+    /// lose it draw their glyphs with the grayscale pipelines; picking a
+    /// pipeline is per-block-per-layer anyway, so this costs nothing.
+    subpixel_ok: bool,
     content_dirty: bool,
     uniform_dirty: bool,
     /// The content was built while a glyph store was out of room, or a glyph
@@ -316,6 +426,7 @@ impl Block {
             z: 0.0,
             visible: true,
             slot,
+            subpixel_ok: true,
             content_dirty: false,
             // The buffer's contents are undefined until written.
             uniform_dirty: true,
@@ -401,6 +512,12 @@ pub struct TextRenderer {
     /// Same shaders with `BLEND_MASTERS` on, for the glyphs that have a
     /// second variable-font master.
     blend_pipeline: wgpu::RenderPipeline,
+    /// The two above with LCD subpixel coverage and dual-source blending, when
+    /// [`Subpixel::Rgb`] was asked for and the device could do it. Blocks that
+    /// are no longer axis-aligned fall back to the grayscale pair, which is why
+    /// this is a per-draw choice rather than a swap.
+    subpixel_pipelines: Option<[wgpu::RenderPipeline; 2]>,
+    options: RendererOptions,
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -455,18 +572,67 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
+    /// A renderer with default options: grayscale coverage, blended in the
+    /// target's own space. [`TextRenderer::with_options`] for the rest.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        Self::with_stores(device, format, Atlas::new(device), CurveStore::new(device))
+        Self::with_options(device, format, RendererOptions::default())
     }
 
-    /// Build a renderer around pre-sized glyph stores (tests use tiny ones to
-    /// exercise growth and eviction).
+    /// A renderer with LCD subpixel coverage and/or gamma-correct blending.
+    /// Read [`RendererOptions`] first: both options put obligations on the host
+    /// (a device feature, a surface `view_formats` entry), and an option the
+    /// device cannot honor is dropped rather than fatal —
+    /// [`TextRenderer::effective_options`] reports what survived.
+    pub fn with_options(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        options: RendererOptions,
+    ) -> Self {
+        Self::build(
+            device,
+            format,
+            options,
+            Atlas::new(device),
+            CurveStore::new(device),
+        )
+    }
+
+    /// Build a renderer around pre-sized glyph stores: the tests use tiny ones
+    /// to exercise growth and eviction.
+    #[cfg(test)]
     pub(crate) fn with_stores(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         atlas: Atlas,
         curves: CurveStore,
     ) -> Self {
+        Self::build(device, format, RendererOptions::default(), atlas, curves)
+    }
+
+    fn build(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        requested: RendererOptions,
+        atlas: Atlas,
+        curves: CurveStore,
+    ) -> Self {
+        // Subpixel coverage needs per-channel blend factors, which is a device
+        // feature the host had to ask for at `request_device` time. Falling
+        // back beats panicking: a WebGL2 host asking for the best it can get
+        // should simply get grayscale.
+        let dual_source = device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let options = RendererOptions {
+            blend: requested.blend,
+            subpixel: match requested.subpixel {
+                Subpixel::Rgb if dual_source => Subpixel::Rgb,
+                _ => Subpixel::Off,
+            },
+        };
+        let format = options.target_format(format);
+        let linear = (options.blend == CoverageBlend::Linear) as u32 as f64;
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("faf-text shaders"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
@@ -572,7 +738,7 @@ impl TextRenderer {
             immediate_size: 0,
         });
 
-        let blend = wgpu::BlendState {
+        let src_over = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
                 dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -584,12 +750,33 @@ impl TextRenderer {
                 operation: wgpu::BlendOperation::Add,
             },
         };
+        // Src1 is the fragment shader's second output, one coverage per color
+        // stripe: `color * coverage + dst * (1 - coverage)`, per channel. The
+        // alpha component keeps the src-over above, over the widest stripe, so
+        // a glyph punches the same hole in a transparent target either way.
+        let lcd_over = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Src1,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1Alpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
 
         // `constants` specialize the fragment shader: the vector pipelines
-        // differ only in whether BLEND_MASTERS compiles the master-B fetch in.
+        // differ only in whether BLEND_MASTERS compiles the master-B fetch in,
+        // and LINEAR_BLEND likewise folds the gamma correction away when it is
+        // off. `module` is the base shader everywhere but the subpixel
+        // pipelines, which need one that enables dual-source blending.
         let make_pipeline = |label: &str,
+                             module: &wgpu::ShaderModule,
                              vs: &str,
                              fs: &str,
+                             blend: wgpu::BlendState,
                              stride: u64,
                              attrs: &[wgpu::VertexAttribute],
                              constants: &[(&str, f64)]| {
@@ -597,7 +784,7 @@ impl TextRenderer {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &shader,
+                    module,
                     entry_point: Some(vs),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
@@ -607,7 +794,7 @@ impl TextRenderer {
                     })],
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &shader,
+                    module,
                     entry_point: Some(fs),
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants,
@@ -634,16 +821,20 @@ impl TextRenderer {
 
         let rect_pipeline = make_pipeline(
             "faf-text rects",
+            &shader,
             "rect_vs",
             "rect_fs",
+            src_over,
             rect_stride as u64,
             &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
             &[],
         );
         let deco_pipeline = make_pipeline(
             "faf-text decorations",
+            &shader,
             "deco_vs",
             "deco_fs",
+            src_over,
             deco_stride as u64,
             &wgpu::vertex_attr_array![
                 0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Uint32
@@ -652,14 +843,16 @@ impl TextRenderer {
         );
         let atlas_pipeline = make_pipeline(
             "faf-text atlas glyphs",
+            &shader,
             "glyph_vs",
             "glyph_fs",
+            src_over,
             atlas_stride as u64,
             &wgpu::vertex_attr_array![
                 0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
                 3 => Float32x2, 4 => Float32x4, 5 => Uint32
             ],
-            &[],
+            &[("LINEAR_BLEND", linear)],
         );
         let vector_attrs = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
@@ -668,20 +861,62 @@ impl TextRenderer {
         ];
         let vector_pipeline = make_pipeline(
             "faf-text vector glyphs",
+            &shader,
             "vector_vs",
             "vector_fs",
+            src_over,
             vector_stride as u64,
             &vector_attrs,
-            &[],
+            &[("LINEAR_BLEND", linear)],
         );
         let blend_pipeline = make_pipeline(
             "faf-text vector glyphs (two masters)",
+            &shader,
             "vector_vs",
             "vector_fs",
+            src_over,
             vector_stride as u64,
             &vector_attrs,
-            &[("BLEND_MASTERS", 1.0)],
+            &[("BLEND_MASTERS", 1.0), ("LINEAR_BLEND", linear)],
         );
+        // The subpixel module is built only where it can exist: its `enable
+        // dual_source_blending` directive is validated against the device's own
+        // capabilities, so a device without the feature could not create it at
+        // all. It is shaders.wgsl plus the extra entry point, because the LCD
+        // fragment shader reuses every bit of the winding machinery.
+        let subpixel_pipelines = (options.subpixel == Subpixel::Rgb).then(|| {
+            let source = format!(
+                "enable dual_source_blending;\n{}\n{}",
+                include_str!("shaders.wgsl"),
+                include_str!("subpixel.wgsl")
+            );
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("faf-text subpixel shaders"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            [
+                make_pipeline(
+                    "faf-text vector glyphs (subpixel)",
+                    &module,
+                    "vector_vs",
+                    "vector_subpixel_fs",
+                    lcd_over,
+                    vector_stride as u64,
+                    &vector_attrs,
+                    &[("LINEAR_BLEND", linear)],
+                ),
+                make_pipeline(
+                    "faf-text vector glyphs (subpixel, two masters)",
+                    &module,
+                    "vector_vs",
+                    "vector_subpixel_fs",
+                    lcd_over,
+                    vector_stride as u64,
+                    &vector_attrs,
+                    &[("BLEND_MASTERS", 1.0), ("LINEAR_BLEND", linear)],
+                ),
+            ]
+        });
 
         let mut renderer = Self {
             rect_pipeline,
@@ -689,6 +924,8 @@ impl TextRenderer {
             atlas_pipeline,
             vector_pipeline,
             blend_pipeline,
+            subpixel_pipelines,
+            options,
             bind_group,
             bind_group_layout,
             sampler,
@@ -965,6 +1202,32 @@ impl TextRenderer {
         self.uploads
     }
 
+    /// The options this renderer was actually built with, which differ from
+    /// the ones it was asked for whenever the device could not honor them:
+    /// [`Subpixel::Rgb`] without [`wgpu::Features::DUAL_SOURCE_BLENDING`]
+    /// comes back [`Subpixel::Off`]. Hosts that adapt their surface
+    /// configuration (or their UI) to the result should read it from here
+    /// rather than assume.
+    pub fn effective_options(&self) -> RendererOptions {
+        self.options
+    }
+
+    /// An instance color in the space the pipelines blend in. Under the
+    /// default (gamma) blend this is the identity, and instance data is
+    /// bit-for-bit what it always was.
+    fn shade(&self, color: Color) -> [f32; 4] {
+        match self.options.blend {
+            CoverageBlend::Gamma => color.0,
+            // Alpha is a coverage, not a color: it stays linear either way.
+            CoverageBlend::Linear => [
+                srgb_to_linear(color.0[0]),
+                srgb_to_linear(color.0[1]),
+                srgb_to_linear(color.0[2]),
+                color.0[3],
+            ],
+        }
+    }
+
     // ---- Immediate mode ----
 
     /// Start a new frame in immediate mode: advances the frame and clears the
@@ -1145,18 +1408,6 @@ impl TextRenderer {
     /// glyphs, atlas glyphs, line decorations, over-rects.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(0, &self.bind_group, &[]);
-        // One entry per layer, in draw order: under-rects, chips, vector
-        // glyphs, weight-blended glyphs, atlas glyphs, line decorations,
-        // over-rects.
-        let pipelines = [
-            &self.rect_pipeline,
-            &self.deco_pipeline,
-            &self.vector_pipeline,
-            &self.blend_pipeline,
-            &self.atlas_pipeline,
-            &self.deco_pipeline,
-            &self.rect_pipeline,
-        ];
         for id in &self.order {
             let Some(block) = self.blocks.get(id) else {
                 continue;
@@ -1164,6 +1415,24 @@ impl TextRenderer {
             if !block.visible || block.is_empty() {
                 continue;
             }
+            // LCD coverage only means something on a block that still lands
+            // square on the pixel grid; the rest keep the grayscale pair.
+            let (vector, blend) = match &self.subpixel_pipelines {
+                Some([vector, blend]) if block.subpixel_ok => (vector, blend),
+                _ => (&self.vector_pipeline, &self.blend_pipeline),
+            };
+            // One entry per layer, in draw order: under-rects, chips, vector
+            // glyphs, weight-blended glyphs, atlas glyphs, line decorations,
+            // over-rects.
+            let pipelines = [
+                &self.rect_pipeline,
+                &self.deco_pipeline,
+                vector,
+                blend,
+                &self.atlas_pipeline,
+                &self.deco_pipeline,
+                &self.rect_pipeline,
+            ];
             pass.set_bind_group(
                 1,
                 &self.block_bind_group,
@@ -1192,7 +1461,7 @@ impl TextRenderer {
         let inst = RectInstance {
             pos: [rect[0], rect[1]],
             size: [rect[2], rect[3]],
-            color: color.0,
+            color: self.shade(color),
         };
         match layer {
             RectLayer::Under => self.scratch.under.push(inst),
@@ -1201,7 +1470,7 @@ impl TextRenderer {
     }
 
     fn push_decoration(&mut self, rect: Rect, kind: DecorationKind, color: Color) {
-        let inst = DecorationInstance::new(rect, kind, color);
+        let inst = DecorationInstance::new(rect, kind, self.shade(color));
         if kind.is_chip() {
             self.scratch.chips.push(inst);
         } else {
@@ -1222,10 +1491,12 @@ impl TextRenderer {
             let baseline_y = pos[1] + run.line_y;
             self.push_run_decorations(&run, pos, default_color);
             for glyph in run.glyphs.iter() {
-                let color = glyph
-                    .color_opt
-                    .map(Color::from_cosmic)
-                    .unwrap_or(default_color);
+                let color = self.shade(
+                    glyph
+                        .color_opt
+                        .map(Color::from_cosmic)
+                        .unwrap_or(default_color),
+                );
                 let font_size = glyph.font_size;
 
                 if let Some(gc) = self.curves.get_or_insert(
@@ -1266,7 +1537,7 @@ impl TextRenderer {
                         size: [(max_x - min_x) * font_size, (max_y - min_y) * font_size],
                         em_pos: [min_x, max_y],
                         em_size: [max_x - min_x, -(max_y - min_y)],
-                        color: color.0,
+                        color,
                         first: gc.first,
                         count: gc.instance_count(),
                         band_scale: [(max_x - min_x) / band_w, -(max_y - min_y) / band_h],
@@ -1304,7 +1575,7 @@ impl TextRenderer {
                         size: entry.size,
                         uv_pos: entry.uv_pos,
                         uv_size: entry.uv_size,
-                        color: color.0,
+                        color,
                         kind: entry.is_color as u32,
                         _pad: [0; 3],
                     });
@@ -1391,7 +1662,7 @@ impl TextRenderer {
         self.scratch.line_decos.push(DecorationInstance::new(
             rect,
             DecorationKind::Underline,
-            color,
+            self.shade(color),
         ));
     }
 
@@ -1546,6 +1817,8 @@ impl TextRenderer {
                 continue;
             }
             block.uniform_dirty = false;
+            let composed = compose(self.px_from_world, block.model);
+            block.subpixel_ok = subpixel_ok(composed);
             let uniform = block_uniform(self.px_from_world, block.model);
             queue.write_buffer(
                 &self.block_uniforms,
@@ -1612,15 +1885,31 @@ impl TextRenderer {
 /// is only *numerically* the identity — which is what keeps a 2D scene
 /// bit-for-bit identical to the pre-matrix renderer.
 fn block_uniform(px_from_world: Option<Mat4>, model: Mat4) -> BlockUniform {
-    let m = match px_from_world {
-        Some(px_from_world) => px_from_world * model,
-        None => model,
-    };
+    let m = compose(px_from_world, model);
     BlockUniform {
         transform: m.to_cols_array_2d(),
         flags: if is_axis_aligned(m) { BLOCK_SNAP } else { 0 },
         _pad: [0; 3],
     }
+}
+
+/// The matrix a block's uniform carries: its model composed with the host's
+/// projection, or the model alone under the default one — never a multiply by
+/// something that is only *numerically* the identity.
+fn compose(px_from_world: Option<Mat4>, model: Mat4) -> Mat4 {
+    match px_from_world {
+        Some(px_from_world) => px_from_world * model,
+        None => model,
+    }
+}
+
+/// Whether a placement can carry LCD subpixel coverage: an axis-aligned scale
+/// and translation (so screen x is still the stripe axis and one pixel is one
+/// sample), and not mirrored in x (which would swap the R and B stripes). Any
+/// other placement — a turn in the screen plane, a pane under perspective —
+/// draws its glyphs grayscale instead.
+fn subpixel_ok(m: Mat4) -> bool {
+    is_axis_aligned(m) && m.x_axis.x > 0.0
 }
 
 /// Whether a placement is an axis-aligned scale plus translation, i.e. whether
@@ -2568,6 +2857,226 @@ mod tests {
                 && (manual[0][0] - underline.pos[0]).abs() < 0.01
                 && (manual[0][2] - underline.size[0]).abs() < 0.01,
             "manual {manual:?} vs attribute {underline:?}"
+        );
+    }
+
+    // ---- Quality options ----
+
+    #[test]
+    fn the_srgb_transfer_function_inverts_to_the_iec_curve() {
+        // Endpoints are exact, the linear segment is a plain divide, and the
+        // canonical mid-gray is the number every color library agrees on.
+        assert_eq!(srgb_to_linear(0.0), 0.0);
+        assert_eq!(srgb_to_linear(1.0), 1.0);
+        assert!((srgb_to_linear(0.04) - 0.04 / 12.92).abs() < 1e-9);
+        assert!((srgb_to_linear(0.5) - 0.2140).abs() < 1e-4);
+        assert!((srgb_to_linear(128.0 / 255.0) - 0.2158).abs() < 1e-4);
+        // 0x80 in sRGB is *not* half the light, which is the whole point.
+        assert!(srgb_to_linear(0.5) < 0.5);
+    }
+
+    #[test]
+    fn options_the_device_cannot_honor_fall_back_to_the_defaults() {
+        let (device, _) = testing::gpu();
+        assert!(
+            !device
+                .features()
+                .contains(wgpu::Features::DUAL_SOURCE_BLENDING),
+            "the shared test device is built without the feature on purpose"
+        );
+
+        let asked = RendererOptions {
+            blend: CoverageBlend::Linear,
+            subpixel: Subpixel::Rgb,
+        };
+        assert_eq!(
+            asked.required_features(),
+            wgpu::Features::DUAL_SOURCE_BLENDING
+        );
+        assert_eq!(
+            RendererOptions::default().required_features(),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            asked.target_format(wgpu::TextureFormat::Rgba8Unorm),
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(
+            RendererOptions::default().target_format(wgpu::TextureFormat::Rgba8Unorm),
+            wgpu::TextureFormat::Rgba8Unorm,
+            "the default blend renders into the format it was handed"
+        );
+
+        let renderer = TextRenderer::with_options(
+            device,
+            asked.target_format(testing::FORMAT),
+            RendererOptions {
+                subpixel: Subpixel::Rgb,
+                ..asked
+            },
+        );
+        assert_eq!(
+            renderer.effective_options(),
+            RendererOptions {
+                blend: CoverageBlend::Linear,
+                subpixel: Subpixel::Off,
+            },
+            "subpixel needs a device feature; gamma mode needs nothing"
+        );
+        assert!(renderer.subpixel_pipelines.is_none());
+
+        // And the default renderer reports exactly what it is.
+        let plain = TextRenderer::new(device, testing::FORMAT);
+        assert_eq!(plain.effective_options(), RendererOptions::default());
+    }
+
+    #[test]
+    fn linear_blending_moves_the_edges_and_leaves_the_interiors() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Agex", 24.0, [6.0, 6.0]);
+
+        let mut gamma = renderer(2048, 2048);
+        let gamma_px = frame(&mut gamma, &mut font_system, &sample, None);
+
+        let mut linear = TextRenderer::with_options(
+            device,
+            testing::FORMAT,
+            RendererOptions {
+                blend: CoverageBlend::Linear,
+                ..Default::default()
+            },
+        );
+        let (_, queue) = testing::gpu();
+        linear.begin();
+        linear.text(
+            queue,
+            &mut font_system,
+            &sample.buffer,
+            sample.pos,
+            Color::WHITE,
+        );
+        // The linear pipelines target the sRGB view of the same texture, which
+        // is the host obligation `RendererOptions::target_format` spells out.
+        let linear_px = testing::render_pixels_on(
+            testing::gpu(),
+            &mut linear,
+            W,
+            H,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
+        assert!(ink(&gamma_px) > 0 && ink(&linear_px) > 0);
+        assert_ne!(gamma_px, linear_px, "linear blending is a different blend");
+        // Full coverage round-trips: a glyph interior is the color it was
+        // asked for either way, because the CPU-side sRGB → linear conversion
+        // and the hardware's encode on the way out are inverses.
+        assert!(pure_white(&gamma_px) > 0);
+        assert!(
+            pure_white(&linear_px) >= pure_white(&gamma_px),
+            "linear must not dim what was fully covered"
+        );
+        // Antialiased edges are the difference: blending white-ish coverage in
+        // linear light and re-encoding lands brighter than blending the
+        // encoded values directly.
+        assert!(
+            ink(&linear_px) > ink(&gamma_px),
+            "linear {} vs gamma {}",
+            ink(&linear_px),
+            ink(&gamma_px)
+        );
+    }
+
+    #[test]
+    fn subpixel_coverage_only_survives_an_axis_aligned_placement() {
+        // The same predicate the snap flag uses, minus mirroring: LCD stripes
+        // have an order, and a block flipped in x would hand R the light B
+        // should get.
+        assert!(subpixel_ok(Mat4::IDENTITY));
+        assert!(subpixel_ok(Mat4::from_translation(glam::vec3(
+            3.0, 7.5, 0.0
+        ))));
+        assert!(subpixel_ok(Mat4::from_scale(glam::vec3(2.0, 2.0, 1.0))));
+        assert!(!subpixel_ok(Mat4::from_scale(glam::vec3(-1.0, 1.0, 1.0))));
+        assert!(!subpixel_ok(Mat4::from_rotation_z(0.01)));
+
+        // A pane under a real camera: the perspective divisor alone disables
+        // it, exactly as it disables atlas snapping.
+        let size = [W as f32, H as f32];
+        let perspective = math::px_from_clip(size) * math::screen_perspective(size, 0.7);
+        assert!(!subpixel_ok(perspective * Mat4::from_rotation_y(0.4)));
+        assert!(
+            subpixel_ok(compose(
+                None,
+                Mat4::from_translation(glam::vec3(4.0, 4.0, 0.0))
+            )),
+            "the default projection leaves a 2D block alone"
+        );
+    }
+
+    #[test]
+    fn subpixel_coverage_lights_the_stripes_apart_and_only_where_it_can() {
+        let Some(gpu) = testing::dual_source_gpu() else {
+            eprintln!("skipped: adapter has no DUAL_SOURCE_BLENDING");
+            return;
+        };
+        let (device, queue) = gpu;
+        let mut font_system = testing::font_system();
+        // Small text: stem edges land mid-pixel, which is where the stripes
+        // have something to say.
+        let sample = view(&mut font_system, "Illinois mill", 12.0, [6.0, 6.0]);
+
+        let mut renderer = TextRenderer::with_options(
+            device,
+            testing::FORMAT,
+            RendererOptions {
+                subpixel: Subpixel::Rgb,
+                ..Default::default()
+            },
+        );
+        assert_eq!(renderer.effective_options().subpixel, Subpixel::Rgb);
+        let block = renderer.create_block();
+        renderer.begin_frame();
+        renderer.set_block_content(
+            queue,
+            &mut font_system,
+            block,
+            &BlockContent {
+                buffer: Some(&sample.buffer),
+                pos: sample.pos,
+                default_color: Color::WHITE,
+                ..Default::default()
+            },
+        );
+        let flat = testing::render_pixels_on(gpu, &mut renderer, W, H, testing::FORMAT);
+        assert!(drew(&flat));
+        let fringed = |px: &[u8]| px.chunks_exact(4).filter(|p| p[0] != p[2]).count();
+        assert!(
+            fringed(&flat) > 20,
+            "LCD coverage must differ between the R and B stripes: {} pixels",
+            fringed(&flat)
+        );
+
+        // Turn the same block out of the screen plane and the stripe axis is
+        // gone: those glyphs draw with the grayscale pipeline instead.
+        let size = [W as f32, H as f32];
+        let center = glam::vec3(size[0] * 0.5, size[1] * 0.5, 0.0);
+        renderer.begin_frame();
+        renderer.set_view_projection(math::screen_perspective(size, 0.7).to_cols_array_2d());
+        renderer.set_block_transform(
+            block,
+            (Mat4::from_translation(center)
+                * Mat4::from_rotation_y(40f32.to_radians())
+                * Mat4::from_translation(-center))
+            .to_cols_array_2d(),
+        );
+        let tilted = testing::render_pixels_on(gpu, &mut renderer, W, H, testing::FORMAT);
+        assert!(drew(&tilted), "a tilted pane still draws");
+        assert!(!renderer.blocks[&block.0].subpixel_ok);
+        assert_eq!(
+            fringed(&tilted),
+            0,
+            "a pane with no stripe axis must draw grayscale"
         );
     }
 

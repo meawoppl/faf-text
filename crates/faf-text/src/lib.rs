@@ -55,7 +55,10 @@ mod testing;
 mod view;
 
 pub use document::{CHUNK_LINES, DocCursor, DocStats, Document, RETAIN_CHUNKS, WINDOW_CHUNKS};
-pub use renderer::{BlockContent, BlockId, DecorationKind, RectLayer, TextRenderer, UploadStats};
+pub use renderer::{
+    BlockContent, BlockId, CoverageBlend, DecorationKind, RectLayer, RendererOptions, Subpixel,
+    TextRenderer, UploadStats,
+};
 pub use view::{LineMetrics, Rect, TextView};
 
 pub use cosmic_text;

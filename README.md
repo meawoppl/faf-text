@@ -82,6 +82,25 @@ with a z key rather than a depth buffer. `cargo run --example panes3d` renders
 three panes at oblique angles, one of them near edge-on, with a selection
 painted through the ray path.
 
+**Coverage has two construction-time knobs.** `TextRenderer::with_options`
+takes a `CoverageBlend` and a `Subpixel` mode; `new` is the default pair, and
+the default pair renders byte-for-byte what faf-text always did.
+`CoverageBlend::Linear` points the pipelines at the sRGB view of the target
+(`format.add_srgb_suffix()` in the surface's `view_formats`), converts instance
+colors to linear light on the CPU, and applies a luminance-conditional contrast
+correction to coverage, because blending in linear light on its own thins
+dark-on-light stems. `Subpixel::Rgb` casts the horizontal ray three times, a
+third of a pixel apart, for one coverage per LCD stripe, and hands the result
+to the blender through dual-source blending (`Src1` factors, so the device
+needs `wgpu::Features::DUAL_SOURCE_BLENDING` — WebGL2 never does, and asks for
+grayscale instead). Both are *pipeline variants*, not shader branches: the
+glyph fragment shader is a place where even a never-taken branch has measured
+25%. Each is dropped rather than fatal when the device cannot do it, and
+`effective_options()` says what survived. Subpixel coverage additionally turns
+itself off per block for any placement that is not an axis-aligned scale and
+translation — a pane tilted in 3D has no stripe axis to sample along, so its
+glyphs draw grayscale while the flat ones next to it do not.
+
 **The scene is retained, and damage-tracked.** Content lives in blocks; each
 block owns a range of every instance arena (under-rects, chips, vector glyphs,
 weight-blended glyphs, atlas glyphs, line decorations, over-rects) and one entry in a
@@ -150,7 +169,17 @@ python3 -m http.server -d web 8000
   around the shaped weight rather than across the whole axis.
 - Only the `wght` axis is interpolated, between its two extremes; other
   variation axes still bake into the extracted curves.
-- No gamma-aware blending option yet; text blends in the surface's space.
+- `Subpixel::Rgb` runs no LCD filter: each stripe is a point sample a third of
+  a pixel wide, so stem edges carry the full unfiltered orange/blue fringe. It
+  is a real resolution win on a striped RGB panel at 11–13 px and visibly
+  colored anywhere else (a rotated pane, a screenshot, a non-RGB panel). The
+  usual fix is a five-tap filter across neighboring stripes, which costs more
+  ray casts than the current three.
+- `CoverageBlend::Linear` still reads lighter than the default for dark text on
+  a light background even with the contrast correction: linear light *is*
+  thinner there, and 1/1.43 only claws part of it back. It is the right mode for
+  correctness (and for light-on-dark, where gamma blending over-fattens), not a
+  drop-in replacement.
 - Atlas glyphs (color emoji) stop snapping to the pixel grid once a block's
   placement is no longer an axis-aligned scale and translation — there is no
   grid to snap to — so they go slightly soft in 3D. Vector glyphs are exact at

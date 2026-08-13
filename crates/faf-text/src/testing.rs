@@ -32,6 +32,39 @@ pub fn gpu() -> &'static (wgpu::Device, wgpu::Queue) {
     })
 }
 
+/// A headless device with `DUAL_SOURCE_BLENDING`, or `None` where the adapter
+/// has no such feature (which is where the renderer falls back to grayscale
+/// coverage, so the tests that need this skip themselves).
+pub fn dual_source_gpu() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
+    static GPU: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
+    GPU.get_or_init(|| {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .expect("no GPU adapter available");
+            if !adapter
+                .features()
+                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            {
+                return None;
+            }
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::DUAL_SOURCE_BLENDING,
+                    ..Default::default()
+                })
+                .await
+                .ok()
+        })
+    })
+    .as_ref()
+}
+
 /// A font system holding just DejaVu Sans, so glyph ids are stable.
 pub fn font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_DEJAVU_SANS])
@@ -70,7 +103,20 @@ pub fn font_id_of(font_system: &FontSystem, family: &str) -> fontdb::ID {
 /// Finish the frame, draw everything queued on `renderer` into a `width ×
 /// height` target, and read it back as tightly packed RGBA8.
 pub fn render_pixels(renderer: &mut TextRenderer, width: u32, height: u32) -> Vec<u8> {
-    let (device, queue) = gpu();
+    render_pixels_on(gpu(), renderer, width, height, FORMAT)
+}
+
+/// [`render_pixels`] on a chosen device, rendering through a view of
+/// `view_format` — which is how the gamma-correct pipelines are exercised: the
+/// texture stays [`FORMAT`], so the readback is still raw sRGB-encoded bytes,
+/// but the attachment the blender sees is the sRGB view of it.
+pub fn render_pixels_on(
+    (device, queue): &(wgpu::Device, wgpu::Queue),
+    renderer: &mut TextRenderer,
+    width: u32,
+    height: u32,
+    view_format: wgpu::TextureFormat,
+) -> Vec<u8> {
     renderer.finish(device, queue, [width as f32, height as f32]);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -85,9 +131,12 @@ pub fn render_pixels(renderer: &mut TextRenderer, width: u32, height: u32) -> Ve
         dimension: wgpu::TextureDimension::D2,
         format: FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
+        view_formats: &[view_format],
     });
-    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(view_format),
+        ..Default::default()
+    });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {

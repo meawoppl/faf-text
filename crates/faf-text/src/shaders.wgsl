@@ -47,6 +47,38 @@ const BANDED_FLAG: u32 = 0x80000000u;
 // loop, and even never taken it costs a quarter of the fragment time.
 override BLEND_MASTERS: bool = false;
 
+// True on the pipelines built for CoverageBlend::Linear, which render into the
+// sRGB view of the target so the blender works in light-linear space. Same
+// reasoning as BLEND_MASTERS: an override rather than a uniform, so the
+// default (gamma) pipelines compile to exactly the shader they did before this
+// existed.
+override LINEAR_BLEND: bool = false;
+
+// Contrast exponent for gamma-correct coverage. Blending in linear light is
+// physically right and perceptually wrong for text: it thins dark-on-light
+// stems and fattens light-on-dark ones. Skia-adjacent stacks correct that with
+// a contrast/gamma boost applied to coverage before the blend, keyed on the
+// text color; 1.43 is the usual constant (Skia's default text contrast lands
+// in the same neighborhood, as does FreeType's `gamma` for LCD filtering).
+// This is the simple luminance-conditional variant: dark text gets
+// coverage^(1/1.43) (fatter), light text coverage^1.43 (thinner).
+const COVERAGE_CONTRAST: f32 = 1.43;
+
+// Coverage, conditioned for the space the blender is about to work in. Folds
+// away to `coverage` on the gamma pipelines.
+//
+// `color` is already linear when LINEAR_BLEND is on (the CPU converted it), so
+// the luminance test is a linear-light one — its 0.5 threshold sits around
+// 0xbc in sRGB, which puts everything but near-white text on the "dark" side.
+fn shape_coverage(coverage: f32, color: vec3<f32>) -> f32 {
+    if LINEAR_BLEND {
+        let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let exponent = select(1.0 / COVERAGE_CONTRAST, COVERAGE_CONTRAST, luma >= 0.5);
+        return pow(coverage, exponent);
+    }
+    return coverage;
+}
+
 // Unit-quad corner from the vertex index (two CCW triangles, 6 vertices).
 fn quad_corner(vi: u32) -> vec2<f32> {
     var corners = array<vec2<f32>, 6>(
@@ -242,7 +274,7 @@ fn glyph_fs(in: GlyphOutput) -> @location(0) vec4<f32> {
     let texel = textureSampleLevel(atlas_tex, atlas_samp, in.uv, 0.0);
     if in.kind == GLYPH_KIND_MASK {
         // Grayscale coverage stored in alpha; tint with the instance color.
-        return vec4<f32>(in.color.rgb, in.color.a * texel.a);
+        return vec4<f32>(in.color.rgb, in.color.a * shape_coverage(texel.a, in.color.rgb));
     }
     // Color glyph (emoji): texel carries its own color.
     return vec4<f32>(texel.rgb, texel.a * in.color.a);
@@ -530,5 +562,5 @@ fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
         coverage += clamp(abs(wind_x[tap]), 0.0, 1.0) + clamp(abs(wind_y[tap]), 0.0, 1.0);
     }
     coverage = coverage / (2.0 * f32(taps));
-    return vec4<f32>(in.color.rgb, in.color.a * coverage);
+    return vec4<f32>(in.color.rgb, in.color.a * shape_coverage(coverage, in.color.rgb));
 }

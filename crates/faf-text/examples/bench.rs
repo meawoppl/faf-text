@@ -2,8 +2,13 @@
 //! fill a two-megapixel area with 50 lines of text at 32 pixels per em,
 //! measure steady-state render time. Prepare runs once; the timed loop
 //! re-records and submits the same draws, like a static scene.
+//!
+//! `--linear` and `--subpixel` run the same workload through the issue-11
+//! quality options, which is how their fragment cost was measured.
 
-use faf_text::{Attrs, Color, Family, Metrics, TextRenderer, TextView};
+use faf_text::{
+    Attrs, Color, CoverageBlend, Family, Metrics, RendererOptions, Subpixel, TextRenderer, TextView,
+};
 use std::time::Instant;
 
 const SIZE: u32 = 1448; // 1448^2 ≈ 2.10 MP
@@ -24,11 +29,30 @@ async fn run() {
         .await
         .unwrap();
     println!("adapter: {}", adapter.get_info().name);
+
+    let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let options = RendererOptions {
+        blend: if flag("--linear") {
+            CoverageBlend::Linear
+        } else {
+            CoverageBlend::Gamma
+        },
+        subpixel: if flag("--subpixel") {
+            Subpixel::Rgb
+        } else {
+            Subpixel::Off
+        },
+    };
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: options.required_features() & adapter.features(),
+            ..Default::default()
+        })
         .await
         .unwrap();
 
+    let format = wgpu::TextureFormat::Rgba8Unorm;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench target"),
         size: wgpu::Extent3d {
@@ -39,14 +63,19 @@ async fn run() {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
+        view_formats: &[options.target_format(format)],
     });
-    let view = target.create_view(&Default::default());
+    // Linear mode renders through the sRGB view of the same texture.
+    let view = target.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(options.target_format(format)),
+        ..Default::default()
+    });
 
     let mut font_system = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS]);
-    let mut renderer = TextRenderer::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TextRenderer::with_options(&device, format, options);
+    println!("options: {:?}", renderer.effective_options());
 
     // 50 lines packed into the 2 MP square, 32 px/em like the paper.
     let line_height = SIZE as f32 / LINES as f32; // 28.96 px

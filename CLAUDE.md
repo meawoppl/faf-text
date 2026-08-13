@@ -29,7 +29,12 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   texture's height changes at runtime.
 - Fragment-shader benchmark: `cargo run --release --example stress -p faf-text`
   (a full 960×600 frame of 11px text, ~7.9k glyphs, timed over 200 serialized
-  frames).
+  frames). `stress` and `bench` both take `--linear` / `--subpixel` to run the
+  same scene through the issue-11 options. `stress` is noisy run to run
+  (1.80–2.10 ms/frame on the same build); `bench` is the stable one.
+- Quality options: `cargo run --release --example quality -p faf-text` renders
+  the three configurations side by side into `quality.png` plus an 8× crop in
+  `quality-zoom.png`, and prints ink totals and R≠B pixel counts per panel.
 - GPU unit tests are fine and expected: `src/testing.rs` (cfg(test)) hands out
   one shared headless device plus `render_pixels` for readback comparisons.
   `cargo test -p faf-text` exercises curve-texture growth and eviction on the
@@ -185,6 +190,31 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   four blocks (selection, text, search, caret) rather than three. All four
   share one model matrix under the demo's 3D tilt, which is what keeps the
   caret and the selection glued to the glyphs.
+- Quality options (#11) are pipeline variants, never uniforms, for the same
+  reason `BLEND_MASTERS` is: `LINEAR_BLEND` gates the contrast correction in
+  `shape_coverage` and folds away when off, and passing `("LINEAR_BLEND", 0.0)`
+  explicitly is byte-identical to passing no constants at all (offscreen md5
+  unchanged, `bench` 0.643 → 0.643 ms).
+- LCD subpixel needs `enable dual_source_blending;`, which naga validates
+  against the *device's* capabilities — a module containing it cannot be
+  created without `wgpu::Features::DUAL_SOURCE_BLENDING`. So `subpixel.wgsl` is
+  a second module, built at runtime as `"enable …" + shaders.wgsl +
+  subpixel.wgsl` and only when the feature is present; the base module never
+  mentions it and WebGL2 is unaffected. The RTX 3070 (Vulkan) has the feature;
+  `testing::dual_source_gpu()` hands out a device with it or `None`.
+- Subpixel coverage costs three x casts plus the y pass: at 11px that is the
+  same six casts the grayscale 3-tap path runs (stress unmoved within noise),
+  at 32px it is 4 vs 2 and the frame doubles (bench 0.643 → 1.270 ms). Linear
+  blending is ~free (0.647 ms).
+- The issue's "y cast multiplies in" for subpixel is wrong and the code
+  averages instead: both casts measure the *same* vertical edge on a stem, so a
+  product squares its coverage. Averaging keeps subpixel and grayscale at the
+  same weight — panel ink in `examples/quality` matches to 5 significant
+  figures (58753047 vs 58753326).
+- Per-block subpixel gating reuses the `is_axis_aligned` predicate behind
+  `BLOCK_SNAP` (plus "not mirrored in x", which would swap R and B), evaluated
+  in `upload_uniforms` where the composed matrix already exists, and cached on
+  the block so `render(&self)` can pick a pipeline per block.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.
