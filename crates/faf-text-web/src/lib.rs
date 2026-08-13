@@ -31,18 +31,26 @@ pub struct FafTextDemo {
 #[wasm_bindgen]
 impl FafTextDemo {
     /// Create the renderer on a canvas. The canvas backing size should
-    /// already be set (CSS size × devicePixelRatio).
-    pub async fn attach(canvas: HtmlCanvasElement, dpr: f32) -> Result<FafTextDemo, JsValue> {
+    /// already be set (CSS size × devicePixelRatio). Pass `force_gl` when a
+    /// JS-side `navigator.gpu.requestAdapter()` probe failed — wgpu's WebGPU
+    /// backend throws an uncatchable TypeError on null adapters.
+    pub async fn attach(
+        canvas: HtmlCanvasElement,
+        dpr: f32,
+        force_gl: bool,
+    ) -> Result<FafTextDemo, JsValue> {
         console_error_panic_hook::set_once();
 
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
 
-        // Try WebGPU first, then a WebGL2-only instance — some environments
-        // (older browsers, headless) expose navigator.gpu but never deliver
-        // an adapter.
+        let backend_order: &[wgpu::Backends] = if force_gl {
+            &[wgpu::Backends::GL]
+        } else {
+            &[wgpu::Backends::BROWSER_WEBGPU, wgpu::Backends::GL]
+        };
         let mut picked = None;
-        for backends in [wgpu::Backends::BROWSER_WEBGPU, wgpu::Backends::GL] {
+        for &backends in backend_order {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends,
                 ..wgpu::InstanceDescriptor::new_without_display_handle()

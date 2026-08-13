@@ -76,9 +76,16 @@ async function main() {
   };
   fit();
 
+  // Probe WebGPU from JS: wgpu can't recover from environments that expose
+  // navigator.gpu but hand back a null adapter (e.g. headless).
+  let forceGl = true;
+  try {
+    forceGl = !(navigator.gpu && await navigator.gpu.requestAdapter());
+  } catch { forceGl = true; }
+
   let demo;
   try {
-    demo = await FafTextDemo.attach(canvas, dpr);
+    demo = await FafTextDemo.attach(canvas, dpr, forceGl);
   } catch (e) {
     document.getElementById('canvas').hidden = true;
     document.getElementById('fallback').hidden = false;
