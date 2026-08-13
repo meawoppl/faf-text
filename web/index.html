@@ -103,6 +103,7 @@ async function main() {
     return;
   }
   document.getElementById('backend').textContent = demo.backend();
+  window.demo = demo;  // console/debug access
   demo.set_text(SAMPLE);
   demo.set_search(document.getElementById('search').value);
 
