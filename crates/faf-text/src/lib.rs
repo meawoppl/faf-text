@@ -33,6 +33,14 @@
 //! block's text therefore belongs either in that block's under-rects or in a
 //! block created before it.
 //!
+//! # Terminal grid
+//!
+//! [`TermGrid`] is a shaping-free fast path for monospace cell content: char →
+//! glyph id through the font's charmap, fixed cell metrics, merged background
+//! runs, and procedural rects for box drawing. It renders into an ordinary
+//! block through [`GlyphSpec`], so a terminal pane and a prose pane share one
+//! curve store and one draw order. See the [`grid`](crate::TermGrid) docs.
+//!
 //! # Panes in 3D
 //!
 //! A block carries a full 4×4 placement ([`TextRenderer::set_block_transform`])
@@ -48,6 +56,7 @@ mod arena;
 mod atlas;
 mod curves;
 mod document;
+mod grid;
 pub mod math;
 mod renderer;
 #[cfg(test)]
@@ -55,15 +64,17 @@ mod testing;
 mod view;
 
 pub use document::{CHUNK_LINES, DocCursor, DocStats, Document, RETAIN_CHUNKS, WINDOW_CHUNKS};
+pub use grid::{Cell, CellStyle, GridFont, GridScene, TermGrid, char_width};
 pub use renderer::{
-    BlockContent, BlockId, CoverageBlend, DecorationKind, RectLayer, RendererOptions, Subpixel,
-    TextRenderer, UploadStats,
+    BlockContent, BlockId, CoverageBlend, DecorationKind, GlyphSpec, RectLayer, RendererOptions,
+    Subpixel, TextRenderer, UploadStats,
 };
 pub use view::{LineMetrics, Rect, TextView};
 
 pub use cosmic_text;
 pub use cosmic_text::{
     Affinity, Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, UnderlineStyle, Weight,
+    fontdb,
 };
 /// Re-exported so hosts build the matrices [`math`] and [`TextRenderer`] take
 /// without pinning a second copy of glam.

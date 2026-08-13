@@ -101,6 +101,22 @@ itself off per block for any placement that is not an axis-aligned scale and
 translation — a pane tilted in 3D has no stripe axis to sample along, so its
 glyphs draw grayscale while the flat ones next to it do not.
 
+**Terminal content skips the shaper entirely.** A `TermGrid` is cells, colors,
+style bits and a scrollback ring; translating a viewport into instances maps
+each char straight through the font's charmap to a glyph id (cached per face),
+places it on a whole-pixel cell grid, and merges adjacent same-background cells
+into single rects. No shaping, no layout, no per-frame allocation — a 200×60
+grid of colored log lines costs **0.12 ms of CPU per frame** to translate into
+4.4k instances on this box, and the result goes into one retained block, so
+appending a line re-uploads that block and nothing else. Correctness is not
+traded away for it: CJK and other East Asian Width `W`/`F` characters take two
+cells, and any cell the charmap misses — combining marks, ZWJ clusters, emoji —
+falls back to a one-cell cosmic-text buffer, shaped once and cached by string,
+which is also how color emoji reach the atlas. Box drawing and block elements
+(U+2500–U+259F) are **generated**, not shaped: exact cell-bound rects, so lines
+join their neighbours with no seam at any size, where a font's outlines stipple
+the joins. `cargo run --example term` renders the showcase to `term.png`.
+
 **The scene is retained, and damage-tracked.** Content lives in blocks; each
 block owns a range of every instance arena (under-rects, chips, vector glyphs,
 weight-blended glyphs, atlas glyphs, line decorations, over-rects) and one entry in a
@@ -130,8 +146,8 @@ Vulkan/Metal/DX12/GL natively, and WebGPU or WebGL2 in the browser.
 
 - `crates/faf-text` — the renderer. `TextRenderer` (pipelines + glyph sources),
   `TextView` (positioned cosmic-text buffer with hit-testing/selection
-  helpers), `math` (camera matrices and the ray/pane hit test). No windowing
-  dependencies.
+  helpers), `TermGrid`/`GridFont` (the monospace cell fast path), `math`
+  (camera matrices and the ray/pane hit test). No windowing dependencies.
 - `crates/faf-text-web` — wasm-bindgen bindings: attach to a canvas, drive
   selection from pointer events, search highlighting, clipboard.
 - `web/` — demo page.
@@ -143,6 +159,7 @@ Native smoke test (renders `offscreen.png`, no window needed):
 ```sh
 cargo run --example offscreen -p faf-text
 cargo run --example panes3d -p faf-text   # three text panes in 3D
+cargo run --release --example term -p faf-text  # 200×60 terminal grid + box drawing
 ```
 
 Web demo:
@@ -187,3 +204,9 @@ python3 -m http.server -d web 8000
 - No depth buffer: blocks composite in draw order, and a host placing panes in
   3D sorts them back to front itself (`set_block_z`). Intersecting panes are
   not resolved per pixel.
+- `TermGrid` translates the whole viewport every time it is asked, not just the
+  cells that changed: at 0.12 ms for 12k cells the bookkeeping a per-cell damage
+  map would need costs more than it saves. Idle frames skip the translation
+  entirely (`take_dirty`).
+- The grid draws box-drawing arcs (U+256D–U+2570) as sharp corners and
+  diagonals as one-pixel staircases — rects are the only primitive it emits.

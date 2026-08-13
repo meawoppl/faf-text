@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use cosmic_text::{Buffer, CacheKey, FontSystem, LayoutRun, UnderlineStyle};
+use cosmic_text::{Buffer, CacheKey, CacheKeyFlags, FontSystem, LayoutRun, UnderlineStyle, fontdb};
 use glam::Mat4;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -201,6 +201,44 @@ struct VectorGlyphInstance {
     b_first: u32,
 }
 
+/// Build the quad for one outline glyph: the em bbox padded by 1.5 px for the
+/// analytic coverage's falloff, placed at an unsnapped pen position (the
+/// coverage handles fractional positions exactly), plus the mapping from quad
+/// corner back into band space.
+fn vector_instance(
+    gc: &crate::curves::GlyphCurves,
+    pen: [f32; 2],
+    font_size: f32,
+    color: [f32; 4],
+    weight_t: f32,
+) -> VectorGlyphInstance {
+    let pad = 1.5 / font_size;
+    let min_x = gc.bbox[0] - pad;
+    let min_y = gc.bbox[1] - pad;
+    let max_x = gc.bbox[2] + pad;
+    let max_y = gc.bbox[3] + pad;
+
+    // Band space is the unpadded bbox, y-up like the em coords. The quad is
+    // that bbox plus the pad, and the pad is a size-dependent number of em, so
+    // the mapping divides it back out.
+    let band_w = (gc.bbox[2] - gc.bbox[0]).max(f32::MIN_POSITIVE);
+    let band_h = (gc.bbox[3] - gc.bbox[1]).max(f32::MIN_POSITIVE);
+
+    VectorGlyphInstance {
+        pos: [pen[0] + min_x * font_size, pen[1] - max_y * font_size],
+        size: [(max_x - min_x) * font_size, (max_y - min_y) * font_size],
+        em_pos: [min_x, max_y],
+        em_size: [max_x - min_x, -(max_y - min_y)],
+        color,
+        first: gc.first,
+        count: gc.instance_count(),
+        band_scale: [(max_x - min_x) / band_w, -(max_y - min_y) / band_h],
+        band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
+        weight_t,
+        b_first: gc.b_first(),
+    }
+}
+
 /// A decoration's shape. Every kind draws from one pipeline, so a block's
 /// decorations cost two draws however many shapes they mix.
 ///
@@ -289,6 +327,30 @@ impl DecorationInstance {
     }
 }
 
+/// One glyph placed by id, with no shaping in front of it.
+///
+/// [`TextRenderer::text`] is the ordinary path: cosmic-text shapes a buffer and
+/// the renderer walks its layout runs. A monospace grid ([`crate::TermGrid`])
+/// already knows which glyph goes in which cell — it maps char to glyph id
+/// through the font's charmap — so it queues them directly. Everything past
+/// that point is identical: outlines take the vector path, outline-less glyphs
+/// (color emoji) land in the bitmap atlas, and both stores cache by the same
+/// keys, so a grid and a prose pane share glyph data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphSpec {
+    pub font_id: fontdb::ID,
+    pub glyph_id: u16,
+    /// Em size in px, as a shaped glyph's `font_size`.
+    pub font_size: f32,
+    /// Pen position: the glyph's baseline origin, block-local px.
+    pub pos: [f32; 2],
+    pub color: Color,
+    /// Weight the glyph is fetched at. On a variable face this picks the
+    /// `wght` blend; on a static one it only keys the cache, so
+    /// [`fontdb::Weight::NORMAL`] is the right default.
+    pub weight: fontdb::Weight,
+}
+
 /// Which side of the text a rect layer renders on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RectLayer {
@@ -328,6 +390,10 @@ pub struct BlockContent<'a> {
     pub buffer: Option<&'a Buffer>,
     /// Top-left corner of `buffer`, block-local.
     pub pos: [f32; 2],
+    /// Glyphs placed by id, with no shaping — the [`crate::TermGrid`] path.
+    /// Drawn in the same layers as `buffer`'s glyphs, and unaffected by `pos`:
+    /// a [`GlyphSpec`] carries its own block-local pen position.
+    pub glyphs: &'a [GlyphSpec],
     /// Color for glyphs that carry none of their own.
     pub default_color: Color,
     /// GPU weight blend for every glyph, as in
@@ -353,6 +419,7 @@ impl Default for BlockContent<'_> {
         Self {
             buffer: None,
             pos: [0.0, 0.0],
+            glyphs: &[],
             default_color: Color::WHITE,
             weight: None,
             under_rects: &[],
@@ -1044,6 +1111,7 @@ impl TextRenderer {
                 content.weight,
             );
         }
+        self.push_glyphs(queue, font_system, content.glyphs, content.weight);
         self.commit(id);
     }
 
@@ -1345,6 +1413,19 @@ impl TextRenderer {
         self.transient_pending = true;
     }
 
+    /// Queue glyphs that are already resolved to ids, skipping shaping — the
+    /// primitive [`crate::TermGrid`] renders through. Each [`GlyphSpec`]
+    /// carries its own pen position and color.
+    pub fn glyphs(
+        &mut self,
+        queue: &wgpu::Queue,
+        font_system: &mut FontSystem,
+        glyphs: &[GlyphSpec],
+    ) {
+        self.push_glyphs(queue, font_system, glyphs, None);
+        self.transient_pending = true;
+    }
+
     // ---- Frame ----
 
     /// Upload everything dirty — instance ranges, block uniforms, new glyph
@@ -1522,29 +1603,13 @@ impl TextRenderer {
                     let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
                     let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
 
-                    let pad = 1.5 / font_size;
-                    let min_x = gc.bbox[0] - pad;
-                    let min_y = gc.bbox[1] - pad;
-                    let max_x = gc.bbox[2] + pad;
-                    let max_y = gc.bbox[3] + pad;
-
-                    // Band space is the unpadded bbox, y-up like the em coords.
-                    let band_w = (gc.bbox[2] - gc.bbox[0]).max(f32::MIN_POSITIVE);
-                    let band_h = (gc.bbox[3] - gc.bbox[1]).max(f32::MIN_POSITIVE);
-
-                    let instance = VectorGlyphInstance {
-                        pos: [origin_x + min_x * font_size, origin_y - max_y * font_size],
-                        size: [(max_x - min_x) * font_size, (max_y - min_y) * font_size],
-                        em_pos: [min_x, max_y],
-                        em_size: [max_x - min_x, -(max_y - min_y)],
+                    let instance = vector_instance(
+                        &gc,
+                        [origin_x, origin_y],
+                        font_size,
                         color,
-                        first: gc.first,
-                        count: gc.instance_count(),
-                        band_scale: [(max_x - min_x) / band_w, -(max_y - min_y) / band_h],
-                        band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
-                        weight_t: weight_t.unwrap_or(gc.weight_t),
-                        b_first: gc.b_first(),
-                    };
+                        weight_t.unwrap_or(gc.weight_t),
+                    );
                     // Two masters means the blending pipeline; everything else
                     // draws with a shader that never looks for one.
                     if instance.b_first == 0 {
@@ -1560,27 +1625,98 @@ impl TextRenderer {
                 // and the block wants re-setting once the store has compacted.
                 self.scratch.stale |= self.curves.overflowed();
                 let physical = glyph.physical((pos[0], baseline_y), 1.0);
-                if let Some(entry) =
-                    self.atlas
-                        .get_or_insert(queue, font_system, physical.cache_key)
-                {
-                    if self.scratch.collect_keys {
-                        self.scratch.atlas_keys.insert(physical.cache_key);
-                    }
-                    self.scratch.atlas.push(AtlasGlyphInstance {
-                        pos: [
-                            (physical.x + entry.left) as f32,
-                            (physical.y - entry.top) as f32,
-                        ],
-                        size: entry.size,
-                        uv_pos: entry.uv_pos,
-                        uv_size: entry.uv_size,
-                        color,
-                        kind: entry.is_color as u32,
-                        _pad: [0; 3],
-                    });
-                }
+                self.push_atlas_glyph(
+                    queue,
+                    font_system,
+                    physical.cache_key,
+                    [physical.x, physical.y],
+                    color,
+                );
             }
+        }
+    }
+
+    /// Queue glyphs that arrive already resolved to ids — the shaping-free
+    /// path. Same stores, same layers, same fallbacks as [`Self::push_text`];
+    /// all that is skipped is the shaping that would have produced the ids.
+    fn push_glyphs(
+        &mut self,
+        queue: &wgpu::Queue,
+        font_system: &mut FontSystem,
+        glyphs: &[GlyphSpec],
+        weight_t: Option<f32>,
+    ) {
+        for spec in glyphs {
+            let flags = CacheKeyFlags::empty();
+            if let Some(gc) = self.curves.get_or_insert(
+                font_system,
+                spec.font_id,
+                spec.glyph_id,
+                spec.weight,
+                flags,
+            ) {
+                if gc.count == 0 {
+                    continue; // whitespace
+                }
+                if self.scratch.collect_keys {
+                    self.scratch.curve_keys.insert(GlyphKey::new(
+                        spec.font_id,
+                        spec.glyph_id,
+                        spec.weight,
+                        flags,
+                    ));
+                }
+                let instance = vector_instance(
+                    &gc,
+                    spec.pos,
+                    spec.font_size,
+                    self.shade(spec.color),
+                    weight_t.unwrap_or(gc.weight_t),
+                );
+                if instance.b_first == 0 {
+                    self.scratch.vector.push(instance);
+                } else {
+                    self.scratch.blend.push(instance);
+                }
+                continue;
+            }
+            self.scratch.stale |= self.curves.overflowed();
+            let (cache_key, x, y) = CacheKey::new(
+                spec.font_id,
+                spec.glyph_id,
+                spec.font_size,
+                (spec.pos[0], spec.pos[1].trunc()),
+                spec.weight,
+                flags,
+            );
+            let color = self.shade(spec.color);
+            self.push_atlas_glyph(queue, font_system, cache_key, [x, y], color);
+        }
+    }
+
+    /// Rasterize a glyph into the bitmap atlas and queue its quad. `pos` is the
+    /// physical (integer) pen position the cache key was binned at.
+    fn push_atlas_glyph(
+        &mut self,
+        queue: &wgpu::Queue,
+        font_system: &mut FontSystem,
+        cache_key: CacheKey,
+        pos: [i32; 2],
+        color: [f32; 4],
+    ) {
+        if let Some(entry) = self.atlas.get_or_insert(queue, font_system, cache_key) {
+            if self.scratch.collect_keys {
+                self.scratch.atlas_keys.insert(cache_key);
+            }
+            self.scratch.atlas.push(AtlasGlyphInstance {
+                pos: [(pos[0] + entry.left) as f32, (pos[1] - entry.top) as f32],
+                size: entry.size,
+                uv_pos: entry.uv_pos,
+                uv_size: entry.uv_size,
+                color,
+                kind: entry.is_color as u32,
+                _pad: [0; 3],
+            });
         }
     }
 
