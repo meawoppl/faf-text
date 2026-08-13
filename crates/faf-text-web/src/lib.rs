@@ -14,6 +14,8 @@ const HIGHLIGHT: Color = Color::rgba(0.88, 0.69, 0.41, 0.38);
 const FOREGROUND: Color = Color::rgba(0.75, 0.79, 0.96, 1.0);
 const CARET: Color = Color::rgba(1.0, 0.62, 0.39, 1.0);
 const MARGIN: f32 = 24.0;
+/// The embedded variable font, whose `wght` masters the GPU can blend.
+const VARIABLE_FAMILY: &str = "Manrope";
 /// Caret thickness and composition underline thickness, in physical pixels.
 const CARET_WIDTH: f32 = 2.0;
 
@@ -75,6 +77,9 @@ pub struct FafTextDemo {
     caret_visible: bool,
     dragging: bool,
     search: String,
+    /// GPU weight blend for the whole view, and with it the family the text is
+    /// shaped in: `None` is the static demo font, `Some(t)` the variable one.
+    weight_blend: Option<f32>,
 }
 
 #[wasm_bindgen]
@@ -158,6 +163,7 @@ impl FafTextDemo {
         let mut font_system = faf_text::font_system_from_fonts(&[
             faf_text::FONT_DEJAVU_SANS,
             faf_text::FONT_DEJAVU_SANS_MONO,
+            faf_text::FONT_MANROPE_VARIABLE,
         ]);
 
         let font_size = 18.0;
@@ -191,6 +197,7 @@ impl FafTextDemo {
             caret_visible: true,
             dragging: false,
             search: String::new(),
+            weight_blend: None,
         })
     }
 
@@ -216,6 +223,20 @@ impl FafTextDemo {
         let px = size * self.dpr;
         self.view
             .set_metrics(&mut self.font_system, Metrics::new(px, px * 1.5));
+    }
+
+    /// Blend the whole view between the variable font's lightest and boldest
+    /// masters, in the fragment shader: 0 is the axis minimum, 1 the maximum.
+    /// `undefined` goes back to the static demo font and its shaped weight.
+    /// Cheap enough to drive from a per-frame sine — nothing re-shapes and no
+    /// curve is re-extracted.
+    pub fn set_weight_blend(&mut self, t: Option<f32>) {
+        // Only the font swap needs a re-shape; the blend itself is free.
+        let reshape = t.is_some() != self.weight_blend.is_some();
+        self.weight_blend = t.map(|t| t.clamp(0.0, 1.0));
+        if reshape {
+            self.reshape();
+        }
     }
 
     pub fn set_search(&mut self, needle: &str) {
@@ -429,10 +450,16 @@ impl FafTextDemo {
     /// Re-shape the buffer from the backing string. O(n) per edit, which is
     /// fine at demo sizes and keeps the model dead simple.
     fn reshape(&mut self) {
+        // Only the variable face has masters to blend, so the weight wave
+        // switches the text over to it.
+        let family = match self.weight_blend {
+            Some(_) => Family::Name(VARIABLE_FAMILY),
+            None => Family::SansSerif,
+        };
         self.view.set_text(
             &mut self.font_system,
             &self.text,
-            &Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(family),
         );
     }
 
@@ -510,12 +537,13 @@ impl FafTextDemo {
             self.renderer
                 .rect([r[0], r[1]], [CARET_WIDTH, r[3]], CARET, RectLayer::Over);
         }
-        self.renderer.text(
+        self.renderer.text_with_weight(
             &self.queue,
             &mut self.font_system,
             &self.view.buffer,
             self.view.pos,
             FOREGROUND,
+            self.weight_blend,
         );
         self.renderer.finish(
             &self.device,

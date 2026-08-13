@@ -50,6 +50,7 @@
   <label>font size <input type="range" id="size" min="8" max="160" value="18">
     <span id="sizeval" class="stat">18px</span></label>
   <label><input type="checkbox" id="pulse"> animate zoom</label>
+  <label><input type="checkbox" id="wave"> weight wave</label>
   <label>highlight <input type="text" id="search" value="winding" placeholder="search text"></label>
   <span class="badge">click the text and type — it's editable</span>
 </header>
@@ -185,9 +186,15 @@ async function main() {
   });
 
   const pulse = document.getElementById('pulse');
+  const wave = document.getElementById('wave');
   const fpsEl = document.getElementById('fps');
   let frames = 0, last = performance.now(), start = last;
   const tick = now => {
+    // Weight is a GPU lerp between two masters of the variable font, so this
+    // costs nothing per frame: no re-shape, no re-raster.
+    demo.set_weight_blend(wave.checked
+      ? 0.5 + 0.5 * Math.sin((now - start) / 700)
+      : undefined);
     if (pulse.checked) {
       const s = 18 + 60 * (0.5 - 0.5 * Math.cos((now - start) / 900));
       sizeVal.textContent = `${s.toFixed(0)}px`;

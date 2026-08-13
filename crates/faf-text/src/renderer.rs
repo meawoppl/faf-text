@@ -50,6 +50,12 @@ struct VectorGlyphInstance {
     /// glyph, so the vertex shader divides it back out.
     band_scale: [f32; 2],
     band_bias: [f32; 2],
+    /// Blend between the glyph's two variable-font masters: 0 = the `wght`
+    /// axis minimum, 1 = its maximum. Ignored when `b_first` is 0.
+    weight_t: f32,
+    /// Base texel of the master-B records, 0 for a single-master glyph — the
+    /// fast path every static font takes.
+    b_first: u32,
 }
 
 /// Which side of the text a rect layer renders on.
@@ -103,6 +109,9 @@ pub struct TextRenderer {
     rect_pipeline: wgpu::RenderPipeline,
     atlas_pipeline: wgpu::RenderPipeline,
     vector_pipeline: wgpu::RenderPipeline,
+    /// Same shaders with `BLEND_MASTERS` on, for the glyphs that have a
+    /// second variable-font master.
+    blend_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -118,11 +127,13 @@ pub struct TextRenderer {
     over_rects: Vec<RectInstance>,
     atlas_glyphs: Vec<AtlasGlyphInstance>,
     vector_glyphs: Vec<VectorGlyphInstance>,
+    blend_glyphs: Vec<VectorGlyphInstance>,
 
     under_buf: InstanceBuffer,
     over_buf: InstanceBuffer,
     atlas_buf: InstanceBuffer,
     vector_buf: InstanceBuffer,
+    blend_buf: InstanceBuffer,
 }
 
 impl TextRenderer {
@@ -227,38 +238,47 @@ impl TextRenderer {
             },
         };
 
-        let make_pipeline =
-            |label: &str, vs: &str, fs: &str, stride: u64, attrs: &[wgpu::VertexAttribute]| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some(vs),
-                        compilation_options: Default::default(),
-                        buffers: &[Some(wgpu::VertexBufferLayout {
-                            array_stride: stride,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: attrs,
-                        })],
+        // `constants` specialize the fragment shader: the vector pipelines
+        // differ only in whether BLEND_MASTERS compiles the master-B fetch in.
+        let make_pipeline = |label: &str,
+                             vs: &str,
+                             fs: &str,
+                             stride: u64,
+                             attrs: &[wgpu::VertexAttribute],
+                             constants: &[(&str, f64)]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: stride,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: attrs,
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants,
+                        ..Default::default()
                     },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some(fs),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
 
         let rect_pipeline = make_pipeline(
             "faf-text rects",
@@ -266,6 +286,7 @@ impl TextRenderer {
             "rect_fs",
             std::mem::size_of::<RectInstance>() as u64,
             &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+            &[],
         );
         let atlas_pipeline = make_pipeline(
             "faf-text atlas glyphs",
@@ -276,23 +297,36 @@ impl TextRenderer {
                 0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
                 3 => Float32x2, 4 => Float32x4, 5 => Uint32
             ],
+            &[],
         );
+        let vector_attrs = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
+            3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32,
+            7 => Float32x2, 8 => Float32x2, 9 => Float32, 10 => Uint32
+        ];
+        let vector_stride = std::mem::size_of::<VectorGlyphInstance>() as u64;
         let vector_pipeline = make_pipeline(
             "faf-text vector glyphs",
             "vector_vs",
             "vector_fs",
-            std::mem::size_of::<VectorGlyphInstance>() as u64,
-            &wgpu::vertex_attr_array![
-                0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
-                3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32,
-                7 => Float32x2, 8 => Float32x2
-            ],
+            vector_stride,
+            &vector_attrs,
+            &[],
+        );
+        let blend_pipeline = make_pipeline(
+            "faf-text vector glyphs (two masters)",
+            "vector_vs",
+            "vector_fs",
+            vector_stride,
+            &vector_attrs,
+            &[("BLEND_MASTERS", 1.0)],
         );
 
         Self {
             rect_pipeline,
             atlas_pipeline,
             vector_pipeline,
+            blend_pipeline,
             bind_group,
             bind_group_layout,
             sampler,
@@ -305,10 +339,12 @@ impl TextRenderer {
             over_rects: Vec::new(),
             atlas_glyphs: Vec::new(),
             vector_glyphs: Vec::new(),
+            blend_glyphs: Vec::new(),
             under_buf: InstanceBuffer::new(),
             over_buf: InstanceBuffer::new(),
             atlas_buf: InstanceBuffer::new(),
             vector_buf: InstanceBuffer::new(),
+            blend_buf: InstanceBuffer::new(),
         }
     }
 
@@ -324,6 +360,7 @@ impl TextRenderer {
         self.over_rects.clear();
         self.atlas_glyphs.clear();
         self.vector_glyphs.clear();
+        self.blend_glyphs.clear();
     }
 
     /// Queue a solid rectangle on the given layer.
@@ -350,6 +387,29 @@ impl TextRenderer {
         buffer: &Buffer,
         pos: [f32; 2],
         default_color: Color,
+    ) {
+        self.text_with_weight(queue, font_system, buffer, pos, default_color, None);
+    }
+
+    /// [`TextRenderer::text`] with the GPU weight blend overridden for every
+    /// glyph: 0 draws the font's `wght` axis minimum, 1 its maximum, and
+    /// anything between interpolates the outlines in the fragment shader. Free
+    /// to animate — the curve data never changes.
+    ///
+    /// `None` keeps each glyph's default blend, the one matching the weight it
+    /// was shaped at. Glyphs from a static font ignore this entirely.
+    ///
+    /// Caveat: advances come from shaping, which happened at the attrs weight.
+    /// Blending far from it makes the text look tight or loose, so animate
+    /// around the shaped weight rather than across the whole axis.
+    pub fn text_with_weight(
+        &mut self,
+        queue: &wgpu::Queue,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        pos: [f32; 2],
+        default_color: Color,
+        weight_t: Option<f32>,
     ) {
         for run in buffer.layout_runs() {
             let baseline_y = pos[1] + run.line_y;
@@ -385,7 +445,7 @@ impl TextRenderer {
                     let band_w = (gc.bbox[2] - gc.bbox[0]).max(f32::MIN_POSITIVE);
                     let band_h = (gc.bbox[3] - gc.bbox[1]).max(f32::MIN_POSITIVE);
 
-                    self.vector_glyphs.push(VectorGlyphInstance {
+                    let instance = VectorGlyphInstance {
                         pos: [origin_x + min_x * font_size, origin_y - max_y * font_size],
                         size: [(max_x - min_x) * font_size, (max_y - min_y) * font_size],
                         em_pos: [min_x, max_y],
@@ -395,7 +455,16 @@ impl TextRenderer {
                         count: gc.instance_count(),
                         band_scale: [(max_x - min_x) / band_w, -(max_y - min_y) / band_h],
                         band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
-                    });
+                        weight_t: weight_t.unwrap_or(gc.weight_t),
+                        b_first: gc.b_first(),
+                    };
+                    // Two masters means the blending pipeline; everything else
+                    // draws with a shader that never looks for one.
+                    if instance.b_first == 0 {
+                        self.vector_glyphs.push(instance);
+                    } else {
+                        self.blend_glyphs.push(instance);
+                    }
                     continue;
                 }
 
@@ -451,6 +520,7 @@ impl TextRenderer {
         self.over_buf.upload(device, queue, &self.over_rects);
         self.atlas_buf.upload(device, queue, &self.atlas_glyphs);
         self.vector_buf.upload(device, queue, &self.vector_glyphs);
+        self.blend_buf.upload(device, queue, &self.blend_glyphs);
     }
 
     /// Record draws into an open render pass:
@@ -461,6 +531,7 @@ impl TextRenderer {
         let draws = [
             (&self.rect_pipeline, &self.under_buf),
             (&self.vector_pipeline, &self.vector_buf),
+            (&self.blend_pipeline, &self.blend_buf),
             (&self.atlas_pipeline, &self.atlas_buf),
             (&self.rect_pipeline, &self.over_buf),
         ];
@@ -535,9 +606,19 @@ mod tests {
     }
 
     fn view(font_system: &mut FontSystem, text: &str, size: f32, pos: [f32; 2]) -> TextView {
+        view_in(font_system, text, size, pos, Family::SansSerif)
+    }
+
+    fn view_in(
+        font_system: &mut FontSystem,
+        text: &str,
+        size: f32,
+        pos: [f32; 2],
+        family: Family,
+    ) -> TextView {
         let mut view = TextView::new(font_system, Metrics::new(size, size * 1.25));
         view.pos = pos;
-        view.set_text(font_system, text, &Attrs::new().family(Family::SansSerif));
+        view.set_text(font_system, text, &Attrs::new().family(family));
         view
     }
 
@@ -556,6 +637,108 @@ mod tests {
             renderer.text(queue, font_system, &filler.buffer, filler.pos, Color::WHITE);
         }
         testing::render_pixels(renderer, W, H)
+    }
+
+    /// Draw one view at a fixed GPU weight blend and read the frame back.
+    fn weighted_frame(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        view: &TextView,
+        weight_t: Option<f32>,
+    ) -> Vec<u8> {
+        let (_, queue) = testing::gpu();
+        renderer.begin();
+        renderer.text_with_weight(
+            queue,
+            font_system,
+            &view.buffer,
+            view.pos,
+            Color::WHITE,
+            weight_t,
+        );
+        testing::render_pixels(renderer, W, H)
+    }
+
+    /// Total coverage in a frame — how much ink the glyphs put down.
+    fn ink(pixels: &[u8]) -> u64 {
+        pixels.iter().map(|&p| p as u64).sum()
+    }
+
+    #[test]
+    fn the_gpu_weight_blend_grades_a_variable_font_between_its_masters() {
+        let mut font_system = testing::variable_font_system();
+        let sample = view_in(
+            &mut font_system,
+            "weight",
+            40.0,
+            [6.0, 6.0],
+            Family::Name(testing::VARIABLE_FAMILY),
+        );
+        let mut renderer = renderer(2048, 2048);
+
+        let steps: Vec<u64> = [0.0, 0.25, 0.5, 0.75, 1.0]
+            .iter()
+            .map(|&t| {
+                ink(&weighted_frame(
+                    &mut renderer,
+                    &mut font_system,
+                    &sample,
+                    Some(t),
+                ))
+            })
+            .collect();
+        assert!(steps[0] > 0, "the sample drew something");
+        assert!(
+            renderer.vector_glyphs.is_empty() && !renderer.blend_glyphs.is_empty(),
+            "a variable face draws on the blending pipeline"
+        );
+        assert!(
+            renderer.blend_glyphs.iter().all(|g| g.b_first != 0),
+            "every glyph of a variable face carries a second master"
+        );
+        // Heavier all the way up the axis, and no step is a jump to a
+        // completely different shape: the outline moves continuously.
+        for pair in steps.windows(2) {
+            assert!(pair[1] > pair[0], "weight steps must add ink: {steps:?}");
+            assert!(
+                pair[1] < pair[0] * 2,
+                "a step should nudge the outline, not replace it: {steps:?}"
+            );
+        }
+
+        // The default blend is the one matching the shaped weight (400 of
+        // 200..800), so it lands inside the range the overrides span.
+        let default = ink(&weighted_frame(
+            &mut renderer,
+            &mut font_system,
+            &sample,
+            None,
+        ));
+        assert!(default > steps[0] && default < steps[4]);
+    }
+
+    #[test]
+    fn a_static_font_ignores_the_weight_blend_entirely() {
+        let mut font_system = testing::font_system();
+        let sample = view_in(
+            &mut font_system,
+            "weight",
+            40.0,
+            [6.0, 6.0],
+            Family::Name(testing::STATIC_FAMILY),
+        );
+        let mut renderer = renderer(2048, 2048);
+
+        let plain = weighted_frame(&mut renderer, &mut font_system, &sample, None);
+        assert!(
+            renderer.vector_glyphs.iter().all(|g| g.b_first == 0),
+            "a static face has no second master to blend to"
+        );
+        assert!(ink(&plain) > 0, "the sample drew something");
+        for t in [0.0, 0.5, 1.0] {
+            let forced = weighted_frame(&mut renderer, &mut font_system, &sample, Some(t));
+            assert_eq!(plain, forced, "weight_t {t} disturbed a static font");
+        }
     }
 
     #[test]

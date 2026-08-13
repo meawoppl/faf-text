@@ -63,6 +63,20 @@ algorithm change. Roadmap lives in issues #2–#11.
   range overlaps it ±5% of a band height — leave a curve out and its winding
   contribution is exactly 0.0, which is why banding is bit-for-bit
   pixel-identical to the flat loop (assert this with the offscreen example).
+- Variable weight: a `wght` face is extracted at both axis ends and master B's
+  records go in a parallel region after A's, so one constant (`b_offset =
+  count * 2` texels) reaches any twin and band lists keep indexing A. Band
+  membership is decided over *both* masters' control-point ranges, or a blend
+  could put a curve in a band that omitted it.
+- A per-curve `if b_base != 0u` in the fragment shader cost **25%** even when
+  never taken (0.64 → 0.80 ms in `examples/bench`). The fix is the WGSL
+  `override BLEND_MASTERS` plus two pipelines built from the same module with
+  `PipelineCompilationOptions::constants`; the static path then compiles to
+  exactly the old shader. Overrides work fine on wgpu 30 + naga.
+- `FontSystem::new_with_fonts` also loads **system fonts** on native (cosmic's
+  `load_fonts` calls `db.load_system_fonts()` first), so an embedded blob is
+  the *last* face in the database, not the first — look faces up by family
+  (`testing::font_id_of`), never by position.
 - Glyph stores never evict mid-frame: queued instances hold raw `first` indices
   and atlas UVs, so overflow sets a flag, falls back for that frame, and the
   eviction runs in `begin_frame`. Growth/compaction bump `CurveStore.generation`

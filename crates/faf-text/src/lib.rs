@@ -55,6 +55,11 @@ impl Color {
 pub const FONT_DEJAVU_SANS: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 /// DejaVu Sans Mono, ditto.
 pub const FONT_DEJAVU_SANS_MONO: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+/// Manrope, a variable font with a `wght` axis spanning 200–800. Glyphs from a
+/// variable face carry both axis-end masters on the GPU, so
+/// [`TextRenderer::text_with_weight`] can blend weight per frame for free.
+/// SIL Open Font License 1.1 — see `assets/Manrope-OFL.txt`.
+pub const FONT_MANROPE_VARIABLE: &[u8] = include_bytes!("../assets/Manrope-Variable.ttf");
 
 /// Build a [`FontSystem`] from font blobs alone — no system font scan, which
 /// keeps startup fast and is the only option on wasm.

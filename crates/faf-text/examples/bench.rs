@@ -54,14 +54,23 @@ async fn run() {
     let filler = "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789 ";
     let chars_per_line = (SIZE as f32 / 17.0) as usize; // ~32px DejaVu advance ≈ 17px avg
     for i in 0..LINES {
-        let mut line: String = filler.chars().cycle().skip(i * 7).take(chars_per_line).collect();
+        let mut line: String = filler
+            .chars()
+            .cycle()
+            .skip(i * 7)
+            .take(chars_per_line)
+            .collect();
         line.push('\n');
         text.push_str(&line);
     }
 
     let mut tv = TextView::new(&mut font_system, Metrics::new(32.0, line_height));
     tv.set_size(&mut font_system, Some(SIZE as f32), None);
-    tv.set_text(&mut font_system, &text, &Attrs::new().family(Family::SansSerif));
+    tv.set_text(
+        &mut font_system,
+        &text,
+        &Attrs::new().family(Family::SansSerif),
+    );
 
     // Prepare once (uploads instances + curve data), then time pure rendering.
     renderer.begin();

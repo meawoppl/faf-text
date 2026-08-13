@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use cosmic_text::fontdb;
 
 use crate::renderer::TextRenderer;
-use crate::{FONT_DEJAVU_SANS, FontSystem, font_system_from_fonts};
+use crate::{FONT_DEJAVU_SANS, FONT_MANROPE_VARIABLE, FontSystem, font_system_from_fonts};
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -37,9 +37,34 @@ pub fn font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_DEJAVU_SANS])
 }
 
-/// The id of the one face in [`font_system`].
+/// A font system with Manrope in it, whose `wght` axis (200–800) gives every
+/// glyph two masters to blend between.
+pub fn variable_font_system() -> FontSystem {
+    font_system_from_fonts(&[FONT_MANROPE_VARIABLE])
+}
+
+/// Family name of the static face the tests fall back on.
+pub const STATIC_FAMILY: &str = "DejaVu Sans";
+
+/// Family name of the face [`variable_font_system`] is loaded for.
+pub const VARIABLE_FAMILY: &str = "Manrope";
+
+/// The id of the first face in `font_system`.
 pub fn font_id(font_system: &FontSystem) -> fontdb::ID {
     font_system.db().faces().next().expect("no faces loaded").id
+}
+
+/// The id of the face for `family`. cosmic-text's `new_with_fonts` scans the
+/// system fonts as well as the blobs it is handed, so an embedded font is
+/// nowhere near the front of the database — it is appended, hence `last`.
+pub fn font_id_of(font_system: &FontSystem, family: &str) -> fontdb::ID {
+    font_system
+        .db()
+        .faces()
+        .filter(|face| face.families.iter().any(|(name, _)| name == family))
+        .last()
+        .unwrap_or_else(|| panic!("no face loaded for family {family}"))
+        .id
 }
 
 /// Finish the frame, draw everything queued on `renderer` into a `width ×

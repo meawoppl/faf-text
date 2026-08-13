@@ -32,6 +32,14 @@ Because coverage is analytic, glyphs get **true subpixel positioning** (no
 snapping, no subpixel atlas bins) and **free scaling** — zooming re-rasterizes
 nothing; the curve data never changes.
 
+**Variable-font weight is a GPU lerp.** A glyph from a face with a `wght` axis
+is extracted twice, at both ends of the axis, and the two point-compatible
+master outlines are stored side by side. The fragment shader mixes the control
+points before the winding test, so weight animates per frame at zero CPU cost
+and without touching the curve texture. Glyphs without a second master are
+drawn by a pipeline the master-B fetch is compiled out of, so they pay nothing
+for the feature.
+
 **What's not curves rides a bitmap atlas.** Color emoji and any glyph without
 an extractable outline are rasterized by swash into a shelf-packed
 (`etagere`) RGBA atlas and drawn by a second instanced pipeline.
@@ -49,8 +57,8 @@ the glyphs, highlight overlays render *over* them with alpha blending, both
 instanced. Hit-testing (pixel → cursor) and cursor-range → rect geometry are
 BiDi-aware, courtesy of cosmic-text's shaping and layout.
 
-A full frame is at most four draw calls: under-rects, vector glyphs, atlas
-glyphs, over-rects.
+A full frame is at most five draw calls: under-rects, vector glyphs, weight-
+blended vector glyphs, atlas glyphs, over-rects.
 
 ## Compatibility
 
@@ -88,6 +96,9 @@ python3 -m http.server -d web 8000
 - A glyph that overflows a capped store falls back for the frame it overflowed
   in (curves → atlas, atlas → skipped glyph); it renders normally from the next
   frame on, once eviction has made room.
-- Variable-font weight is applied by swash at extraction; each weight gets its
-  own curve set (correct, just not deduplicated).
+- Weight blending moves outlines, not advances: those come from shaping, at
+  the attrs weight. Blending far from it reads tight or loose, so animate
+  around the shaped weight rather than across the whole axis.
+- Only the `wght` axis is interpolated, between its two extremes; other
+  variation axes still bake into the extracted curves.
 - No gamma-aware blending option yet; text blends in the surface's space.

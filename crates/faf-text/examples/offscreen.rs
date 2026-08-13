@@ -49,6 +49,7 @@ async fn run() {
     let mut font_system = faf_text::font_system_from_fonts(&[
         faf_text::FONT_DEJAVU_SANS,
         faf_text::FONT_DEJAVU_SANS_MONO,
+        faf_text::FONT_MANROPE_VARIABLE,
     ]);
     font_system.db_mut().load_system_fonts();
 
@@ -83,6 +84,17 @@ async fn run() {
         "let coverage = clamp(abs(winding), 0.0, 1.0); // exact, no MSAA\n\
          for size in [8, 11, 15, 22, 64, 300] { render(size); } // one curve set",
         &Attrs::new().family(Family::Monospace),
+    );
+
+    // Variable font: one shaped buffer drawn five times, each blending the
+    // glyph's two wght masters differently in the fragment shader. No
+    // re-extraction, no second curve set — just a lerp per control point.
+    let mut weights = TextView::new(&mut font_system, Metrics::new(26.0, 34.0));
+    weights.pos = [40.0, 500.0];
+    weights.set_text(
+        &mut font_system,
+        "weight",
+        &Attrs::new().family(Family::Name("Manrope")),
     );
 
     // A giant glyph to show off resolution independence — same curve data the
@@ -145,6 +157,16 @@ async fn run() {
         huge.pos,
         Color::rgba8(0xbb, 0x9a, 0xf7, 0xff),
     );
+    for step in 0..5 {
+        renderer.text_with_weight(
+            &queue,
+            &mut font_system,
+            &weights.buffer,
+            [weights.pos[0] + step as f32 * 112.0, weights.pos[1]],
+            Color::rgba8(0xff, 0x9e, 0x64, 0xff),
+            Some(step as f32 / 4.0),
+        );
+    }
 
     renderer.finish(&device, &queue, [WIDTH as f32, HEIGHT as f32]);
 
