@@ -12,11 +12,13 @@
 
 mod atlas;
 mod curves;
+mod document;
 mod renderer;
 #[cfg(test)]
 mod testing;
 mod view;
 
+pub use document::{CHUNK_LINES, DocCursor, DocStats, Document, RETAIN_CHUNKS, WINDOW_CHUNKS};
 pub use renderer::{RectLayer, TextRenderer};
 pub use view::{Rect, TextView};
 
