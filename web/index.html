@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>faf-text — GPU text renderer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #15161e; color: #c0caf5;
+    font: 14px/1.5 system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; background: #1a1b26; border-bottom: 1px solid #2a2c3a;
+  }
+  header h1 { font-size: 16px; margin: 0; color: #7aa2f7; }
+  header .stat {
+    font-variant-numeric: tabular-nums; color: #9ece6a;
+    background: #1f2130; border-radius: 6px; padding: 2px 10px;
+  }
+  header .badge { color: #bb9af7; background: #1f2130; border-radius: 6px; padding: 2px 10px; }
+  label { display: flex; align-items: center; gap: 8px; color: #a9b1d6; }
+  input[type="text"] {
+    background: #1f2130; color: #c0caf5; border: 1px solid #2a2c3a;
+    border-radius: 6px; padding: 4px 10px; width: 160px;
+  }
+  input[type="range"] { accent-color: #7aa2f7; }
+  #canvas {
+    display: block; width: 100%; height: calc(100vh - 57px);
+    cursor: text; touch-action: none;
+  }
+  #fallback { padding: 40px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>faf-text</h1>
+  <span class="badge" id="backend">…</span>
+  <span class="stat" id="fps">— fps</span>
+  <label>font size <input type="range" id="size" min="8" max="160" value="18">
+    <span id="sizeval" class="stat">18px</span></label>
+  <label><input type="checkbox" id="pulse"> animate zoom</label>
+  <label>highlight <input type="text" id="search" value="winding" placeholder="search text"></label>
+</header>
+<canvas id="canvas"></canvas>
+<div id="fallback" hidden>
+  <h2>WebGPU/WebGL2 unavailable</h2>
+  <p id="fallback-msg"></p>
+</div>
+
+<script type="module">
+import init, { FafTextDemo } from './pkg/faf_text_web.js';
+
+const SAMPLE = `faf-text — a GPU text renderer that is fast as f***.
+
+Every glyph on this page is drawn by a fragment shader deciding inside/outside against the glyph's quadratic Bézier curves with the non-zero winding rule. There is no glyph atlas for outlines, no re-rasterization on zoom, and antialiasing is analytic — the clamp of a crossing distance, not MSAA. Drag the font-size slider (or hit "animate zoom") and watch letterforms stay perfect at every scale; the curve data uploaded to the GPU never changes.
+
+Selection is an instanced rect layer under the glyphs — click and drag to select. Highlights are an alpha-blended rect layer over the glyphs — type in the highlight box to mark every occurrence live. Both come from the same BiDi-aware cursor geometry, so mixed scripts select correctly.
+
+Shaping is cosmic-text (pure Rust, compiled to wasm): Ελληνικά, кириллица, tiếng Việt, ﬁ ﬂ ligatures, and math like ∮ E⋅da = Q or ∀x∈ℝ: x² ≥ 0 all shape and render on the same code path. One draw call renders every solid rect, one draws every glyph.
+
+The winding evaluation is exact even where rays graze curve endpoints — crossings are classified by the sign pattern of the control points, not by fragile root-range checks. Below ~24px, three parallel rays per axis recover hairline stems that single sampling would drop.
+
+Type or paste anything here — this block is the renderer's input. ${'Speed test: the quick brown fox jumps over the lazy dog 0123456789. '.repeat(40)}`;
+
+async function main() {
+  await init();
+  const canvas = document.getElementById('canvas');
+  const dpr = window.devicePixelRatio || 1;
+  const fit = () => {
+    const r = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+  };
+  fit();
+
+  let demo;
+  try {
+    demo = await FafTextDemo.attach(canvas, dpr);
+  } catch (e) {
+    document.getElementById('canvas').hidden = true;
+    document.getElementById('fallback').hidden = false;
+    document.getElementById('fallback-msg').textContent = String(e);
+    return;
+  }
+  document.getElementById('backend').textContent = demo.backend();
+  demo.set_text(SAMPLE);
+  demo.set_search(document.getElementById('search').value);
+
+  window.addEventListener('resize', () => {
+    fit();
+    demo.resize(canvas.width, canvas.height, window.devicePixelRatio || 1);
+  });
+
+  const pos = e => {
+    const r = canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  };
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    demo.pointer_down(...pos(e));
+  });
+  canvas.addEventListener('pointermove', e => demo.pointer_move(...pos(e)));
+  canvas.addEventListener('pointerup', () => demo.pointer_up());
+  document.addEventListener('copy', e => {
+    const text = demo.selected_text();
+    if (text) { e.clipboardData.setData('text/plain', text); e.preventDefault(); }
+  });
+
+  const sizeInput = document.getElementById('size');
+  const sizeVal = document.getElementById('sizeval');
+  sizeInput.addEventListener('input', () => {
+    sizeVal.textContent = `${sizeInput.value}px`;
+    demo.set_font_size(Number(sizeInput.value));
+  });
+  document.getElementById('search').addEventListener('input',
+    e => demo.set_search(e.target.value));
+
+  // Paste replaces the text — quickest way to try your own content.
+  document.addEventListener('paste', e => {
+    const text = e.clipboardData.getData('text/plain');
+    if (text) demo.set_text(text);
+  });
+
+  const pulse = document.getElementById('pulse');
+  const fpsEl = document.getElementById('fps');
+  let frames = 0, last = performance.now(), start = last;
+  const tick = now => {
+    if (pulse.checked) {
+      const s = 18 + 60 * (0.5 - 0.5 * Math.cos((now - start) / 900));
+      sizeVal.textContent = `${s.toFixed(0)}px`;
+      demo.set_font_size(s);
+    }
+    demo.render();
+    frames++;
+    if (now - last > 500) {
+      fpsEl.textContent = `${(frames * 1000 / (now - last)).toFixed(0)} fps`;
+      frames = 0; last = now;
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+main();
+</script>
+</body>
+</html>
