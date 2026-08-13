@@ -185,6 +185,40 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   four blocks (selection, text, search, caret) rather than three. All four
   share one model matrix under the demo's 3D tilt, which is what keeps the
   caret and the selection glued to the glyphs.
+- Terminal grid (`grid.rs`): char → glyph id is
+  `font.as_swash().charmap().map(ch)` (0 = miss), and the advance is
+  `font.as_swash().glyph_metrics(&[]).scale(px).advance_width(id)`. Both are
+  cached per face in `GridFont`. `Family::Monospace` does **not** resolve in a
+  fonts-only `FontSystem` — cosmic-text sets the db's monospace default to
+  "Noto Sans Mono", which a blob-only database has never heard of — so
+  `resolve_face` falls back through (family, normal style), `Monospace`, and
+  finally the *last* face in the db.
+- Cell metrics are **rounded to whole pixels** (advance of `M`, and ascent +
+  descent + leading), and that is load-bearing: procedural box drawing centers
+  its strokes at `round((cell - thickness) / 2)` in every cell, so two
+  neighbours agree on the offset to the pixel and a join has no seam. Fractional
+  cells put the same stroke at different subpixel offsets per column and the
+  seams stipple.
+- Box drawing's double-line rule: a double arm is two light rails at ±light
+  around where the single bar would be, and a rail's middle is omitted exactly
+  where a *double* perpendicular arm crosses it. That one rule gives ╬ four
+  corners, ╠ a continuous left rail and a broken right one, and ═ two full
+  rails; a *single* perpendicular arm never breaks a rail, it just runs into it
+  (which is why ╤'s stem starts at the lower rail).
+- The East Asian Width table is generated from
+  `unicode.org/Public/UCD/latest/ucd/EastAsianWidth.txt` (17.0.0 as of writing):
+  keep W and F, add the blocks the file documents as defaulting to W for
+  unassigned code points (CJK Ext A, CJK Unified, CJK Compat, planes 2 and 3),
+  sort and merge. `ｱ` U+FF71 is *halfwidth* (class H, narrow) — the fullwidth
+  twin is U+30A2.
+- `BlockContent::glyphs` / `TextRenderer::glyphs` take `GlyphSpec`s (font id,
+  glyph id, size, pen, color, weight) and skip shaping. `push_text` and
+  `push_glyphs` share `vector_instance` and `push_atlas_glyph`; the shared
+  helpers are exactly the old arithmetic, and the offscreen md5 is unchanged,
+  which is how that refactor was checked.
+- Grid → instance translation for 200×60 colored log cells is **0.12 ms**
+  (mean, release, this box), producing ~4.4k instances; `set_block_content` +
+  `finish` is another ~0.26 ms. `cargo run --release --example term` reports it.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.
