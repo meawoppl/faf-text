@@ -250,6 +250,22 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
 - Grid → instance translation for 200×60 colored log cells is **0.12 ms**
   (mean, release, this box), producing ~4.4k instances; `set_block_content` +
   `finish` is another ~0.26 ms. `cargo run --release --example term` reports it.
+- The web demo's terminal toggle (`set_terminal`) hides the four editable
+  blocks with `set_block_visible` instead of emptying them, and refuses every
+  edit entry point while it is on, so toggling back restores the text *and* the
+  caret/selection; toggling off still re-uploads from the view (`Dirty::all`)
+  rather than trusting instances that sat hidden through an eviction. The grid
+  lives in a fifth block created last (so it composites on top) and keeps a
+  plain offset even under the 3D tilt — at z = 0 the perspective camera agrees
+  with the 2D projection, so flat content does not move. A streaming log
+  scrolls the header off the top every line, so the header is simply redrawn
+  after each `scroll_up` — three rows, cheap, and always in frame.
+- Driving the demo page for a browser check *interactively* (toggle a control,
+  then screenshot) needs CDP, not `--screenshot`: `google-chrome --headless=new
+  --use-angle=swiftshader --enable-unsafe-swiftshader --remote-debugging-port=
+  9222`, then a node script over `ws` (`npm i ws`) doing `Runtime.evaluate` +
+  `Page.captureScreenshot`. Real time runs normally there, so rAF animation
+  screenshots land where expected and no virtual-time budget is involved.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.

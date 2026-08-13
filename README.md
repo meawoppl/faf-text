@@ -149,7 +149,9 @@ Vulkan/Metal/DX12/GL natively, and WebGPU or WebGL2 in the browser.
   helpers), `TermGrid`/`GridFont` (the monospace cell fast path), `math`
   (camera matrices and the ray/pane hit test). No windowing dependencies.
 - `crates/faf-text-web` — wasm-bindgen bindings: attach to a canvas, drive
-  selection from pointer events, search highlighting, clipboard.
+  selection from pointer events, search highlighting, clipboard, and a
+  display-only terminal mode that streams a synthetic log through a `TermGrid`
+  sized to the canvas.
 - `web/` — demo page.
 
 ## Running

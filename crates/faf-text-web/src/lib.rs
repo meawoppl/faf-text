@@ -8,7 +8,8 @@ use faf_text::cosmic_text::{Attrs, Cursor, Family, Metrics};
 use faf_text::glam::{Mat4, Vec3, Vec4};
 use faf_text::math::{block_hit, ndc_ray, pointer_ndc, screen_perspective};
 use faf_text::{
-    BlockContent, BlockId, Color, DecorationKind, FontSystem, Rect, TextRenderer, TextView,
+    BlockContent, BlockId, Cell, CellStyle, Color, DecorationKind, FontSystem, GridFont, GridScene,
+    Rect, TermGrid, TextRenderer, TextView,
 };
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
@@ -30,6 +31,172 @@ const CHIP_RADIUS: f32 = 6.0;
 const FOV_Y: f32 = 0.7;
 /// How far the tilted pane shrinks, so its near edge stays on the canvas.
 const TILT_SCALE: f32 = 0.78;
+/// The embedded monospace font the terminal grid measures its cells in.
+const MONO_FAMILY: &str = "DejaVu Sans Mono";
+/// Cell font size in CSS pixels.
+const TERM_FONT_SIZE: f32 = 13.0;
+/// Gap between the canvas edge and cell (0, 0), in CSS pixels.
+const TERM_MARGIN: f32 = 12.0;
+/// Rows the grid keeps above the viewport.
+const TERM_SCROLLBACK: usize = 2000;
+/// Frames between log lines — the stream is paced, not flat out.
+const TERM_LINE_EVERY: usize = 4;
+/// Same log on every load.
+const TERM_SEED: u64 = 0x1234_5678_9abc_def0;
+
+// Terminal palette, the same tokyo-night-ish one `examples/term.rs` uses.
+const TERM_BG: Color = Color::rgba(0.06, 0.06, 0.09, 1.0);
+const TERM_FG: Color = Color::rgba(0.75, 0.79, 0.96, 1.0);
+const TERM_DIM: Color = Color::rgba(0.35, 0.38, 0.5, 1.0);
+const TERM_BLUE: Color = Color::rgba(0.48, 0.64, 0.97, 1.0);
+const TERM_CYAN: Color = Color::rgba(0.45, 0.8, 0.85, 1.0);
+const TERM_GREEN: Color = Color::rgba(0.62, 0.81, 0.42, 1.0);
+const TERM_YELLOW: Color = Color::rgba(0.88, 0.69, 0.4, 1.0);
+const TERM_RED: Color = Color::rgba(0.97, 0.46, 0.55, 1.0);
+const TERM_MAGENTA: Color = Color::rgba(0.73, 0.6, 0.97, 1.0);
+
+const LEVELS: [(&str, Color); 5] = [
+    ("TRACE", TERM_DIM),
+    ("DEBUG", TERM_BLUE),
+    ("INFO ", TERM_GREEN),
+    ("WARN ", TERM_YELLOW),
+    ("ERROR", TERM_RED),
+];
+
+const TARGETS: [&str; 6] = [
+    "curves::store",
+    "renderer::block",
+    "atlas::shelf",
+    "grid::stream",
+    "document::chunk",
+    "wgpu::queue",
+];
+
+const MESSAGES: [&str; 6] = [
+    "uploaded {n} instances in {n} writes, arena at {n}%",
+    "glyph {n} extracted: {n} quads, banded, bbox stable",
+    "block {n} damaged by scroll; {n} cells retranslated",
+    "shelf {n} full, evicting {n} glyphs not drawn since frame {n}",
+    "chunk {n} shaped ({n} lines, {n} runs) and retained",
+    "present skipped: nothing damaged for {n} frames",
+];
+
+/// A tiny xorshift, so the log is the same log on every load.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.next() as usize % items.len()]
+    }
+}
+
+/// Terminal mode's state: the grid, the mono font its cells are measured in,
+/// the reusable instance scene, and the synthetic log stream feeding it.
+struct Terminal {
+    grid: TermGrid,
+    font: GridFont,
+    scene: GridScene,
+    rng: Rng,
+    frame: usize,
+}
+
+/// One synthetic log line at the bottom of the grid, printed as colored
+/// segments: a dim timestamp, a level chip, a target, and a body whose numbers
+/// get their own color the way a structured logger highlights values.
+fn push_log_line(term: &mut Terminal) {
+    let Terminal {
+        grid, rng, frame, ..
+    } = term;
+    grid.scroll_up(1);
+    let row = grid.rows() - 1;
+    let (level, level_color) = *rng.pick(&LEVELS);
+    let target = *rng.pick(&TARGETS);
+    let message = *rng.pick(&MESSAGES);
+
+    let mut col = grid.print(
+        0,
+        row,
+        &format!("{:>6}.{:03}  ", *frame / 60, (*frame * 17) % 1000),
+        TERM_DIM,
+        None,
+    );
+    // The level is the one run with a background: a highlight is a merged
+    // rect, however many cells it covers.
+    col = grid.print(col, row, level, TERM_BG, Some(level_color));
+    col = grid.print(col, row, &format!(" {target:<16} "), TERM_CYAN, None);
+    for part in message.split('{') {
+        if let Some(rest) = part.strip_prefix("n}") {
+            col = grid.print(
+                col,
+                row,
+                &(rng.next() % 1000).to_string(),
+                TERM_MAGENTA,
+                None,
+            );
+            col = grid.print(col, row, rest, TERM_FG, None);
+        } else {
+            col = grid.print(col, row, part, TERM_FG, None);
+        }
+    }
+    if level == "ERROR" {
+        grid.print_styled(
+            col,
+            row,
+            "  see backtrace",
+            TERM_RED,
+            None,
+            CellStyle::UNDERLINE,
+        );
+    }
+}
+
+/// Redraw the three header rows, which the stream scrolls away every line: a
+/// double-line box with a single-line column tee'd into both rails, so the
+/// mixed joins are on screen the whole time.
+fn draw_header(grid: &mut TermGrid, backend: &str) {
+    let (cols, rows) = (grid.cols(), grid.rows());
+    if cols < 24 || rows < 6 {
+        return;
+    }
+    let split = cols / 2;
+    for col in 1..cols - 1 {
+        grid.set_cell(col, 0, Cell::new('═', TERM_BLUE));
+        grid.set_cell(col, 1, Cell::new(' ', TERM_FG));
+        grid.set_cell(col, 2, Cell::new('═', TERM_BLUE));
+    }
+    grid.set_cell(0, 0, Cell::new('╔', TERM_BLUE));
+    grid.set_cell(cols - 1, 0, Cell::new('╗', TERM_BLUE));
+    grid.set_cell(0, 1, Cell::new('║', TERM_BLUE));
+    grid.set_cell(cols - 1, 1, Cell::new('║', TERM_BLUE));
+    grid.set_cell(0, 2, Cell::new('╚', TERM_BLUE));
+    grid.set_cell(cols - 1, 2, Cell::new('╝', TERM_BLUE));
+    // The tees are part of the rails, so they wear the rail's color: a cell
+    // of another color would leave a visible notch in an otherwise clean join.
+    grid.set_cell(split, 0, Cell::new('╤', TERM_BLUE));
+    grid.set_cell(split, 1, Cell::new('│', TERM_DIM));
+    grid.set_cell(split, 2, Cell::new('╧', TERM_BLUE));
+
+    grid.print(3, 0, "╡ faf-text terminal grid ╞", TERM_CYAN, None);
+    grid.print(
+        2,
+        1,
+        &format!("{cols}×{rows} cells · {backend} · streaming"),
+        TERM_FG,
+        None,
+    );
+    let mut col = split + 2;
+    for (level, color) in LEVELS {
+        col = grid.print(col, 1, level, TERM_BG, Some(color));
+        col = grid.print(col, 1, " ", TERM_FG, None);
+    }
+}
 
 /// How a search match is marked. Everything but `Highlight` goes through the
 /// decoration pipeline.
@@ -170,6 +337,12 @@ pub struct FafTextDemo {
     search_block: BlockId,
     caret_block: BlockId,
     dirty: Dirty,
+    /// Terminal mode: while it is on, the four editable blocks are *hidden*
+    /// rather than emptied, so toggling it off puts the text, the caret and
+    /// the selection back exactly as they were.
+    terminal: bool,
+    term: Option<Terminal>,
+    grid_block: BlockId,
 }
 
 #[wasm_bindgen]
@@ -254,6 +427,10 @@ impl FafTextDemo {
         let text_block = renderer.create_block();
         let search_block = renderer.create_block();
         let caret_block = renderer.create_block();
+        // Created last so it composites above everything, and hidden until
+        // terminal mode asks for it.
+        let grid_block = renderer.create_block();
+        renderer.set_block_visible(grid_block, false);
         let mut font_system = faf_text::font_system_from_fonts(&[
             faf_text::FONT_DEJAVU_SANS,
             faf_text::FONT_DEJAVU_SANS_MONO,
@@ -299,6 +476,9 @@ impl FafTextDemo {
             search_block,
             caret_block,
             dirty: Dirty::all(),
+            terminal: false,
+            term: None,
+            grid_block,
         })
     }
 
@@ -387,6 +567,9 @@ impl FafTextDemo {
             None,
         );
         self.dirty = Dirty::all();
+        if self.term.is_some() {
+            self.build_terminal();
+        }
     }
 
     /// Stand the text pane up in 3D: `degrees` of rotation about its own
@@ -405,8 +588,41 @@ impl FafTextDemo {
         self.tilt = degrees;
     }
 
+    /// Swap the editable pane for a live terminal grid: a synthetic colored
+    /// log streams into a [`TermGrid`] sized to the canvas, drawn out of one
+    /// retained block with the mono face and procedural box drawing.
+    ///
+    /// The editable blocks are hidden, never destroyed, and no edit is
+    /// accepted while this is on — so toggling it back off restores the text,
+    /// the caret and the selection exactly as they were.
+    pub fn set_terminal(&mut self, on: bool) {
+        if self.terminal == on {
+            return;
+        }
+        self.terminal = on;
+        if on {
+            self.build_terminal();
+        } else {
+            // Rebuild the editable blocks from the (untouched) view rather
+            // than trusting instances that sat hidden through an eviction.
+            self.dirty = Dirty::all();
+        }
+        for block in self.text_blocks() {
+            self.renderer.set_block_visible(block, !on);
+        }
+        self.renderer.set_block_visible(self.grid_block, on);
+    }
+
+    /// Whether terminal mode is on.
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+
     /// Pointer coordinates are CSS px relative to the canvas.
     pub fn pointer_down(&mut self, x: f32, y: f32) {
+        if self.terminal {
+            return;
+        }
         if let Some(cursor) = self.hit(x, y) {
             self.set_cursor(cursor, false);
             self.dragging = true;
@@ -477,6 +693,9 @@ impl FafTextDemo {
     /// single-character key inserts itself. Returns true when the event was
     /// consumed and JS should call `preventDefault()`.
     pub fn key_input(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
+        if self.terminal {
+            return false;
+        }
         match key {
             "ArrowLeft" | "ArrowRight" => {
                 let forward = key == "ArrowRight";
@@ -566,6 +785,9 @@ impl FafTextDemo {
 
     /// Insert text at the caret, replacing the selection.
     pub fn insert_text(&mut self, text: &str) {
+        if self.terminal {
+            return;
+        }
         let range = self.selection_range().unwrap_or_else(|| {
             offset_of(&self.text, self.cursor)..offset_of(&self.text, self.cursor)
         });
@@ -574,6 +796,9 @@ impl FafTextDemo {
 
     /// IME composition started: the pending text replaces the selection.
     pub fn composition_start(&mut self) {
+        if self.terminal {
+            return;
+        }
         if let Some(range) = self.selection_range() {
             self.replace_range(range, "");
         }
@@ -584,6 +809,9 @@ impl FafTextDemo {
     /// Preedit text changed. It lives in the backing string so it shapes and
     /// renders inline (underlined) at the caret.
     pub fn composition_update(&mut self, text: &str) {
+        if self.terminal {
+            return;
+        }
         let range = match self.composition.clone() {
             Some(range) => range,
             None => {
@@ -736,15 +964,96 @@ impl FafTextDemo {
         ])
     }
 
-    /// Push whatever changed since the last frame into the blocks that own it.
-    fn sync_blocks(&mut self) {
-        let origin = self.view.pos;
-        let blocks = [
+    /// The four blocks the editable pane is drawn out of, in z-order.
+    fn text_blocks(&self) -> [BlockId; 4] {
+        [
             self.selection_block,
             self.text_block,
             self.search_block,
             self.caret_block,
-        ];
+        ]
+    }
+
+    /// Cells that fit on the canvas at this font's cell size.
+    fn grid_cells(&self, font: &GridFont) -> [u16; 2] {
+        let [cell_w, cell_h] = font.cell_size();
+        let margin = 2.0 * TERM_MARGIN * self.dpr;
+        let fit = |extent: u32, cell: f32| {
+            ((extent as f32 - margin) / cell).floor().clamp(1.0, 400.0) as u16
+        };
+        [
+            fit(self.config.width, cell_w),
+            fit(self.config.height, cell_h),
+        ]
+    }
+
+    /// Build the terminal grid, or refit the existing one to the canvas. The
+    /// mono font is only rebuilt when its pixel size actually changed — every
+    /// cache in a `GridFont` is worth keeping across a resize, and the grid
+    /// re-anchors its log to the bottom the way a terminal does.
+    fn build_terminal(&mut self) {
+        let px = (TERM_FONT_SIZE * self.dpr).round().max(6.0);
+        let mut term = match self.term.take() {
+            Some(mut term) if term.font.font_size() == px => {
+                let [cols, rows] = self.grid_cells(&term.font);
+                term.grid.resize(cols, rows);
+                term
+            }
+            _ => {
+                let font = GridFont::new(&mut self.font_system, Family::Name(MONO_FAMILY), px);
+                let [cols, rows] = self.grid_cells(&font);
+                let mut term = Terminal {
+                    grid: TermGrid::new(cols, rows, TERM_SCROLLBACK),
+                    font,
+                    scene: GridScene::new(),
+                    rng: Rng(TERM_SEED),
+                    frame: 0,
+                };
+                // Fill the viewport once, so switching in lands on a screen
+                // full of log rather than on three header rows.
+                for _ in 0..rows {
+                    term.frame += 1;
+                    push_log_line(&mut term);
+                }
+                term
+            }
+        };
+        draw_header(&mut term.grid, &self.backend);
+        self.term = Some(term);
+    }
+
+    /// Advance the synthetic stream and translate the grid into its block —
+    /// only when something moved, so an idle grid uploads nothing.
+    fn terminal_tick(&mut self) {
+        let Some(mut term) = self.term.take() else {
+            return;
+        };
+        term.frame += 1;
+        if term.frame.is_multiple_of(TERM_LINE_EVERY) {
+            push_log_line(&mut term);
+            draw_header(&mut term.grid, &self.backend);
+        }
+        if term.grid.take_dirty() {
+            let Terminal {
+                grid, font, scene, ..
+            } = &mut term;
+            grid.render(
+                &mut self.renderer,
+                &self.queue,
+                &mut self.font_system,
+                font,
+                scene,
+                self.grid_block,
+                [0.0, 0.0],
+            );
+        }
+        self.term = Some(term);
+    }
+
+    /// Push whatever changed since the last frame into the blocks that own it.
+    fn sync_blocks(&mut self) {
+        let origin = self.view.pos;
+        let blocks = self.text_blocks();
         // Placement is a uniform per block either way — a swaying pane costs
         // four matrix writes a frame and not one instance.
         match self.pane_model() {
@@ -763,6 +1072,12 @@ impl FafTextDemo {
                 }
             }
         }
+        // The grid stays flat under any tilt: at z = 0 the perspective camera
+        // agrees with the 2D projection exactly, so this is the same pixels
+        // either way.
+        let margin = TERM_MARGIN * self.dpr;
+        self.renderer
+            .set_block_offset(self.grid_block, [margin, margin]);
 
         if std::mem::take(&mut self.dirty.text) {
             self.renderer.set_block_content(
@@ -886,6 +1201,9 @@ impl FafTextDemo {
 
     fn render_frame(&mut self) -> Result<bool, JsValue> {
         self.renderer.begin_frame();
+        if self.terminal {
+            self.terminal_tick();
+        }
         self.sync_blocks();
         // Nothing changed: what is on the canvas is still right, so there is
         // no pass to record and no frame to present.

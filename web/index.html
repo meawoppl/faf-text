@@ -59,6 +59,7 @@
   <label><input type="checkbox" id="pulse"> animate zoom</label>
   <label><input type="checkbox" id="wave"> weight wave</label>
   <label><input type="checkbox" id="tilt" title="stand the pane up in 3D — selection still works"> 3D tilt</label>
+  <label><input type="checkbox" id="terminal" title="stream a synthetic colored log through a terminal grid — display only, editing is off"> terminal</label>
   <label>highlight <input type="text" id="search" value="winding" placeholder="search text">
     <select id="mode" title="how matches are marked">
       <option value="highlight">highlight</option>
@@ -129,6 +130,11 @@ async function main() {
   });
 
   const ime = document.getElementById('ime');
+  const terminal = document.getElementById('terminal');
+  // Terminal mode hides the editable blocks (it never destroys them), so the
+  // page stops feeding it input while it is on — the grid is display-only.
+  terminal.addEventListener('change', () => demo.set_terminal(terminal.checked));
+  const editing = () => !terminal.checked;
   // Caret blink is host-side: 530ms on/off, restarted on every edit or motion.
   const BLINK = 530;
   let lastActivity = performance.now();
@@ -140,19 +146,21 @@ async function main() {
     return [e.clientX - r.left, e.clientY - r.top];
   };
   canvas.addEventListener('pointerdown', e => {
+    if (!editing()) return;
     canvas.setPointerCapture(e.pointerId);
     demo.pointer_down(...pos(e));
     // Keyboard and IME events go to the hidden input, not the canvas.
     ime.focus({ preventScroll: true });
     activity();
   });
-  canvas.addEventListener('pointermove', e => demo.pointer_move(...pos(e)));
+  canvas.addEventListener('pointermove', e => { if (editing()) demo.pointer_move(...pos(e)); });
   canvas.addEventListener('pointerup', () => { demo.pointer_up(); activity(); });
-  canvas.addEventListener('focus', () => ime.focus({ preventScroll: true }));
+  canvas.addEventListener('focus', () => { if (editing()) ime.focus({ preventScroll: true }); });
   ime.addEventListener('focus', () => { focused = true; activity(); });
   ime.addEventListener('blur', () => { focused = false; });
 
   ime.addEventListener('keydown', e => {
+    if (!editing()) return;
     if (e.isComposing || e.keyCode === 229) return;  // the IME owns this key
     if (demo.key_input(e.key, e.ctrlKey || e.metaKey, e.shiftKey)) e.preventDefault();
     activity();
@@ -160,9 +168,10 @@ async function main() {
 
   // IME: the preedit text lives in the Rust-side string so it shapes and
   // renders inline (underlined) at the caret, then commits in place.
-  ime.addEventListener('compositionstart', () => { demo.composition_start(); activity(); });
-  ime.addEventListener('compositionupdate', e => { demo.composition_update(e.data || ''); activity(); });
+  ime.addEventListener('compositionstart', () => { if (editing()) { demo.composition_start(); activity(); } });
+  ime.addEventListener('compositionupdate', e => { if (editing()) { demo.composition_update(e.data || ''); activity(); } });
   ime.addEventListener('compositionend', e => {
+    if (!editing()) return;
     demo.composition_update(e.data || '');
     demo.composition_end(true);
     ime.value = '';
@@ -174,6 +183,7 @@ async function main() {
     if (text) { e.clipboardData.setData('text/plain', text); e.preventDefault(); }
   });
   document.addEventListener('cut', e => {
+    if (!editing()) return;
     const text = demo.selected_text();
     if (!text) return;
     e.clipboardData.setData('text/plain', text);
@@ -197,6 +207,7 @@ async function main() {
 
   // Paste inserts at the caret, replacing any selection.
   document.addEventListener('paste', e => {
+    if (!editing()) return;
     const text = e.clipboardData.getData('text/plain');
     if (!text) return;
     e.preventDefault();
@@ -213,28 +224,32 @@ async function main() {
   const TILT_DEGREES = 30, SWAY_DEGREES = 4, SWAY_MS = 5200;
   let frames = 0, last = performance.now(), start = last;
   const tick = now => {
-    // Weight is a GPU lerp between two masters of the variable font, so this
-    // costs nothing per frame: no re-shape, no re-raster.
-    demo.set_weight_blend(wave.checked
-      ? 0.5 + 0.5 * Math.sin((now - start) / 700)
-      : undefined);
-    // Pointer selection keeps working through this: clicks are cast as rays
-    // onto the pane's plane and land on the same words they would flat.
-    demo.set_tilt(tilt.checked
-      ? TILT_DEGREES + SWAY_DEGREES * Math.sin((now - start) / SWAY_MS * Math.PI * 2)
-      : undefined);
-    if (pulse.checked) {
-      const s = 18 + 60 * (0.5 - 0.5 * Math.cos((now - start) / 900));
-      sizeVal.textContent = `${s.toFixed(0)}px`;
-      demo.set_font_size(s);
+    // The editable pane is hidden in terminal mode, so nothing drives it:
+    // re-shaping text nobody can see would be the one expensive thing here.
+    if (editing()) {
+      // Weight is a GPU lerp between two masters of the variable font, so this
+      // costs nothing per frame: no re-shape, no re-raster.
+      demo.set_weight_blend(wave.checked
+        ? 0.5 + 0.5 * Math.sin((now - start) / 700)
+        : undefined);
+      // Pointer selection keeps working through this: clicks are cast as rays
+      // onto the pane's plane and land on the same words they would flat.
+      demo.set_tilt(tilt.checked
+        ? TILT_DEGREES + SWAY_DEGREES * Math.sin((now - start) / SWAY_MS * Math.PI * 2)
+        : undefined);
+      if (pulse.checked) {
+        const s = 18 + 60 * (0.5 - 0.5 * Math.cos((now - start) / 900));
+        sizeVal.textContent = `${s.toFixed(0)}px`;
+        demo.set_font_size(s);
+      }
+      const blinkOn = Math.floor((now - lastActivity) / BLINK) % 2 === 0;
+      demo.set_caret_visible(focused && blinkOn);
+      // Park the IME input on the caret so composition popups land there.
+      const [cx, cy, , ch] = demo.caret_css_rect();
+      const box = canvas.getBoundingClientRect();
+      ime.style.left = `${box.left + cx}px`;
+      ime.style.top = `${box.top + cy + ch}px`;
     }
-    const blinkOn = Math.floor((now - lastActivity) / BLINK) % 2 === 0;
-    demo.set_caret_visible(focused && blinkOn);
-    // Park the IME input on the caret so composition popups land there.
-    const [cx, cy, , ch] = demo.caret_css_rect();
-    const box = canvas.getBoundingClientRect();
-    ime.style.left = `${box.left + cx}px`;
-    ime.style.top = `${box.top + cy + ch}px`;
     // render() returns false when the scene graph reports no damage: nothing
     // was re-recorded and nothing was presented, so it does not count as a
     // drawn frame. An idle demo sits at "idle" — that is the point.
