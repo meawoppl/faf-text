@@ -1,5 +1,8 @@
 //! wasm-bindgen glue: binds the faf-text renderer to an HTML canvas with
-//! pointer-driven selection and search highlighting.
+//! pointer-driven selection, keyboard editing, IME composition and search
+//! highlighting.
+
+use std::ops::Range;
 
 use faf_text::cosmic_text::{Attrs, Cursor, Family, Metrics};
 use faf_text::{Color, FontSystem, RectLayer, TextRenderer, TextView};
@@ -9,7 +12,44 @@ use web_sys::HtmlCanvasElement;
 const SELECTION: Color = Color::rgba(0.23, 0.39, 0.66, 1.0);
 const HIGHLIGHT: Color = Color::rgba(0.88, 0.69, 0.41, 0.38);
 const FOREGROUND: Color = Color::rgba(0.75, 0.79, 0.96, 1.0);
+const CARET: Color = Color::rgba(1.0, 0.62, 0.39, 1.0);
 const MARGIN: f32 = 24.0;
+/// Caret thickness and composition underline thickness, in physical pixels.
+const CARET_WIDTH: f32 = 2.0;
+
+/// Line separators cosmic-text splits paragraphs on, normalized to `\n` so
+/// that byte offsets in the backing string line up with buffer lines.
+fn normalize(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace(['\r', '\u{b}', '\u{c}', '\u{1c}', '\u{1d}', '\u{1e}'], "\n")
+        .replace(['\u{85}', '\u{2028}', '\u{2029}'], "\n")
+}
+
+/// Byte offset of a cursor in the backing string.
+fn offset_of(text: &str, c: Cursor) -> usize {
+    let mut start = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        if i == c.line {
+            return start + c.index.min(line.len());
+        }
+        start += line.len() + 1;
+    }
+    text.len()
+}
+
+/// Inverse of [`offset_of`].
+fn cursor_of(text: &str, offset: usize) -> Cursor {
+    let offset = offset.min(text.len());
+    let mut start = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        let end = start + line.len();
+        if offset <= end {
+            return Cursor::new(i, offset - start);
+        }
+        start = end + 1;
+    }
+    Cursor::new(0, 0)
+}
 
 #[wasm_bindgen]
 pub struct FafTextDemo {
@@ -23,7 +63,16 @@ pub struct FafTextDemo {
     view: TextView,
     dpr: f32,
     font_size: f32,
-    selection: Option<(Cursor, Cursor)>,
+    /// Authoritative text; the shaped buffer is rebuilt from it on every edit.
+    text: String,
+    /// Insertion point, and the fixed end of the selection.
+    cursor: Cursor,
+    anchor: Cursor,
+    /// Column vertical motion tries to keep, in physical pixels.
+    sticky_x: Option<f32>,
+    /// Byte range of in-flight IME composition text inside `text`.
+    composition: Option<Range<usize>>,
+    caret_visible: bool,
     dragging: bool,
     search: String,
 }
@@ -134,7 +183,12 @@ impl FafTextDemo {
             view,
             dpr,
             font_size,
-            selection: None,
+            text: String::new(),
+            cursor: Cursor::new(0, 0),
+            anchor: Cursor::new(0, 0),
+            sticky_x: None,
+            composition: None,
+            caret_visible: true,
             dragging: false,
             search: String::new(),
         })
@@ -145,12 +199,16 @@ impl FafTextDemo {
     }
 
     pub fn set_text(&mut self, text: &str) {
-        self.view.set_text(
-            &mut self.font_system,
-            text,
-            &Attrs::new().family(Family::SansSerif),
-        );
-        self.selection = None;
+        self.text = normalize(text);
+        self.reshape();
+        self.composition = None;
+        self.sticky_x = None;
+        self.set_cursor(Cursor::new(0, 0), false);
+    }
+
+    /// The full text, so JS can round-trip it (save, copy-all, tests).
+    pub fn text(&self) -> String {
+        self.text.clone()
     }
 
     pub fn set_font_size(&mut self, size: f32) {
@@ -183,7 +241,7 @@ impl FafTextDemo {
     /// Pointer coordinates are CSS px relative to the canvas.
     pub fn pointer_down(&mut self, x: f32, y: f32) {
         if let Some(cursor) = self.view.hit(x * self.dpr, y * self.dpr) {
-            self.selection = Some((cursor, cursor));
+            self.set_cursor(cursor, false);
             self.dragging = true;
         }
     }
@@ -192,10 +250,8 @@ impl FafTextDemo {
         if !self.dragging {
             return;
         }
-        if let (Some((anchor, _)), Some(cursor)) =
-            (self.selection, self.view.hit(x * self.dpr, y * self.dpr))
-        {
-            self.selection = Some((anchor, cursor));
+        if let Some(cursor) = self.view.hit(x * self.dpr, y * self.dpr) {
+            self.set_cursor(cursor, true);
         }
     }
 
@@ -205,27 +261,210 @@ impl FafTextDemo {
 
     /// The currently selected text (for clipboard integration in JS).
     pub fn selected_text(&self) -> String {
-        let Some((a, b)) = self.selection else {
-            return String::new();
-        };
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let mut out = String::new();
-        for (i, line) in self.view.buffer.lines.iter().enumerate() {
-            if i < start.line || i > end.line {
-                continue;
-            }
-            let text = line.text();
-            let from = if i == start.line { start.index } else { 0 };
-            let to = if i == end.line { end.index } else { text.len() };
-            if i > start.line {
-                out.push('\n');
-            }
-            out.push_str(&text[from.min(text.len())..to.min(text.len())]);
+        match self.selection_range() {
+            Some(range) => self.text[range].to_string(),
+            None => String::new(),
         }
-        out
+    }
+
+    /// Caret geometry in CSS pixels relative to the canvas: `[x, y, w, h]`.
+    /// JS parks the hidden IME input here so the composition popup lands on
+    /// the caret.
+    pub fn caret_css_rect(&self) -> Box<[f32]> {
+        let rect = self
+            .view
+            .cursor_rect(self.cursor)
+            .map_or([0.0, 0.0, 0.0, 0.0], |r| [r[0], r[1], CARET_WIDTH, r[3]]);
+        rect.map(|v| v / self.dpr).into()
+    }
+
+    /// Caret blink is host-side: JS toggles this on a timer and resets it on
+    /// every edit or motion.
+    pub fn set_caret_visible(&mut self, visible: bool) {
+        self.caret_visible = visible;
+    }
+
+    /// Handle a `keydown`. `key` is the raw `KeyboardEvent.key` value; any
+    /// single-character key inserts itself. Returns true when the event was
+    /// consumed and JS should call `preventDefault()`.
+    pub fn key_input(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
+        match key {
+            "ArrowLeft" | "ArrowRight" => {
+                let forward = key == "ArrowRight";
+                // A plain arrow with a selection collapses it to that edge.
+                match self.selection_range() {
+                    Some(range) if !shift => {
+                        let offset = if forward { range.end } else { range.start };
+                        self.set_cursor(cursor_of(&self.text, offset), false);
+                    }
+                    _ => {
+                        let next = match (forward, ctrl) {
+                            (true, false) => self.view.move_right(self.cursor),
+                            (true, true) => self.view.move_word_right(self.cursor),
+                            (false, false) => self.view.move_left(self.cursor),
+                            (false, true) => self.view.move_word_left(self.cursor),
+                        };
+                        self.set_cursor(next, shift);
+                    }
+                }
+                self.sticky_x = None;
+                true
+            }
+            "ArrowUp" | "ArrowDown" => {
+                let sticky = match self.sticky_x {
+                    Some(x) => x,
+                    None => self.view.cursor_rect(self.cursor).map_or(0.0, |r| r[0]),
+                };
+                let next = if key == "ArrowUp" {
+                    self.view.move_up(self.cursor, sticky)
+                } else {
+                    self.view.move_down(self.cursor, sticky)
+                };
+                self.set_cursor(next, shift);
+                self.sticky_x = Some(sticky);
+                true
+            }
+            "Home" | "End" => {
+                let next = if ctrl {
+                    let offset = if key == "Home" { 0 } else { self.text.len() };
+                    cursor_of(&self.text, offset)
+                } else if key == "Home" {
+                    self.view.line_start(self.cursor)
+                } else {
+                    self.view.line_end(self.cursor)
+                };
+                self.set_cursor(next, shift);
+                self.sticky_x = None;
+                true
+            }
+            "Backspace" | "Delete" => {
+                let range = self.selection_range().unwrap_or_else(|| {
+                    let here = offset_of(&self.text, self.cursor);
+                    let other = if key == "Backspace" {
+                        offset_of(&self.text, self.view.move_left(self.cursor))
+                    } else {
+                        offset_of(&self.text, self.view.move_right(self.cursor))
+                    };
+                    here.min(other)..here.max(other)
+                });
+                self.replace_range(range, "");
+                true
+            }
+            "Enter" => {
+                self.insert_text("\n");
+                true
+            }
+            "Tab" => {
+                self.insert_text("    ");
+                true
+            }
+            "a" | "A" if ctrl => {
+                self.anchor = Cursor::new(0, 0);
+                self.cursor = cursor_of(&self.text, self.text.len());
+                self.sticky_x = None;
+                true
+            }
+            // Copy/cut/paste stay with the browser's clipboard events.
+            _ if ctrl => false,
+            _ if key.chars().count() == 1 => {
+                self.insert_text(key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Insert text at the caret, replacing the selection.
+    pub fn insert_text(&mut self, text: &str) {
+        let range = self.selection_range().unwrap_or_else(|| {
+            offset_of(&self.text, self.cursor)..offset_of(&self.text, self.cursor)
+        });
+        self.replace_range(range, &normalize(text));
+    }
+
+    /// IME composition started: the pending text replaces the selection.
+    pub fn composition_start(&mut self) {
+        if let Some(range) = self.selection_range() {
+            self.replace_range(range, "");
+        }
+        let at = offset_of(&self.text, self.cursor);
+        self.composition = Some(at..at);
+    }
+
+    /// Preedit text changed. It lives in the backing string so it shapes and
+    /// renders inline (underlined) at the caret.
+    pub fn composition_update(&mut self, text: &str) {
+        let range = match self.composition.clone() {
+            Some(range) => range,
+            None => {
+                self.composition_start();
+                self.composition.clone().unwrap_or_default()
+            }
+        };
+        let text = normalize(text);
+        self.text.replace_range(range.clone(), &text);
+        self.composition = Some(range.start..range.start + text.len());
+        self.reshape();
+        self.set_cursor(cursor_of(&self.text, range.start + text.len()), false);
+    }
+
+    /// Composition finished: `commit` keeps the preedit text, otherwise it is
+    /// removed (the browser fires `compositionend` with the final text first,
+    /// so a committed run needs no further edit).
+    pub fn composition_end(&mut self, commit: bool) {
+        let Some(range) = self.composition.take() else {
+            return;
+        };
+        if !commit {
+            self.replace_range(range, "");
+        }
     }
 
     pub fn render(&mut self) -> Result<(), JsValue> {
+        self.render_frame()
+    }
+}
+
+impl FafTextDemo {
+    /// Re-shape the buffer from the backing string. O(n) per edit, which is
+    /// fine at demo sizes and keeps the model dead simple.
+    fn reshape(&mut self) {
+        self.view.set_text(
+            &mut self.font_system,
+            &self.text,
+            &Attrs::new().family(Family::SansSerif),
+        );
+    }
+
+    /// Move the caret; `extend` keeps the selection anchor put (Shift+motion).
+    fn set_cursor(&mut self, cursor: Cursor, extend: bool) {
+        self.cursor = cursor;
+        if !extend {
+            self.anchor = cursor;
+        }
+    }
+
+    fn selection_range(&self) -> Option<Range<usize>> {
+        let a = offset_of(&self.text, self.anchor);
+        let b = offset_of(&self.text, self.cursor);
+        (a != b).then(|| a.min(b)..a.max(b))
+    }
+
+    /// Splice the backing string, re-shape, and park the caret after the
+    /// inserted text.
+    fn replace_range(&mut self, range: Range<usize>, with: &str) {
+        if range.start > self.text.len() || range.end > self.text.len() {
+            return;
+        }
+        let end = range.start + with.len();
+        self.text.replace_range(range, with);
+        self.composition = None;
+        self.sticky_x = None;
+        self.reshape();
+        self.set_cursor(cursor_of(&self.text, end), false);
+    }
+
+    fn render_frame(&mut self) -> Result<(), JsValue> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -236,10 +475,23 @@ impl FafTextDemo {
 
         self.renderer.begin();
 
-        if let Some((a, b)) = self.selection {
-            for r in self.view.selection_rects(a, b) {
+        if self.selection_range().is_some() {
+            for r in self.view.selection_rects(self.anchor, self.cursor) {
                 self.renderer
                     .rect([r[0], r[1]], [r[2], r[3]], SELECTION, RectLayer::Under);
+            }
+        }
+        // IME preedit: underline the composing run so it reads as provisional.
+        if let Some(range) = self.composition.clone() {
+            let start = cursor_of(&self.text, range.start);
+            let end = cursor_of(&self.text, range.end);
+            for r in self.view.selection_rects(start, end) {
+                self.renderer.rect(
+                    [r[0], r[1] + r[3] - CARET_WIDTH],
+                    [r[2], CARET_WIDTH],
+                    FOREGROUND,
+                    RectLayer::Over,
+                );
             }
         }
         if !self.search.is_empty() {
@@ -249,6 +501,14 @@ impl FafTextDemo {
                         .rect([r[0], r[1]], [r[2], r[3]], HIGHLIGHT, RectLayer::Over);
                 }
             }
+        }
+        if let Some(r) = self
+            .view
+            .cursor_rect(self.cursor)
+            .filter(|_| self.caret_visible)
+        {
+            self.renderer
+                .rect([r[0], r[1]], [CARET_WIDTH, r[3]], CARET, RectLayer::Over);
         }
         self.renderer.text(
             &self.queue,

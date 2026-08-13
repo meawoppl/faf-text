@@ -121,6 +121,17 @@ async fn run() {
         }
     }
 
+    // Caret: a 2 px Over rect straight from cursor_rect, parked inside the
+    // code block right after "clamp(".
+    if let Some(rect) = mono.cursor_rect(Cursor::new(0, 21)) {
+        renderer.rect(
+            [rect[0], rect[1]],
+            [2.0, rect[3]],
+            Color::rgba8(0xff, 0x9e, 0x64, 0xff),
+            RectLayer::Over,
+        );
+    }
+
     let fg = Color::rgba8(0xc0, 0xca, 0xf5, 0xff);
     let accent = Color::rgba8(0x7a, 0xa2, 0xf7, 0xff);
     let green = Color::rgba8(0x9e, 0xce, 0x6a, 0xff);

@@ -21,7 +21,9 @@ pub use renderer::{RectLayer, TextRenderer};
 pub use view::{Rect, TextView};
 
 pub use cosmic_text;
-pub use cosmic_text::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Weight};
+pub use cosmic_text::{
+    Affinity, Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Weight,
+};
 
 /// Straight (non-premultiplied) RGBA color, 0..=1 per channel.
 #[derive(Clone, Copy, Debug, PartialEq)]

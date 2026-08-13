@@ -243,6 +243,7 @@ dependencies = [
  "png",
  "pollster",
  "rustc-hash 2.1.3",
+ "unicode-segmentation",
  "wgpu",
 ]
 

@@ -29,7 +29,15 @@
   input[type="range"] { accent-color: #7aa2f7; }
   #canvas {
     display: block; width: 100%; height: calc(100vh - 57px);
-    cursor: text; touch-action: none;
+    cursor: text; touch-action: none; outline: none;
+  }
+  /* The IME target: a 1×1 invisible input parked at the caret so the
+     composition popup shows up where the text is being typed. */
+  #ime {
+    position: fixed; top: 0; left: 0; width: 1px; height: 1px;
+    padding: 0; margin: 0; border: 0; outline: none; z-index: 10;
+    opacity: 0; background: transparent; color: transparent;
+    caret-color: transparent; font: 16px system-ui, sans-serif;
   }
   #fallback { padding: 40px; }
 </style>
@@ -43,8 +51,10 @@
     <span id="sizeval" class="stat">18px</span></label>
   <label><input type="checkbox" id="pulse"> animate zoom</label>
   <label>highlight <input type="text" id="search" value="winding" placeholder="search text"></label>
+  <span class="badge">click the text and type — it's editable</span>
 </header>
-<canvas id="canvas"></canvas>
+<canvas id="canvas" tabindex="0"></canvas>
+<input id="ime" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true">
 <div id="fallback" hidden>
   <h2>WebGPU/WebGL2 unavailable</h2>
   <p id="fallback-msg"></p>
@@ -63,7 +73,7 @@ Shaping is cosmic-text (pure Rust, compiled to wasm): Ελληνικά, кири
 
 The winding evaluation is exact even where rays graze curve endpoints — crossings are classified by the sign pattern of the control points, not by fragile root-range checks. Below ~24px, three parallel rays per axis recover hairline stems that single sampling would drop.
 
-Type or paste anything here — this block is the renderer's input. ${'Speed test: the quick brown fox jumps over the lazy dog 0123456789. '.repeat(40)}`;
+Click anywhere and type: this block is a real editable surface. Arrows move by grapheme (Ctrl for words, Home/End for the visual row), Shift extends the selection, Backspace deletes a whole grapheme cluster — emoji included. An IME composes inline, underlined, and commits in place. ${'Speed test: the quick brown fox jumps over the lazy dog 0123456789. '.repeat(40)}`;
 
 async function main() {
   await init();
@@ -101,6 +111,13 @@ async function main() {
     demo.resize(canvas.width, canvas.height, window.devicePixelRatio || 1);
   });
 
+  const ime = document.getElementById('ime');
+  // Caret blink is host-side: 530ms on/off, restarted on every edit or motion.
+  const BLINK = 530;
+  let lastActivity = performance.now();
+  let focused = false;
+  const activity = () => { lastActivity = performance.now(); };
+
   const pos = e => {
     const r = canvas.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
@@ -108,12 +125,44 @@ async function main() {
   canvas.addEventListener('pointerdown', e => {
     canvas.setPointerCapture(e.pointerId);
     demo.pointer_down(...pos(e));
+    // Keyboard and IME events go to the hidden input, not the canvas.
+    ime.focus({ preventScroll: true });
+    activity();
   });
   canvas.addEventListener('pointermove', e => demo.pointer_move(...pos(e)));
-  canvas.addEventListener('pointerup', () => demo.pointer_up());
+  canvas.addEventListener('pointerup', () => { demo.pointer_up(); activity(); });
+  canvas.addEventListener('focus', () => ime.focus({ preventScroll: true }));
+  ime.addEventListener('focus', () => { focused = true; activity(); });
+  ime.addEventListener('blur', () => { focused = false; });
+
+  ime.addEventListener('keydown', e => {
+    if (e.isComposing || e.keyCode === 229) return;  // the IME owns this key
+    if (demo.key_input(e.key, e.ctrlKey || e.metaKey, e.shiftKey)) e.preventDefault();
+    activity();
+  });
+
+  // IME: the preedit text lives in the Rust-side string so it shapes and
+  // renders inline (underlined) at the caret, then commits in place.
+  ime.addEventListener('compositionstart', () => { demo.composition_start(); activity(); });
+  ime.addEventListener('compositionupdate', e => { demo.composition_update(e.data || ''); activity(); });
+  ime.addEventListener('compositionend', e => {
+    demo.composition_update(e.data || '');
+    demo.composition_end(true);
+    ime.value = '';
+    activity();
+  });
+
   document.addEventListener('copy', e => {
     const text = demo.selected_text();
     if (text) { e.clipboardData.setData('text/plain', text); e.preventDefault(); }
+  });
+  document.addEventListener('cut', e => {
+    const text = demo.selected_text();
+    if (!text) return;
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
+    demo.key_input('Delete', false, false);
+    activity();
   });
 
   const sizeInput = document.getElementById('size');
@@ -125,10 +174,13 @@ async function main() {
   document.getElementById('search').addEventListener('input',
     e => demo.set_search(e.target.value));
 
-  // Paste replaces the text — quickest way to try your own content.
+  // Paste inserts at the caret, replacing any selection.
   document.addEventListener('paste', e => {
     const text = e.clipboardData.getData('text/plain');
-    if (text) demo.set_text(text);
+    if (!text) return;
+    e.preventDefault();
+    demo.insert_text(text);
+    activity();
   });
 
   const pulse = document.getElementById('pulse');
@@ -140,6 +192,13 @@ async function main() {
       sizeVal.textContent = `${s.toFixed(0)}px`;
       demo.set_font_size(s);
     }
+    const blinkOn = Math.floor((now - lastActivity) / BLINK) % 2 === 0;
+    demo.set_caret_visible(focused && blinkOn);
+    // Park the IME input on the caret so composition popups land there.
+    const [cx, cy, , ch] = demo.caret_css_rect();
+    const box = canvas.getBoundingClientRect();
+    ime.style.left = `${box.left + cx}px`;
+    ime.style.top = `${box.top + cy + ch}px`;
     demo.render();
     frames++;
     if (now - last > 500) {
