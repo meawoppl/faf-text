@@ -20,7 +20,12 @@ algorithm change. Roadmap lives in issues #2–#11.
   --out-dir ../../web/pkg --release` (wasm-pack is in ~/.cargo/bin, which is
   NOT on PATH). Release builds spend minutes in wasm-opt; run in background.
 - Serve demo: `python3 -m http.server -d web <port>`.
-- `shaders.wgsl` constants `CURVE_TEX_WIDTH` must match `curves.rs`.
+- `shaders.wgsl` constants `CURVE_TEX_WIDTH` must match `curves.rs`. Only the
+  width is shared — the curve texture's height changes at runtime.
+- GPU unit tests are fine and expected: `src/testing.rs` (cfg(test)) hands out
+  one shared headless device plus `render_pixels` for readback comparisons.
+  `cargo test -p faf-text` exercises curve-texture growth and eviction on the
+  real GPU.
 
 ## Hard-won knowledge
 
@@ -41,6 +46,12 @@ algorithm change. Roadmap lives in issues #2–#11.
   mirrored-looking garbage until fixed). Hairline stems need the 3-tap path
   below ~24px.
 - Glyph outlines extracted at size 1.0 + DISABLE_HINTING = pure em units.
+- Glyph stores never evict mid-frame: queued instances hold raw `first` indices
+  and atlas UVs, so overflow sets a flag, falls back for that frame, and the
+  eviction runs in `begin_frame`. Growth/compaction bump `CurveStore.generation`
+  and `TextRenderer::finish` rebuilds the bind group when it changes.
+- `wgpu::Device` is `Clone` (an Arc handle), so `CurveStore` keeps its own copy
+  and can recreate its texture without threading a `&Device` through `text()`.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.

@@ -31,6 +31,14 @@ nothing; the curve data never changes.
 an extractable outline are rasterized by swash into a shelf-packed
 (`etagere`) RGBA atlas and drawn by a second instanced pipeline.
 
+**Both glyph stores are unbounded by policy.** The curve texture doubles in
+height on overflow (up to 8192 rows, or the device's limit) and re-uploads from
+its CPU mirror; once capped, it drops the least recently used half of its
+glyphs and repacks. The bitmap atlas deallocates any glyph not drawn in the
+last two frames when it runs dry, and resets wholesale if fragmentation still
+blocks the allocation. Eviction only ever happens at a frame boundary, so a
+glyph queued for drawing can never have its data moved out from under it.
+
 **Selection and highlights are rect layers.** Selection rects render *under*
 the glyphs, highlight overlays render *over* them with alpha blending, both
 instanced. Hit-testing (pixel → cursor) and cursor-range → rect geometry are
@@ -72,8 +80,9 @@ python3 -m http.server -d web 8000
 
 ## Current limitations
 
-- The glyph atlas and curve texture don't grow or evict yet; overflow logs a
-  warning and falls back (curves → atlas, atlas → skipped glyph).
+- A glyph that overflows a capped store falls back for the frame it overflowed
+  in (curves → atlas, atlas → skipped glyph); it renders normally from the next
+  frame on, once eviction has made room.
 - Variable-font weight is applied by swash at extraction; each weight gets its
   own curve set (correct, just not deduplicated).
 - No gamma-aware blending option yet; text blends in the surface's space.

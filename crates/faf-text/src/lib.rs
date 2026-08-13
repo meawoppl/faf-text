@@ -13,6 +13,8 @@
 mod atlas;
 mod curves;
 mod renderer;
+#[cfg(test)]
+mod testing;
 mod view;
 
 pub use renderer::{RectLayer, TextRenderer};

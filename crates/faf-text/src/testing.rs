@@ -1,0 +1,130 @@
+//! Scaffolding for the GPU-backed unit tests: one shared headless device
+//! (adapter setup is slow, and tests run in parallel) plus offscreen render
+//! and readback.
+
+use std::sync::OnceLock;
+
+use cosmic_text::fontdb;
+
+use crate::renderer::TextRenderer;
+use crate::{FONT_DEJAVU_SANS, FontSystem, font_system_from_fonts};
+
+pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// A headless device, created once and shared by every test in the binary.
+pub fn gpu() -> &'static (wgpu::Device, wgpu::Queue) {
+    static GPU: OnceLock<(wgpu::Device, wgpu::Queue)> = OnceLock::new();
+    GPU.get_or_init(|| {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .expect("no GPU adapter available");
+            adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .expect("failed to acquire device")
+        })
+    })
+}
+
+/// A font system holding just DejaVu Sans, so glyph ids are stable.
+pub fn font_system() -> FontSystem {
+    font_system_from_fonts(&[FONT_DEJAVU_SANS])
+}
+
+/// The id of the one face in [`font_system`].
+pub fn font_id(font_system: &FontSystem) -> fontdb::ID {
+    font_system.db().faces().next().expect("no faces loaded").id
+}
+
+/// Finish the frame, draw everything queued on `renderer` into a `width ×
+/// height` target, and read it back as tightly packed RGBA8.
+pub fn render_pixels(renderer: &mut TextRenderer, width: u32, height: u32) -> Vec<u8> {
+    let (device, queue) = gpu();
+    renderer.finish(device, queue, [width as f32, height as f32]);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("test pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        renderer.render(&mut pass);
+    }
+
+    let padded_row = (width * 4).next_multiple_of(256);
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test readback"),
+        size: (padded_row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+    let data = slice.get_mapped_range().unwrap();
+    let row = (width * 4) as usize;
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for y in 0..height as usize {
+        let start = y * padded_row as usize;
+        pixels.extend_from_slice(&data[start..start + row]);
+    }
+    pixels
+}

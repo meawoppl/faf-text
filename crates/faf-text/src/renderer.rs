@@ -97,10 +97,15 @@ pub struct TextRenderer {
     atlas_pipeline: wgpu::RenderPipeline,
     vector_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
 
     atlas: Atlas,
     curves: CurveStore,
+    /// Curve-store generation the current bind group was built against.
+    curves_generation: u64,
+    frame: u64,
 
     under_rects: Vec<RectInstance>,
     over_rects: Vec<RectInstance>,
@@ -115,13 +120,21 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::with_stores(device, format, Atlas::new(device), CurveStore::new(device))
+    }
+
+    /// Build a renderer around pre-sized glyph stores (tests use tiny ones to
+    /// exercise growth and eviction).
+    pub(crate) fn with_stores(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        atlas: Atlas,
+        curves: CurveStore,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("faf-text shaders"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
         });
-
-        let atlas = Atlas::new(device);
-        let curves = CurveStore::new(device);
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("faf-text globals"),
@@ -179,28 +192,14 @@ impl TextRenderer {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("faf-text bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&curves.view),
-                },
-            ],
-        });
+        let bind_group = make_bind_group(
+            device,
+            &bind_group_layout,
+            &globals_buffer,
+            &sampler,
+            &atlas,
+            &curves,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("faf-text pipeline layout"),
@@ -287,7 +286,11 @@ impl TextRenderer {
             atlas_pipeline,
             vector_pipeline,
             bind_group,
+            bind_group_layout,
+            sampler,
             globals_buffer,
+            curves_generation: curves.generation,
+            frame: 0,
             atlas,
             curves,
             under_rects: Vec::new(),
@@ -302,7 +305,13 @@ impl TextRenderer {
     }
 
     /// Start a new frame; clears all queued instances.
+    ///
+    /// This is also the only point at which the glyph stores may evict — no
+    /// instance queued for the frame just ended can survive it.
     pub fn begin(&mut self) {
+        self.frame += 1;
+        self.curves.begin_frame(self.frame);
+        self.atlas.begin_frame(self.frame);
         self.under_rects.clear();
         self.over_rects.clear();
         self.atlas_glyphs.clear();
@@ -412,6 +421,19 @@ impl TextRenderer {
             }),
         );
         self.curves.flush(queue);
+        // Growth or compaction replaced the curve texture this frame; the old
+        // bind group still points at the retired one.
+        if self.curves_generation != self.curves.generation {
+            self.curves_generation = self.curves.generation;
+            self.bind_group = make_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.globals_buffer,
+                &self.sampler,
+                &self.atlas,
+                &self.curves,
+            );
+        }
         self.under_buf.upload(device, queue, &self.under_rects);
         self.over_buf.upload(device, queue, &self.over_rects);
         self.atlas_buf.upload(device, queue, &self.atlas_glyphs);
@@ -440,5 +462,140 @@ impl TextRenderer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..6, 0..instances.len);
         }
+    }
+}
+
+fn make_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    atlas: &Atlas,
+    curves: &CurveStore,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("faf-text bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&atlas.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&curves.view),
+            },
+        ],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::curves::CURVE_TEX_WIDTH;
+    use crate::testing;
+    use crate::{Attrs, Family, Metrics, TextView};
+
+    const W: u32 = 220;
+    const H: u32 = 220;
+    /// Rows the sample text occupies; the filler text is drawn well below.
+    const CROP: usize = (W * 4 * 60) as usize;
+    /// A pile of distinct glyphs — enough to blow past a two-row curve texture.
+    const FILLER: &str = "quick brown fox jumps over the lazy dog 0123456789 ΓΔΘΞΣΦΨΩ";
+
+    fn renderer(curve_height: u32, curve_max_height: u32) -> TextRenderer {
+        let (device, _) = testing::gpu();
+        TextRenderer::with_stores(
+            device,
+            testing::FORMAT,
+            Atlas::new(device),
+            CurveStore::with_size(device, CURVE_TEX_WIDTH, curve_height, curve_max_height),
+        )
+    }
+
+    fn view(font_system: &mut FontSystem, text: &str, size: f32, pos: [f32; 2]) -> TextView {
+        let mut view = TextView::new(font_system, Metrics::new(size, size * 1.25));
+        view.pos = pos;
+        view.set_text(font_system, text, &Attrs::new().family(Family::SansSerif));
+        view
+    }
+
+    /// Draw `sample` alone, plus optionally `filler` far below it, and read the
+    /// frame back.
+    fn frame(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        sample: &TextView,
+        filler: Option<&TextView>,
+    ) -> Vec<u8> {
+        let (_, queue) = testing::gpu();
+        renderer.begin();
+        renderer.text(queue, font_system, &sample.buffer, sample.pos, Color::WHITE);
+        if let Some(filler) = filler {
+            renderer.text(queue, font_system, &filler.buffer, filler.pos, Color::WHITE);
+        }
+        testing::render_pixels(renderer, W, H)
+    }
+
+    #[test]
+    fn glyphs_render_identically_across_a_curve_texture_growth() {
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Abg", 30.0, [6.0, 6.0]);
+        let mut filler = view(&mut font_system, FILLER, 13.0, [6.0, 120.0]);
+        filler.set_size(&mut font_system, Some(W as f32 - 12.0), None);
+
+        // Two rows to start with; "Abg" fits, the filler does not.
+        let mut renderer = renderer(2, 256);
+        let before = frame(&mut renderer, &mut font_system, &sample, None);
+        assert_eq!(renderer.curves.generation, 0, "no growth yet");
+
+        frame(&mut renderer, &mut font_system, &sample, Some(&filler));
+        assert!(renderer.curves.generation > 0, "the texture should grow");
+        assert!(
+            renderer.atlas_glyphs.is_empty(),
+            "growth means nothing falls back to the atlas"
+        );
+
+        let after = frame(&mut renderer, &mut font_system, &sample, None);
+        assert!(before.iter().any(|&b| b != 0), "sample text drew something");
+        assert_eq!(before, after, "growth must not disturb existing glyphs");
+    }
+
+    #[test]
+    fn overflow_at_the_cap_falls_back_without_corrupting_queued_glyphs() {
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Abg", 30.0, [6.0, 6.0]);
+        let mut filler = view(&mut font_system, FILLER, 13.0, [6.0, 120.0]);
+        filler.set_size(&mut font_system, Some(W as f32 - 12.0), None);
+
+        // Capped at its initial size: the filler cannot be made to fit.
+        let mut renderer = renderer(2, 2);
+        let before = frame(&mut renderer, &mut font_system, &sample, None);
+
+        let overflowed = frame(&mut renderer, &mut font_system, &sample, Some(&filler));
+        assert_eq!(renderer.curves.generation, 0, "no eviction mid-frame");
+        assert!(
+            !renderer.atlas_glyphs.is_empty(),
+            "overflowing glyphs fall back to the bitmap atlas"
+        );
+        assert_eq!(
+            before[..CROP],
+            overflowed[..CROP],
+            "already-queued glyphs must keep rendering exactly as before"
+        );
+
+        // The deferred compaction lands at the next frame edge and rewrites
+        // every surviving `first`; the same text must still render the same.
+        let after = frame(&mut renderer, &mut font_system, &sample, None);
+        assert!(renderer.curves.generation > 0, "compaction ran at begin()");
+        assert_eq!(before, after, "compaction must not disturb rendering");
     }
 }
