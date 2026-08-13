@@ -47,8 +47,7 @@ impl FafTextDemo {
                 backends,
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
-            let Ok(surface) =
-                instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            let Ok(surface) = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             else {
                 continue;
             };
