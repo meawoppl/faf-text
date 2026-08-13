@@ -4,6 +4,11 @@ GPU text renderer: vector glyphs evaluated in the fragment shader (winding
 rule over quadratic Béziers in a data texture), bitmap atlas fallback for
 emoji, rect layers for selection/highlight. See README.md for architecture.
 
+Project goal: a rich text interface usable in 2D panes and eventually 3D
+spaces. The fwidth-based analytic AA is perspective-correct by construction,
+so 3D is plumbing (per-pane matrices, ray hit-testing — issue #9), not an
+algorithm change. Roadmap lives in issues #2–#11.
+
 ## Repo patterns
 
 - Workspace: `crates/faf-text` (core, no windowing deps), `crates/faf-text-web`
