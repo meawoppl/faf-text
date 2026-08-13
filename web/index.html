@@ -7,9 +7,12 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
+  /* Column layout so the canvas takes whatever the header leaves, however
+     many rows the controls wrap onto. */
   body {
     margin: 0; background: #15161e; color: #c0caf5;
     font: 14px/1.5 system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
   }
   header {
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
@@ -32,7 +35,7 @@
     border-radius: 6px; padding: 4px 8px;
   }
   #canvas {
-    display: block; width: 100%; height: calc(100vh - 57px);
+    display: block; width: 100%; flex: 1 1 auto; min-height: 0;
     cursor: text; touch-action: none; outline: none;
   }
   /* The IME target: a 1×1 invisible input parked at the caret so the
@@ -55,6 +58,7 @@
     <span id="sizeval" class="stat">18px</span></label>
   <label><input type="checkbox" id="pulse"> animate zoom</label>
   <label><input type="checkbox" id="wave"> weight wave</label>
+  <label><input type="checkbox" id="tilt" title="stand the pane up in 3D — selection still works"> 3D tilt</label>
   <label>highlight <input type="text" id="search" value="winding" placeholder="search text">
     <select id="mode" title="how matches are marked">
       <option value="highlight">highlight</option>
@@ -202,13 +206,22 @@ async function main() {
 
   const pulse = document.getElementById('pulse');
   const wave = document.getElementById('wave');
+  const tilt = document.getElementById('tilt');
   const fpsEl = document.getElementById('fps');
+  // Y rotation of the pane, and the slow sway around it. Both are one matrix
+  // per block per frame — no glyph is rebuilt to stand the text up.
+  const TILT_DEGREES = 30, SWAY_DEGREES = 4, SWAY_MS = 5200;
   let frames = 0, last = performance.now(), start = last;
   const tick = now => {
     // Weight is a GPU lerp between two masters of the variable font, so this
     // costs nothing per frame: no re-shape, no re-raster.
     demo.set_weight_blend(wave.checked
       ? 0.5 + 0.5 * Math.sin((now - start) / 700)
+      : undefined);
+    // Pointer selection keeps working through this: clicks are cast as rays
+    // onto the pane's plane and land on the same words they would flat.
+    demo.set_tilt(tilt.checked
+      ? TILT_DEGREES + SWAY_DEGREES * Math.sin((now - start) / SWAY_MS * Math.PI * 2)
       : undefined);
     if (pulse.checked) {
       const s = 18 + 60 * (0.5 - 0.5 * Math.cos((now - start) / 900));

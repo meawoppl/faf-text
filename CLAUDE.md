@@ -15,7 +15,10 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   (wasm-bindgen), `web/` (demo page, `web/pkg` is wasm-pack output, gitignored).
 - Visual verification without a window: `cargo run --example offscreen -p
   faf-text` renders every feature to `offscreen.png` (works headless — this
-  box has an RTX 3070; wgpu picks Vulkan).
+  box has an RTX 3070; wgpu picks Vulkan). `examples/panes3d` does the same for
+  3D panes (`panes3d.png`). The offscreen scene is a **regression baseline**:
+  its md5 is `beec6786631dd25e4fcad2c801839244` and any change to placement
+  math has to keep it.
 - Wasm build: `~/.cargo/bin/wasm-pack build crates/faf-text-web --target web
   --out-dir ../../web/pkg --release` (wasm-pack is in ~/.cargo/bin, which is
   NOT on PATH). Release builds spend minutes in wasm-opt; run in background.
@@ -119,8 +122,45 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   (start/cap/len, in instances) per arena and one slot in a dynamic-offset
   uniform buffer, stride `max(256, min_uniform_buffer_offset_alignment)`.
   Screen size stayed a separate global rather than being duplicated per block,
-  so a resize writes 16 bytes instead of dirtying every block; the block
-  uniform holds only placement, which is what #9 widens to a mat4.
+  so a resize writes 16 bytes instead of dirtying every block.
+- **The block matrix is px → homogeneous *screen pixels*, not px → clip**, and
+  that choice is load-bearing. A clip-space matrix makes the shader compute
+  `px * (2/W) - 1` where it used to compute `px / W * 2 - 1`; those differ by
+  an ulp for ~54% of x values, the vertex lands in a different 1/256 subpixel
+  bin about 1% of the time, and the offscreen scene came back with 82 pixels
+  changed (max Δ2) — visually identical, md5 not. Keeping the divide in
+  `project()` and folding a host's view-projection into pixel space on the CPU
+  (`px_from_clip(size) * vp * model`) makes a 2D block's matrix a pure
+  translation, so the shader adds exactly like it always did and the scene is
+  byte-identical. The default projection is `None`, *symbolically* the
+  identity, so blocks upload their model matrix untouched (never
+  `px_from_clip * screen_ortho * model`, which is only numerically the
+  identity) and a 2D resize still dirties nothing.
+- Consequences of the pixel-space matrix: pixel snapping for the atlas path is
+  `round(p.xy)` in the vertex shader, gated on a flag derived when the matrix
+  is set (`is_axis_aligned`); a host projection makes every block's uniform
+  depend on the surface size, so `finish` re-derives them on resize; and the
+  block's z passes straight through to clip z, so a block rotated out of the
+  z = 0 plane *without* a view-projection is clipped away by the 0..1 depth
+  range (`math::screen_perspective` is the fix).
+- `math::screen_perspective(size, fov)` puts the eye at `(w/2, h/2, -h/2·cot(fov/2))`
+  looking down +z with world y down, which makes the projection agree with the
+  2D ortho exactly at z = 0: turning 3D on never moves flat content.
+- Hit-testing is `pointer_ndc` → `ndc_ray` → `block_hit`, and the arithmetic is
+  f64 inside: in f32 the round trip through an inverted perspective was 0.012
+  px off, which is more than the 0.01 px the tests want.
+- A strongly tilted pane is only hit-testable where it faces the camera —
+  under perspective the eye can be on the *back* side of the plane for part of
+  a pane even when the pane's pivot faces it. Test round trips near the pivot,
+  and pivot on the camera axis for grazing angles.
+- glam 0.33 deprecates `Mat4::perspective_lh`; the wgpu-convention replacement
+  is `glam::camera::lh::proj::directx::perspective` (LH view space in, y-up
+  NDC with 0..1 depth out).
+- Headless-Chrome screenshots of an *animating* demo can capture before the
+  first frame: with a per-frame sway on, `--virtual-time-budget=60000` never
+  gets through the rAF backlog under SwiftShader and the shot lands during
+  startup. Freeze the animation (sway 0) for a screenshot check, or use a page
+  with less text.
 - Arena mirrors are `Vec<u32>`, not `Vec<u8>`: a byte vec is only 1-aligned and
   `bytemuck::cast_slice` to an instance type may panic on it.
 - **WebGL2 has no base-instance draw**, so a block's range is addressed by
@@ -137,10 +177,14 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   vector glyphs, blended glyphs, atlas glyphs, line decorations, over-rects.
   Chips and line decorations are the same instance type and the same pipeline,
   split into two spans purely so the glyphs can be drawn between them.
-- Per-block layering is *within* a block; blocks composite in creation order.
+- Per-block layering is *within* a block; blocks composite in draw order,
+  which is `set_block_z` then creation order — block ids ascend, so sorting by
+  `(z, id)` *is* the stable insertion-order tiebreak.
   A selection underlay therefore belongs in a block created *before* the text
   block, not in the text block's `under_rects` — which is why the web demo has
-  four blocks (selection, text, search, caret) rather than three.
+  four blocks (selection, text, search, caret) rather than three. All four
+  share one model matrix under the demo's 3D tilt, which is what keeps the
+  caret and the selection glued to the glyphs.
 - The debugging trick that cracked the shader bug: replicate the WGSL math in
   a Python simulator over real outline data (`/tmp/sim_shader.py` pattern) —
   GPU-vs-CPU divergence becomes printable ASCII art.

@@ -1,11 +1,13 @@
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{Buffer, CacheKey, FontSystem, LayoutRun, UnderlineStyle};
+use glam::Mat4;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Color;
 use crate::arena::{Arena, REPACK_FRAGMENTATION, Span};
 use crate::atlas::Atlas;
 use crate::curves::{CurveStore, GlyphKey};
+use crate::math;
 use crate::view::Rect;
 
 #[repr(C)]
@@ -18,16 +20,31 @@ struct Globals {
 /// Per-block data, one copy per block in a single uniform buffer bound at a
 /// dynamic offset. Uniform buffers with dynamic offsets are WebGL2-clean;
 /// storage buffers are not, so this stays a uniform however big it gets.
+/// [`UNIFORM_MIN_STRIDE`] is 256 bytes and this is 80, so the mat4 fits the
+/// layout #4 shipped without touching the bind group or the draw loop.
 ///
-/// Headroom: [`UNIFORM_MIN_STRIDE`] is 256 bytes and this is 16, so issue #9
-/// can replace `offset` with a mat4 (a pane placed in 3D) without changing the
-/// buffer layout, the bind group, or the draw loop.
+/// `transform` maps block-local px to *homogeneous screen pixels*, not to clip
+/// space: the shader's own last step is the divide by the screen size, so a
+/// host's view-projection is folded in here as `px_from_clip * vp * model`.
+/// The pay-off is that a 2D block's transform is a plain translation and the
+/// vertex math stays bit-for-bit what it was before this matrix existed.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq, Debug)]
 struct BlockUniform {
-    offset: [f32; 2],
-    _pad: [f32; 2],
+    transform: [[f32; 4]; 4],
+    flags: u32,
+    _pad: [u32; 3],
 }
+
+/// [`BlockUniform::flags`]: the placement is an axis-aligned scale plus
+/// translation, so the atlas path can snap its quads to the pixel grid. Must
+/// match `BLOCK_SNAP` in shaders.wgsl.
+const BLOCK_SNAP: u32 = 1;
+
+/// How far off axis a placement may be and still count as axis-aligned. A
+/// hand-built ortho matrix has exact zeros here; this is slack for one that
+/// came out of a matrix product.
+const AXIS_EPSILON: f32 = 1e-6;
 
 /// Stride between per-block uniforms. The real stride is this raised to the
 /// device's `min_uniform_buffer_offset_alignment`; 256 is that alignment's
@@ -271,7 +288,11 @@ struct UploadRecord {
 /// damage flags that decide what `finish` re-uploads.
 struct Block {
     spans: [Span; LAYERS],
-    offset: [f32; 2],
+    /// Block-local px to world. A plain translation for a 2D block; anything
+    /// at all for a pane in 3D.
+    model: Mat4,
+    /// Painter's-order sort key, low to high. Ties keep insertion order.
+    z: f32,
     visible: bool,
     /// Index of this block's uniform in the per-block uniform buffer.
     slot: u32,
@@ -291,7 +312,8 @@ impl Block {
     fn new(slot: u32) -> Self {
         Self {
             spans: [Span::default(); LAYERS],
-            offset: [0.0, 0.0],
+            model: Mat4::IDENTITY,
+            z: 0.0,
             visible: true,
             slot,
             content_dirty: false,
@@ -362,9 +384,10 @@ impl Scratch {
 ///
 /// Content lives in **retained blocks**. A block owns a range of each instance
 /// arena and a per-block uniform; setting its content re-uploads only that
-/// range, moving it re-uploads only 16 bytes, and a frame in which nothing
-/// changed reports [`TextRenderer::damaged`] false so the host can skip
-/// rendering and presenting entirely.
+/// range, moving it (or turning it to face a camera —
+/// [`TextRenderer::set_block_transform`]) re-uploads only that uniform, and a
+/// frame in which nothing changed reports [`TextRenderer::damaged`] false so
+/// the host can skip rendering and presenting entirely.
 ///
 /// The immediate-mode API ([`TextRenderer::begin`], [`TextRenderer::rect`],
 /// [`TextRenderer::text`], [`TextRenderer::finish`]) is a thin wrapper over one
@@ -384,6 +407,14 @@ pub struct TextRenderer {
     globals_buffer: wgpu::Buffer,
     globals_dirty: bool,
     screen_size: [f32; 2],
+    /// World to clip, as the host set it. `None` is the default — the screen
+    /// ortho, which is the projection the shader applies anyway, so blocks
+    /// upload their model matrix untouched and 2D stays exact.
+    view_projection: Option<Mat4>,
+    /// `math::px_from_clip(screen_size) * view_projection`, the matrix a
+    /// block's model is composed with on its way into the uniform. Cached
+    /// because it changes only when the projection or the surface does.
+    px_from_world: Option<Mat4>,
 
     block_layout: wgpu::BindGroupLayout,
     block_bind_group: wgpu::BindGroup,
@@ -407,7 +438,9 @@ pub struct TextRenderer {
 
     arenas: [Arena; LAYERS],
     blocks: FxHashMap<u32, Block>,
-    /// Block ids in creation order, which is z-order.
+    /// Block ids in draw order: by [`TextRenderer::set_block_z`], then by
+    /// creation order (block ids are handed out in sequence, so sorting by id
+    /// *is* the insertion-order tiebreak).
     order: Vec<u32>,
     next_id: u32,
     /// The block the immediate-mode API draws into.
@@ -505,9 +538,11 @@ impl TextRenderer {
         );
 
         // Screen size stays in its own global rather than being duplicated into
-        // every block's uniform: a resize then writes 16 bytes instead of
-        // dirtying every block, and the block uniform holds nothing but the
-        // block's own placement — which is exactly what #9 wants to widen.
+        // every block's uniform: a resize writes 16 bytes instead of dirtying
+        // every block, and the block uniform holds nothing but the block's own
+        // placement. That still holds with the mat4 in it, because the block
+        // matrix lands in *pixel* space — only a host that has set its own
+        // view-projection pays for a resize.
         let block_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("faf-text block layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -660,6 +695,8 @@ impl TextRenderer {
             globals_buffer,
             globals_dirty: true,
             screen_size: [0.0, 0.0],
+            view_projection: None,
+            px_from_world: None,
             block_layout,
             block_bind_group,
             block_uniforms,
@@ -701,7 +738,8 @@ impl TextRenderer {
 
     // ---- Retained blocks ----
 
-    /// Create an empty block. Blocks composite in creation order.
+    /// Create an empty block. Blocks composite in creation order, until a
+    /// [`TextRenderer::set_block_z`] says otherwise.
     pub fn create_block(&mut self) -> BlockId {
         let slot = self.free_slots.pop().unwrap_or_else(|| {
             self.slot_top += 1;
@@ -711,6 +749,8 @@ impl TextRenderer {
         self.next_id += 1;
         self.blocks.insert(id, Block::new(slot));
         self.order.push(id);
+        // Ids ascend, so this only ever matters once someone has set a z.
+        self.sort_order();
         self.damaged = true;
         BlockId(id)
     }
@@ -770,17 +810,126 @@ impl TextRenderer {
         self.commit(id);
     }
 
-    /// Move a block. No instance is touched — this is 16 bytes of uniform.
+    /// Move a block. No instance is touched — this is one uniform write.
+    ///
+    /// Shorthand for [`TextRenderer::set_block_transform`] with a translation:
+    /// with the default view-projection, world space *is* screen pixels.
     pub fn set_block_offset(&mut self, id: BlockId, offset: [f32; 2]) {
+        self.place_block(
+            id,
+            Mat4::from_translation(glam::vec3(offset[0], offset[1], 0.0)),
+        );
+    }
+
+    /// Place a block in 3D: `model` maps block-local px to world space, and
+    /// [`TextRenderer::set_view_projection`] maps world to clip.
+    ///
+    /// Column-major, the layout `glam`'s `Mat4::to_cols_array_2d` produces. As
+    /// with [`TextRenderer::set_block_offset`] no instance is rebuilt — a pane
+    /// can be re-oriented every frame for the price of one uniform write, which
+    /// is the whole point of putting the matrix here rather than in the
+    /// geometry.
+    ///
+    /// Coverage needs nothing from this: antialiasing comes from screen-space
+    /// derivatives of an interpolated varying, so it is already measured on the
+    /// projected, foreshortened glyph. The atlas path is the one exception —
+    /// see [`TextRenderer::set_view_projection`].
+    ///
+    /// A model that leaves the z = 0 plane wants a projection to go with it:
+    /// the default one passes depth straight through, so a rotated pane's
+    /// corners land outside the 0..1 clip range and get clipped away.
+    /// [`crate::math::screen_perspective`] is the one to reach for.
+    pub fn set_block_transform(&mut self, id: BlockId, model: [[f32; 4]; 4]) {
+        self.place_block(id, Mat4::from_cols_array_2d(&model));
+    }
+
+    fn place_block(&mut self, id: BlockId, model: Mat4) {
         let Some(block) = self.blocks.get_mut(&id.0) else {
             return;
         };
-        if block.offset == offset {
+        if block.model == model {
             return;
         }
-        block.offset = offset;
+        block.model = model;
         block.uniform_dirty = true;
         self.damaged = true;
+    }
+
+    /// Set the shared world-to-clip matrix — a camera for every block at once.
+    /// [`crate::math::screen_perspective`] builds one that leaves 2D content
+    /// exactly where it was.
+    ///
+    /// There is no depth buffer and text does not z-write, so **blocks
+    /// composite in the order they are drawn**: hosts sort back to front with
+    /// [`TextRenderer::set_block_z`]. Two things follow from the matrix:
+    ///
+    /// - A block whose placement is no longer an axis-aligned scale and
+    ///   translation stops snapping its **atlas** quads (color emoji, bitmap
+    ///   fallbacks) to the pixel grid, because there is no grid to snap them
+    ///   to. Those glyphs go a touch soft in 3D. Vector glyphs are unaffected
+    ///   at any angle.
+    /// - A non-default projection makes every block's uniform depend on the
+    ///   surface size, so a resize re-uploads all of them (a few dozen bytes
+    ///   each). The default projection costs nothing on resize.
+    pub fn set_view_projection(&mut self, vp: [[f32; 4]; 4]) {
+        let vp = Mat4::from_cols_array_2d(&vp);
+        if self.view_projection == Some(vp) {
+            return;
+        }
+        self.view_projection = Some(vp);
+        self.projection_changed();
+    }
+
+    /// Back to the default projection: the screen ortho, which is the one the
+    /// shader applies itself. 2D content is then placed by the exact same
+    /// arithmetic it was before any of this existed.
+    pub fn clear_view_projection(&mut self) {
+        if self.view_projection.is_none() {
+            return;
+        }
+        self.view_projection = None;
+        self.projection_changed();
+    }
+
+    /// Painter's-order sort key, low to high: a block with a lower `z` draws
+    /// first and everything after composites over it. Blocks that share a `z`
+    /// keep creation order, which is what every block has by default.
+    ///
+    /// This is a sort key, not a coordinate — it does not move the block. With
+    /// no depth buffer and alpha-blended text, hosts that place blocks in 3D
+    /// are expected to sort them back to front themselves (say, by the model
+    /// matrix's distance from the eye) and feed the result to this.
+    pub fn set_block_z(&mut self, id: BlockId, z: f32) {
+        let Some(block) = self.blocks.get_mut(&id.0) else {
+            return;
+        };
+        if block.z == z {
+            return;
+        }
+        block.z = z;
+        self.sort_order();
+        self.damaged = true;
+    }
+
+    /// Re-derive the projection blocks are composed with, and dirty every
+    /// block's uniform since all of them just changed.
+    fn projection_changed(&mut self) {
+        self.px_from_world = self
+            .view_projection
+            .map(|vp| math::px_from_clip(self.screen_size) * vp);
+        for block in self.blocks.values_mut() {
+            block.uniform_dirty = true;
+        }
+        self.damaged = true;
+    }
+
+    /// Draw order: z first, then creation order — block ids are handed out in
+    /// sequence, so the id is the insertion index.
+    fn sort_order(&mut self) {
+        let blocks = &self.blocks;
+        let z = |id: &u32| blocks.get(id).map_or(0.0, |block| block.z);
+        self.order
+            .sort_by(|a, b| z(a).total_cmp(&z(b)).then(a.cmp(b)));
     }
 
     /// Show or hide a block. Hidden blocks keep their arena ranges, so showing
@@ -949,6 +1098,7 @@ impl TextRenderer {
         }
 
         if self.screen_size != screen_size || self.globals_dirty {
+            let resized = self.screen_size != screen_size;
             self.screen_size = screen_size;
             self.globals_dirty = false;
             queue.write_buffer(
@@ -959,6 +1109,13 @@ impl TextRenderer {
                     _pad: [0.0; 2],
                 }),
             );
+            // A host projection is folded into pixel space against the surface
+            // size, so it (and every block composed with it) has to be redone.
+            // The default projection has no such dependency, which is why a
+            // plain 2D resize still touches nothing but these 16 bytes.
+            if resized && self.view_projection.is_some() {
+                self.projection_changed();
+            }
         }
 
         self.curves.flush(queue);
@@ -981,8 +1138,9 @@ impl TextRenderer {
         self.damaged = false;
     }
 
-    /// Record draws into an open render pass: every visible block in creation
-    /// order, and within a block the seven layers in the order listed on
+    /// Record draws into an open render pass: every visible block in draw
+    /// order (z, then creation order — nothing z-writes, so this *is* the
+    /// compositing order), and within a block the seven layers listed on
     /// [`TextRenderer`] — under-rects, chips, vector glyphs, weight-blended
     /// glyphs, atlas glyphs, line decorations, over-rects.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -1388,13 +1546,11 @@ impl TextRenderer {
                 continue;
             }
             block.uniform_dirty = false;
+            let uniform = block_uniform(self.px_from_world, block.model);
             queue.write_buffer(
                 &self.block_uniforms,
                 (block.slot * self.uniform_stride) as u64,
-                bytemuck::bytes_of(&BlockUniform {
-                    offset: block.offset,
-                    _pad: [0.0; 2],
-                }),
+                bytemuck::bytes_of(&uniform),
             );
             self.uploads.uniform_writes += 1;
         }
@@ -1446,6 +1602,38 @@ impl TextRenderer {
             }
         }
     }
+}
+
+/// A block's uniform: its model matrix carried into homogeneous pixel space,
+/// plus what the vertex shader needs to know about the result.
+///
+/// `px_from_world` is `None` for the default projection, and then the model
+/// matrix goes in untouched rather than through a multiply by something that
+/// is only *numerically* the identity — which is what keeps a 2D scene
+/// bit-for-bit identical to the pre-matrix renderer.
+fn block_uniform(px_from_world: Option<Mat4>, model: Mat4) -> BlockUniform {
+    let m = match px_from_world {
+        Some(px_from_world) => px_from_world * model,
+        None => model,
+    };
+    BlockUniform {
+        transform: m.to_cols_array_2d(),
+        flags: if is_axis_aligned(m) { BLOCK_SNAP } else { 0 },
+        _pad: [0; 3],
+    }
+}
+
+/// Whether a placement is an axis-aligned scale plus translation, i.e. whether
+/// block-local x and y still land on screen x and y with no rotation, shear or
+/// perspective. Only the columns a z = 0 point touches matter: `m * (x, y, 0,
+/// 1)` is `col0 * x + col1 * y + col3`.
+fn is_axis_aligned(m: Mat4) -> bool {
+    let (x, y, t) = (m.x_axis, m.y_axis, m.w_axis);
+    x.y.abs() <= AXIS_EPSILON
+        && y.x.abs() <= AXIS_EPSILON
+        && x.w.abs() <= AXIS_EPSILON
+        && y.w.abs() <= AXIS_EPSILON
+        && (t.w - 1.0).abs() <= AXIS_EPSILON
 }
 
 fn make_uniform_buffer(device: &wgpu::Device, stride: u32, slots: u32) -> wgpu::Buffer {
@@ -2011,6 +2199,192 @@ mod tests {
         assert_eq!(
             before, after,
             "a retained block must survive a curve relocation"
+        );
+    }
+
+    // ---- Placement ----
+
+    /// Turn `model` into the matrix the shader would receive, under the
+    /// default projection.
+    fn placed(model: Mat4) -> BlockUniform {
+        block_uniform(None, model)
+    }
+
+    #[test]
+    fn a_2d_placement_is_a_translation_and_nothing_else() {
+        // The whole reason the block matrix lands in pixel space rather than
+        // clip space: an offset block's transform is *exactly* a translation,
+        // so the vertex shader adds and never scales, and 2D content renders
+        // bit-for-bit as it did before the matrix existed.
+        let moved = placed(Mat4::from_translation(glam::vec3(30.0, -12.5, 0.0)));
+        assert_eq!(
+            moved.transform,
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [30.0, -12.5, 0.0, 1.0],
+            ]
+        );
+        assert_eq!(moved.flags, BLOCK_SNAP, "a moved block still snaps");
+        assert_eq!(placed(Mat4::IDENTITY).flags, BLOCK_SNAP);
+    }
+
+    #[test]
+    fn a_host_projection_composes_into_pixel_space() {
+        let size = [W as f32, H as f32];
+        // A host that hands over the very projection the renderer applies
+        // itself must get the identity composition back — otherwise every
+        // "3D" scene would pay a scale it did not ask for.
+        let px_from_world = Some(math::px_from_clip(size) * math::screen_ortho(size));
+        let model = Mat4::from_translation(glam::vec3(12.0, 34.0, 0.0));
+        let composed = block_uniform(px_from_world, model);
+        for (a, b) in composed
+            .transform
+            .iter()
+            .flatten()
+            .zip(placed(model).transform.iter().flatten())
+        {
+            assert!((a - b).abs() < 1e-4, "{composed:?} should be the model");
+        }
+
+        // A real camera keeps the block's own placement and adds perspective:
+        // the corner of a block at z = 0 still lands on its 2D pixel.
+        let perspective = Some(math::px_from_clip(size) * math::screen_perspective(size, 0.7));
+        let m = Mat4::from_cols_array_2d(&block_uniform(perspective, model).transform);
+        let corner = m * glam::vec4(60.0, 20.0, 0.0, 1.0);
+        assert!(
+            (corner.x / corner.w - 72.0).abs() < 1e-2 && (corner.y / corner.w - 54.0).abs() < 1e-2,
+            "{corner} should be the 2D pixel (72, 54)"
+        );
+    }
+
+    #[test]
+    fn the_snap_flag_follows_the_placement() {
+        // Snapping means "there is a pixel grid to snap to": scale and
+        // translation keep one, rotation and perspective do not.
+        let axis_aligned = [
+            Mat4::IDENTITY,
+            Mat4::from_translation(glam::vec3(4.0, 9.0, 0.0)),
+            Mat4::from_scale(glam::vec3(2.0, 3.0, 1.0)),
+            Mat4::from_scale(glam::vec3(-1.0, 1.0, 1.0)), // mirrored, still on grid
+        ];
+        for model in axis_aligned {
+            assert_eq!(placed(model).flags, BLOCK_SNAP, "{model} is axis aligned");
+        }
+        // A turn in the screen plane leaves no grid at all.
+        assert_eq!(placed(Mat4::from_rotation_z(0.01)).flags, 0);
+        // A turn *out* of it does, as long as nothing projects it: with no
+        // camera, rotating about y is only a horizontal squash. (It also
+        // pushes the block's z out of the clip range, which is why a block
+        // placed in 3D wants a view-projection — see `set_block_transform`.)
+        assert_eq!(placed(Mat4::from_rotation_y(0.4)).flags, BLOCK_SNAP);
+        let size = [W as f32, H as f32];
+        let perspective = Some(math::px_from_clip(size) * math::screen_perspective(size, 0.7));
+        assert_eq!(
+            block_uniform(perspective, Mat4::from_rotation_y(0.4)).flags,
+            0,
+            "a perspective divisor is not a pixel grid"
+        );
+    }
+
+    #[test]
+    fn a_transform_and_an_offset_place_a_block_the_same_way() {
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "placed", 24.0, [6.0, 6.0]);
+        let offset = [37.0, 61.5];
+
+        let mut moved = renderer(2048, 2048);
+        let block = moved.create_block();
+        moved.begin_frame();
+        set_text_block(&mut moved, &mut font_system, block, &sample);
+        moved.set_block_offset(block, offset);
+        let by_offset = retained_frame(&mut moved);
+        assert!(drew(&by_offset));
+
+        let mut transformed = renderer(2048, 2048);
+        let block = transformed.create_block();
+        transformed.begin_frame();
+        set_text_block(&mut transformed, &mut font_system, block, &sample);
+        transformed.set_block_transform(
+            block,
+            Mat4::from_translation(glam::vec3(offset[0], offset[1], 0.0)).to_cols_array_2d(),
+        );
+        assert_eq!(by_offset, retained_frame(&mut transformed));
+    }
+
+    #[test]
+    fn a_pane_turned_away_from_the_camera_still_draws_its_text() {
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "oblique", 22.0, [10.0, 90.0]);
+        let mut renderer = renderer(2048, 2048);
+        let block = renderer.create_block();
+        renderer.begin_frame();
+        set_text_block(&mut renderer, &mut font_system, block, &sample);
+        let flat = retained_frame(&mut renderer);
+
+        let size = [W as f32, H as f32];
+        let center = glam::vec3(size[0] * 0.5, size[1] * 0.5, 0.0);
+        renderer.begin_frame();
+        renderer.set_view_projection(math::screen_perspective(size, 0.7).to_cols_array_2d());
+        renderer.set_block_transform(
+            block,
+            (Mat4::from_translation(center)
+                * Mat4::from_rotation_y(50f32.to_radians())
+                * Mat4::from_translation(-center))
+            .to_cols_array_2d(),
+        );
+        let tilted = retained_frame(&mut renderer);
+        assert!(drew(&tilted), "a tilted pane still draws");
+        assert_ne!(tilted, flat, "and it does not draw the flat pane");
+        assert_eq!(
+            renderer.upload_stats().content_writes,
+            0,
+            "turning a pane in 3D is a uniform write, not a rebuild"
+        );
+
+        // Back to the default projection and placement: the same pixels as
+        // before anything 3D happened.
+        renderer.begin_frame();
+        renderer.clear_view_projection();
+        renderer.set_block_offset(block, [0.0, 0.0]);
+        assert_eq!(retained_frame(&mut renderer), flat);
+    }
+
+    #[test]
+    fn the_z_key_decides_which_block_composites_on_top() {
+        let mut renderer = renderer(2048, 2048);
+        let over_the_same_pixels = [20.0, 20.0, 80.0, 40.0];
+        let first = renderer.create_block();
+        let second = renderer.create_block();
+        renderer.begin_frame();
+        set_rect_block(&mut renderer, first, &[(over_the_same_pixels, RED)]);
+        set_rect_block(
+            &mut renderer,
+            second,
+            &[(over_the_same_pixels, Color::WHITE)],
+        );
+
+        // Creation order is the default z-order: the later block wins.
+        let px = retained_frame(&mut renderer);
+        assert_eq!(at(&px, 60, 40), 255, "white over red");
+        assert_eq!(px[((40 * W + 60) * 4 + 1) as usize], 255);
+
+        // Sorting the first block in front flips that, and nothing re-uploads.
+        renderer.begin_frame();
+        renderer.set_block_z(first, 1.0);
+        let px = retained_frame(&mut renderer);
+        assert_eq!(px[((40 * W + 60) * 4 + 1) as usize], 0, "red over white");
+        assert_eq!(renderer.upload_stats(), UploadStats::default());
+
+        // Equal keys fall back to creation order, and the transient block
+        // (created first, so id 0) stays underneath everything.
+        renderer.begin_frame();
+        renderer.set_block_z(first, 0.0);
+        retained_frame(&mut renderer);
+        assert_eq!(
+            renderer.order,
+            vec![renderer.transient.0, first.0, second.0]
         );
     }
 

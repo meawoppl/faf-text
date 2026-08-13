@@ -28,14 +28,27 @@
 //!    than being hidden by them.
 //! 7. **over-rects** — highlight overlays and carets ([`RectLayer::Over`]).
 //!
-//! Layering is *within* a block; blocks composite in creation order. An
-//! underlay for a block's text therefore belongs either in that block's
-//! under-rects or in a block created before it.
+//! Layering is *within* a block; blocks composite in creation order (or in
+//! whatever order [`TextRenderer::set_block_z`] asks for). An underlay for a
+//! block's text therefore belongs either in that block's under-rects or in a
+//! block created before it.
+//!
+//! # Panes in 3D
+//!
+//! A block carries a full 4×4 placement ([`TextRenderer::set_block_transform`])
+//! and the scene a shared camera ([`TextRenderer::set_view_projection`]), so a
+//! pane of text can sit anywhere in a 3D scene for the price of one uniform
+//! write per frame. Antialiasing needs no help there: coverage comes from
+//! screen-space derivatives of an interpolated varying, so it is measured on
+//! the projected glyph and stays correct at grazing angles. [`math`] has the
+//! camera helpers and the ray test that turns a pointer back into the
+//! block-local pixels [`TextView::hit`] wants.
 
 mod arena;
 mod atlas;
 mod curves;
 mod document;
+pub mod math;
 mod renderer;
 #[cfg(test)]
 mod testing;
@@ -49,6 +62,9 @@ pub use cosmic_text;
 pub use cosmic_text::{
     Affinity, Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, UnderlineStyle, Weight,
 };
+/// Re-exported so hosts build the matrices [`math`] and [`TextRenderer`] take
+/// without pinning a second copy of glam.
+pub use glam;
 
 /// Straight (non-premultiplied) RGBA color, 0..=1 per channel.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -10,17 +10,29 @@ struct Globals {
 
 // Where a retained block sits. One uniform buffer holds every block's copy and
 // the draw loop binds this at the block's dynamic offset — uniform buffers
-// with dynamic offsets are WebGL2-clean, storage buffers are not.
+// with dynamic offsets are WebGL2-clean, storage buffers are not. The buffer's
+// stride is a full 256 bytes, so the mat4 fits in the layout #4 shipped.
 //
-// Headroom: the buffer's stride is a full 256 bytes, so issue #9 can widen
-// this to a mat4x4 (a pane placed in 3D) without touching the layout, the bind
-// group or the draw loop — `place` becomes a matrix multiply and every vertex
-// entry point below already routes through it.
+// `transform` maps block-local px to **screen-pixel space, homogeneous**: xy in
+// physical pixels (y down, origin top-left), z the depth to emit, w the
+// perspective divisor. It is not a px → clip matrix, and that is deliberate:
+// the divide by `screen_size` below stays in the shader, so a 2D block whose
+// transform is a plain translation computes the exact same floats the
+// pre-matrix renderer did — bit for bit, not just visually. A host's
+// view-projection is folded in on the CPU (`px_from_clip * vp * model`).
 struct BlockXform {
-    offset: vec2<f32>,
-    _pad: vec2<f32>,
+    transform: mat4x4<f32>,
+    flags: u32,
+    // Three scalars, not a vec3: a vec3 would align to 16 and grow the struct.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 @group(1) @binding(0) var<uniform> block_xf: BlockXform;
+
+// The block's placement is an axis-aligned scale + translation, so pixel
+// snapping means something. Must match BLOCK_SNAP in renderer.rs.
+const BLOCK_SNAP: u32 = 1u;
 
 // Must match CURVE_TEX_WIDTH in curves.rs.
 const CURVE_TEX_WIDTH: u32 = 256u;
@@ -44,15 +56,38 @@ fn quad_corner(vi: u32) -> vec2<f32> {
     return corners[vi];
 }
 
-// Block-local pixels to screen pixels. Adding zero is exact, so a block parked
-// at the origin renders bit-for-bit like the unplaced geometry did.
-fn place(px: vec2<f32>) -> vec2<f32> {
-    return px + block_xf.offset;
+// Block-local pixels to homogeneous screen pixels. Every vertex of every
+// pipeline goes through here. A translation-only transform reduces to
+// `px + offset` exactly (multiplying by one and adding zero are exact), so a
+// 2D block renders bit-for-bit like the pre-matrix renderer did.
+fn place(px: vec2<f32>) -> vec4<f32> {
+    return block_xf.transform * vec4<f32>(px, 0.0, 1.0);
+}
+
+// Homogeneous screen pixels to clip space. w is carried through untouched —
+// no manual perspective divide — so the varyings interpolate
+// perspective-correct and the fragment shader's `fwidth` sees the real
+// on-screen footprint of a foreshortened glyph.
+fn project(p: vec4<f32>) -> vec4<f32> {
+    let ndc = p.xy / globals.screen_size * 2.0 - p.w;
+    return vec4<f32>(ndc.x, -ndc.y, p.z, p.w);
 }
 
 fn to_clip(px: vec2<f32>) -> vec4<f32> {
-    let ndc = place(px) / globals.screen_size * 2.0 - 1.0;
-    return vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    return project(place(px));
+}
+
+// Same, but snapped to whole pixels when the block is axis-aligned — the
+// atlas path only, where a bitmap sampled off the pixel grid goes soft. Under
+// any other transform there is no grid to snap to and the quad passes
+// through: slightly soft emoji in 3D, which is the documented trade. The
+// vector path never snaps; its coverage is analytic at any position.
+fn to_clip_snapped(px: vec2<f32>) -> vec4<f32> {
+    var p = place(px);
+    if (block_xf.flags & BLOCK_SNAP) != 0u {
+        p = vec4<f32>(round(p.xy), p.z, p.w);
+    }
+    return project(p);
 }
 
 // ---- Solid rects (selection underlay / highlight overlay) ----
@@ -195,7 +230,7 @@ struct GlyphOutput {
 fn glyph_vs(@builtin(vertex_index) vi: u32, inst: GlyphInstance) -> GlyphOutput {
     let corner = quad_corner(vi);
     var out: GlyphOutput;
-    out.clip = to_clip(inst.pos + corner * inst.size);
+    out.clip = to_clip_snapped(inst.pos + corner * inst.size);
     out.uv = inst.uv_pos + corner * inst.uv_size;
     out.color = inst.color;
     out.kind = inst.kind;
@@ -442,6 +477,12 @@ fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
     // Below ~24 px/em, hairline strokes can slip between the two axis rays;
     // three parallel rays per axis recover true area coverage. Larger glyphs
     // keep the cheap single-ray path.
+    //
+    // `fw` is per axis and comes from the real screen derivatives, so a glyph
+    // foreshortened by a 3D transform is measured as it lands: the compressed
+    // axis reports more em per pixel, `max` picks it, and a pane seen at a
+    // grazing angle takes the three-tap path exactly where it needs it. No
+    // part of the coverage math knows the block was rotated.
     let small = max(fw.x, fw.y) > (1.0 / 24.0);
     let taps = select(1u, 3u, small);
 

@@ -5,6 +5,8 @@
 use std::ops::Range;
 
 use faf_text::cosmic_text::{Attrs, Cursor, Family, Metrics};
+use faf_text::glam::{Mat4, Vec3, Vec4};
+use faf_text::math::{block_hit, ndc_ray, pointer_ndc, screen_perspective};
 use faf_text::{
     BlockContent, BlockId, Color, DecorationKind, FontSystem, Rect, TextRenderer, TextView,
 };
@@ -24,6 +26,10 @@ const VARIABLE_FAMILY: &str = "Manrope";
 const CARET_WIDTH: f32 = 2.0;
 /// Corner radius of a search chip, in CSS pixels.
 const CHIP_RADIUS: f32 = 6.0;
+/// Vertical field of view of the 3D camera, radians.
+const FOV_Y: f32 = 0.7;
+/// How far the tilted pane shrinks, so its near edge stays on the canvas.
+const TILT_SCALE: f32 = 0.78;
 
 /// How a search match is marked. Everything but `Highlight` goes through the
 /// decoration pipeline.
@@ -153,6 +159,9 @@ pub struct FafTextDemo {
     /// GPU weight blend for the whole view, and with it the family the text is
     /// shaped in: `None` is the static demo font, `Some(t)` the variable one.
     weight_blend: Option<f32>,
+    /// Y rotation of the whole pane in degrees, or `None` for flat 2D. Every
+    /// block shares it, so caret and selection stay glued to the glyphs.
+    tilt: Option<f32>,
     /// The scene, in z-order. Selection sits in its own block *below* the text
     /// because blocks composite in creation order — a block's own under-rects
     /// only go under its own glyphs. Search highlights and the caret go above.
@@ -284,6 +293,7 @@ impl FafTextDemo {
             search: String::new(),
             search_mode: SearchMode::default(),
             weight_blend: None,
+            tilt: None,
             selection_block,
             text_block,
             search_block,
@@ -379,9 +389,25 @@ impl FafTextDemo {
         self.dirty = Dirty::all();
     }
 
+    /// Stand the text pane up in 3D: `degrees` of rotation about its own
+    /// vertical axis, seen through a perspective camera. `undefined` puts it
+    /// back flat, where the renderer's placement math is bit-for-bit the plain
+    /// 2D path again.
+    ///
+    /// Nothing re-shapes and no instance is rebuilt — this is one matrix per
+    /// block per frame — so a slow sway is free to animate. Pointer selection
+    /// keeps working: [`FafTextDemo::pointer_down`] casts a ray instead of
+    /// reading a pixel.
+    pub fn set_tilt(&mut self, degrees: Option<f32>) {
+        if self.tilt == degrees {
+            return;
+        }
+        self.tilt = degrees;
+    }
+
     /// Pointer coordinates are CSS px relative to the canvas.
     pub fn pointer_down(&mut self, x: f32, y: f32) {
-        if let Some(cursor) = self.view.hit(x * self.dpr, y * self.dpr) {
+        if let Some(cursor) = self.hit(x, y) {
             self.set_cursor(cursor, false);
             self.dragging = true;
         }
@@ -391,7 +417,7 @@ impl FafTextDemo {
         if !self.dragging {
             return;
         }
-        if let Some(cursor) = self.view.hit(x * self.dpr, y * self.dpr) {
+        if let Some(cursor) = self.hit(x, y) {
             self.set_cursor(cursor, true);
         }
     }
@@ -411,11 +437,29 @@ impl FafTextDemo {
     /// Caret geometry in CSS pixels relative to the canvas: `[x, y, w, h]`.
     /// JS parks the hidden IME input here so the composition popup lands on
     /// the caret.
+    ///
+    /// While the pane is tilted the caret is projected through the same
+    /// matrices the glyphs go through, so the composition popup follows it
+    /// into 3D.
     pub fn caret_css_rect(&self) -> Box<[f32]> {
         let rect = self
             .view
             .cursor_rect(self.cursor)
             .map_or([0.0, 0.0, 0.0, 0.0], |r| [r[0], r[1], CARET_WIDTH, r[3]]);
+        let rect = match self.pane_model() {
+            Some(model) => {
+                let local = self.local(rect);
+                let top = self.project(&model, [local[0], local[1]]);
+                let bottom = self.project(&model, [local[0], local[1] + local[3]]);
+                match (top, bottom) {
+                    (Some(top), Some(bottom)) => {
+                        [top[0], top[1], CARET_WIDTH, (bottom[1] - top[1]).abs()]
+                    }
+                    _ => rect,
+                }
+            }
+            None => rect,
+        };
         rect.map(|v| v / self.dpr).into()
     }
 
@@ -627,16 +671,97 @@ impl FafTextDemo {
         [r[0] - self.view.pos[0], r[1] - self.view.pos[1], r[2], r[3]]
     }
 
+    fn surface(&self) -> [f32; 2] {
+        [self.config.width as f32, self.config.height as f32]
+    }
+
+    /// The camera the tilted scene is seen through. Aimed so that a pane left
+    /// at z = 0 lands on exactly its 2D pixels, which is why turning the tilt
+    /// on does not make the layout jump.
+    fn camera(&self) -> Mat4 {
+        screen_perspective(self.surface(), FOV_Y)
+    }
+
+    /// Where the pane sits in the world, or `None` when it is flat. Every
+    /// block shares this one matrix: the caret, the selection underlay and the
+    /// search marks are all in the pane's own pixel space, so sharing it is
+    /// what keeps them glued to the glyphs at any angle.
+    fn pane_model(&self) -> Option<Mat4> {
+        let degrees = self.tilt?;
+        let margin = MARGIN * self.dpr;
+        let surface = self.surface();
+        // Turn about the middle of the visible pane, and shrink a little so
+        // the near edge does not swing off the canvas.
+        let pivot = Vec3::new(
+            (surface[0] - 2.0 * margin) * 0.5,
+            (surface[1] - 2.0 * margin) * 0.5,
+            0.0,
+        );
+        let origin = Vec3::new(self.view.pos[0], self.view.pos[1], 0.0);
+        Some(
+            Mat4::from_translation(origin + pivot)
+                * Mat4::from_rotation_y(degrees.to_radians())
+                * Mat4::from_scale(Vec3::new(TILT_SCALE, TILT_SCALE, 1.0))
+                * Mat4::from_translation(-pivot),
+        )
+    }
+
+    /// Pointer (CSS px, canvas-relative) to a text cursor. Flat, that is the
+    /// 2D hit test on a physical pixel; tilted, it is the published recipe —
+    /// pixel → NDC → world ray → the pane's own plane — and the *same* 2D hit
+    /// test on the block-local pixel that comes back.
+    fn hit(&self, x: f32, y: f32) -> Option<Cursor> {
+        let px = [x * self.dpr, y * self.dpr];
+        let Some(model) = self.pane_model() else {
+            return self.view.hit(px[0], px[1]);
+        };
+        let vp = self.camera();
+        let (origin, dir) = ndc_ray(&vp, pointer_ndc(self.surface(), px));
+        let local = block_hit(&model, &vp, origin, dir)?;
+        self.view
+            .hit(local[0] + self.view.pos[0], local[1] + self.view.pos[1])
+    }
+
+    /// The other direction: a block-local point to a physical pixel on the
+    /// surface. `None` if it is behind the camera.
+    fn project(&self, model: &Mat4, local: [f32; 2]) -> Option<[f32; 2]> {
+        let clip = self.camera() * *model * Vec4::new(local[0], local[1], 0.0, 1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let surface = self.surface();
+        Some([
+            (clip.x / clip.w * 0.5 + 0.5) * surface[0],
+            (0.5 - clip.y / clip.w * 0.5) * surface[1],
+        ])
+    }
+
     /// Push whatever changed since the last frame into the blocks that own it.
     fn sync_blocks(&mut self) {
         let origin = self.view.pos;
-        for block in [
+        let blocks = [
             self.selection_block,
             self.text_block,
             self.search_block,
             self.caret_block,
-        ] {
-            self.renderer.set_block_offset(block, origin);
+        ];
+        // Placement is a uniform per block either way — a swaying pane costs
+        // four matrix writes a frame and not one instance.
+        match self.pane_model() {
+            Some(model) => {
+                let model = model.to_cols_array_2d();
+                self.renderer
+                    .set_view_projection(self.camera().to_cols_array_2d());
+                for block in blocks {
+                    self.renderer.set_block_transform(block, model);
+                }
+            }
+            None => {
+                self.renderer.clear_view_projection();
+                for block in blocks {
+                    self.renderer.set_block_offset(block, origin);
+                }
+            }
         }
 
         if std::mem::take(&mut self.dirty.text) {

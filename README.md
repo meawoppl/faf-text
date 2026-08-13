@@ -68,13 +68,28 @@ baseline-anchored geometry for a cursor range, and text whose *attributes* ask
 for an underline or strikeout decorates itself. Chips draw under the glyphs and
 the line kinds over them.
 
+**Panes go anywhere in 3D.** A block carries a 4×4 placement and the scene a
+shared camera, so a pane of text can be tilted, turned or flown through a 3D
+scene for one uniform write a frame — no glyph is rebuilt, nothing
+re-rasterizes, and the curve data never changes. Antialiasing needs no help
+there: coverage comes from screen-space derivatives of an interpolated varying,
+so it is measured on the *projected* glyph, and a pane seen at a grazing angle
+is as smooth as a flat one (and takes the hairline three-tap path on whichever
+axis got compressed). Pointer input runs the same way in reverse — pixel to NDC
+ray, ray onto the pane's own plane, and from there the ordinary 2D hit test.
+Text is alpha-blended and does not z-write, so hosts sort blocks back to front
+with a z key rather than a depth buffer. `cargo run --example panes3d` renders
+three panes at oblique angles, one of them near edge-on, with a selection
+painted through the ray path.
+
 **The scene is retained, and damage-tracked.** Content lives in blocks; each
 block owns a range of every instance arena (under-rects, chips, vector glyphs,
 weight-blended glyphs, atlas glyphs, line decorations, over-rects) and one entry in a
 dynamic-offset uniform buffer. Setting a block's content re-uploads that
 block's ranges and nothing else, so typing in a search box does not touch the
-document's glyphs. Moving a block writes 16 bytes of uniform — no instance is
-rebuilt, which is what makes scrolling and (later) 3D pane placement free.
+document's glyphs. Moving a block — or reorienting it in 3D — writes one
+matrix; no instance is rebuilt, which is what makes scrolling and pane
+placement free.
 Dropping blocks frees their ranges to a per-arena free list, and an arena
 repacks itself once more than half of it is holes. When nothing changed at
 all, `damaged()` says so and the host can skip recording and presenting
@@ -96,7 +111,8 @@ Vulkan/Metal/DX12/GL natively, and WebGPU or WebGL2 in the browser.
 
 - `crates/faf-text` — the renderer. `TextRenderer` (pipelines + glyph sources),
   `TextView` (positioned cosmic-text buffer with hit-testing/selection
-  helpers). No windowing dependencies.
+  helpers), `math` (camera matrices and the ray/pane hit test). No windowing
+  dependencies.
 - `crates/faf-text-web` — wasm-bindgen bindings: attach to a canvas, drive
   selection from pointer events, search highlighting, clipboard.
 - `web/` — demo page.
@@ -107,6 +123,7 @@ Native smoke test (renders `offscreen.png`, no window needed):
 
 ```sh
 cargo run --example offscreen -p faf-text
+cargo run --example panes3d -p faf-text   # three text panes in 3D
 ```
 
 Web demo:
@@ -134,3 +151,10 @@ python3 -m http.server -d web 8000
 - Only the `wght` axis is interpolated, between its two extremes; other
   variation axes still bake into the extracted curves.
 - No gamma-aware blending option yet; text blends in the surface's space.
+- Atlas glyphs (color emoji) stop snapping to the pixel grid once a block's
+  placement is no longer an axis-aligned scale and translation — there is no
+  grid to snap to — so they go slightly soft in 3D. Vector glyphs are exact at
+  any angle.
+- No depth buffer: blocks composite in draw order, and a host placing panes in
+  3D sorts them back to front itself (`set_block_z`). Intersecting panes are
+  not resolved per pixel.
