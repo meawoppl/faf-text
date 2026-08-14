@@ -1,0 +1,9 @@
+/target
+/web/pkg
+offscreen.png
+panes3d.png
+term.png
+/.worktrees
+bigfile-*.png
+quality.png
+quality-zoom.png
