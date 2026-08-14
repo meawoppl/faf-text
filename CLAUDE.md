@@ -17,21 +17,15 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   faf-text` renders every feature to `offscreen.png` (works headless — this
   box has an RTX 3070; wgpu picks Vulkan). `examples/panes3d` does the same for
   3D panes (`panes3d.png`). The offscreen scene is a **regression baseline**:
-  its md5 is `4f37b594d6e3f1526fe418781131d273` (it was
-  `729ddb4ccb578c75ebceb95a8bf8249c` before #14's corner clipping re-triangulated
-  the two glyphs over its 48 px/em gate, and
-  `beec6786631dd25e4fcad2c801839244` before the RGBA16F curve storage of #13
-  requantized the outlines) and any change to placement math has to keep it.
-
-  its md5 is `293e8f38a905c6731ca9ebb7c251ba6b` (it was
-  `729ddb4ccb578c75ebceb95a8bf8249c` before #15 grew the canvas 600 → 880 px
-  for the COLR strip, and `beec6786631dd25e4fcad2c801839244` before the RGBA16F
-  curve storage of #13 requantized the outlines) and any change to placement
-  math has to keep it. The strip was *added below* the old scene on purpose:
-  the top 600 rows of the new PNG are still byte-identical to the old one, so
-  "did this move any existing pixel" is answerable even across a resize (build
-  the pre-change tree in a throwaway `git worktree` with its own
-  `CARGO_TARGET_DIR` and diff the crops).
+  its md5 is **`ef89cd412c84ab51059c70f285ecd4a1`** — the union of #14's corner
+  clipping (re-triangulated the two glyphs over the 48 px/em gate) and #15's
+  COLR strip (canvas grown 600 → 880 px; the strip was *added below* on
+  purpose, so rows 0–599 are byte-identical to the pre-#15 scene). Earlier
+  baselines, for archaeology: `293e8f38` (#15 alone), `4f37b594` (#14 alone),
+  `729ddb4c` (post-#13 f16), `beec6786` (post-#7 decorations). Any change to
+  placement math has to keep the current md5; across a canvas resize, answer
+  "did an existing pixel move" by building the pre-change tree in a throwaway
+  `git worktree` with its own `CARGO_TARGET_DIR` and diffing the crops.
   `panes3d.png` is `80928801bd41af0a08cacf96772270c1` and f16 did *not* move
   it: at 3D-pane sizes the quantization stays under half a level of 8-bit
   coverage.
