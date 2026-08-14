@@ -8,6 +8,12 @@
   instance. Fragment invocations drop 5% on a 64 px/em page and 11% on
   large-glyph content; smaller text keeps the plain quad draw untouched.
 
+- COLR/CPAL v0 color glyphs render on the vector path: a color emoji is a stack
+  of ordinary outlines, so each layer extracts into the curve store and draws as
+  one instanced quad in its palette color, crisp at any size and costing no
+  atlas space. COLRv1, CBDT, sbix and SVG color fonts still take the bitmap
+  atlas. Adds `FONT_TWEMOJI_COLR`, a 2 KB four-emoji COLRv0 test font.
+
 - Curve storage moved from RGBA32F to RGBA16F with contour-aware endpoint
   sharing: a banded glyph costs one texel per curve plus one per contour, and
   the offscreen scene's curve data went from 281 KB to 107 KB. Coordinates are

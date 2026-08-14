@@ -74,9 +74,20 @@ and without touching the curve texture. Glyphs without a second master are
 drawn by a pipeline the master-B fetch is compiled out of, so they pay nothing
 for the feature.
 
-**What's not curves rides a bitmap atlas.** Color emoji and any glyph without
-an extractable outline are rasterized by swash into a shelf-packed
-(`etagere`) RGBA atlas and drawn by a second instanced pipeline.
+**Color emoji are curves too, where the font says so.** A COLR/CPAL v0 color
+glyph is not a picture but a stack of ordinary outlines, each painted in one
+flat palette color, so faf-text draws it the way it draws letters: every layer
+extracts into the same curve store and becomes one instanced quad, queued
+bottom to top so the alpha blend does the painter's algorithm. A COLRv0 emoji
+is therefore exact at 300 px, positioned subpixel, correct in 3D, and costs no
+atlas space at all — and the layers are shared, so the same outline used by two
+emoji is stored once.
+
+**What's still not curves rides a bitmap atlas.** CBDT/sbix/SVG color fonts,
+COLRv1 (gradients, transforms and compositing, which the winding shader cannot
+express), and any glyph without an extractable outline are rasterized by swash
+into a shelf-packed (`etagere`) RGBA atlas and drawn by a second instanced
+pipeline.
 
 **Both glyph stores are unbounded by policy.** The curve texture doubles in
 height on overflow (up to 8192 rows, or the device's limit) and re-uploads from
@@ -240,6 +251,10 @@ scripts/build-site.sh                              # site/ = landing + demo + ga
   thinner there, and 1/1.43 only claws part of it back. It is the right mode for
   correctness (and for light-on-dark, where gamma blending over-fattens), not a
   drop-in replacement.
+- Color glyphs take the vector path only for COLR **v0**. COLRv1 is detected
+  and sent to the bitmap atlas whole-font, so a v1 font's v0 compatibility
+  records (where it has any) are not used either. Layers resolve against
+  palette 0; there is no palette selection API.
 - Atlas glyphs (color emoji) stop snapping to the pixel grid once a block's
   placement is no longer an axis-aligned scale and translation — there is no
   grid to snap to — so they go slightly soft in 3D. Vector glyphs are exact at
@@ -258,4 +273,5 @@ scripts/build-site.sh                              # site/ = landing + demo + ga
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
 your option. Vendored fonts keep their own licenses (DejaVu: Bitstream Vera
-derivative; Manrope: OFL 1.1, see `crates/faf-text/assets/`).
+derivative; Manrope: OFL 1.1; Twemoji Mozilla subset: Apache-2.0 build,
+CC-BY 4.0 artwork — see `crates/faf-text/assets/`).

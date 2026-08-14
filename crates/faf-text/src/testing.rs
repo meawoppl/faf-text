@@ -7,7 +7,9 @@ use std::sync::OnceLock;
 use cosmic_text::fontdb;
 
 use crate::renderer::TextRenderer;
-use crate::{FONT_DEJAVU_SANS, FONT_MANROPE_VARIABLE, FontSystem, font_system_from_fonts};
+use crate::{
+    FONT_DEJAVU_SANS, FONT_MANROPE_VARIABLE, FONT_TWEMOJI_COLR, FontSystem, font_system_from_fonts,
+};
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -190,11 +192,44 @@ pub fn variable_font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_MANROPE_VARIABLE])
 }
 
+/// A font system with the vendored COLRv0 emoji subset in it, whose glyphs are
+/// stacks of palette-colored outlines rather than bitmaps.
+pub fn color_font_system() -> FontSystem {
+    font_system_from_fonts(&[FONT_DEJAVU_SANS, FONT_TWEMOJI_COLR])
+}
+
 /// Family name of the static face the tests fall back on.
 pub const STATIC_FAMILY: &str = "DejaVu Sans";
 
 /// Family name of the face [`variable_font_system`] is loaded for.
 pub const VARIABLE_FAMILY: &str = "Manrope";
+
+/// Family name of the face [`color_font_system`] adds.
+pub const COLOR_FAMILY: &str = "Twemoji Mozilla";
+
+/// Where this box keeps a CBDT (bitmap) color font — the negative case for the
+/// COLR path, which has to leave it on the atlas. Tests using it skip
+/// themselves when it is missing.
+pub const CBDT_FONT_PATH: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+/// A font system holding the CBDT color font above, or `None` where this box
+/// does not have it.
+pub fn bitmap_color_font_system() -> Option<FontSystem> {
+    let data = std::fs::read(CBDT_FONT_PATH).ok()?;
+    Some(FontSystem::new_with_fonts([fontdb::Source::Binary(
+        std::sync::Arc::new(data),
+    )]))
+}
+
+/// The glyph id `ch` maps to in a face, or `None` when the face has no glyph
+/// for it (swash reports a miss as glyph 0).
+pub fn glyph_id_of(font_system: &mut FontSystem, id: fontdb::ID, ch: char) -> Option<u16> {
+    let font = font_system.get_font(id, fontdb::Weight::NORMAL)?;
+    match font.as_swash().charmap().map(ch) {
+        0 => None,
+        glyph_id => Some(glyph_id),
+    }
+}
 
 /// The id of the first face in `font_system`.
 pub fn font_id(font_system: &FontSystem) -> fontdb::ID {

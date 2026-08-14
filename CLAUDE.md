@@ -22,6 +22,16 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   the two glyphs over its 48 px/em gate, and
   `beec6786631dd25e4fcad2c801839244` before the RGBA16F curve storage of #13
   requantized the outlines) and any change to placement math has to keep it.
+
+  its md5 is `293e8f38a905c6731ca9ebb7c251ba6b` (it was
+  `729ddb4ccb578c75ebceb95a8bf8249c` before #15 grew the canvas 600 → 880 px
+  for the COLR strip, and `beec6786631dd25e4fcad2c801839244` before the RGBA16F
+  curve storage of #13 requantized the outlines) and any change to placement
+  math has to keep it. The strip was *added below* the old scene on purpose:
+  the top 600 rows of the new PNG are still byte-identical to the old one, so
+  "did this move any existing pixel" is answerable even across a resize (build
+  the pre-change tree in a throwaway `git worktree` with its own
+  `CARGO_TARGET_DIR` and diff the crops).
   `panes3d.png` is `80928801bd41af0a08cacf96772270c1` and f16 did *not* move
   it: at 3D-pane sizes the quantization stays under half a level of 8-bit
   coverage.
@@ -348,6 +358,30 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   in `upload_uniforms` where the composed matrix already exists, and cached on
   the block so `render(&self)` can pick a pipeline per block.
 
+- COLR/CPAL (`colr.rs`, #15): a COLRv0 color glyph is a *stack of ordinary
+  glyphs*, so the whole feature is a cache plus a loop in `push_color_layers` —
+  the layers extract through `CurveStore::get_or_insert` untouched and the
+  renderer emits one vector instance each, in COLR order (instances draw in
+  queue order, which *is* the painter's algorithm the format asks for).
+  Palette 0, and the run color's alpha multiplies the palette alpha; palette
+  index 0xFFFF means "the text color" and takes the run's color whole.
+- ttf-parser 0.25 is already in the tree via fontdb, but cosmic-text does not
+  re-export it, so `cargo add ttf-parser` (same version, one copy in the lock).
+  It parses the sfnt/collection table directory and CPAL (BGRA behind a
+  per-palette index array); the COLRv0 base-glyph/layer arrays are read by hand
+  because ttf-parser only exposes them through a v1-shaped `Painter` trait,
+  which never says *which* layer asked for 0xFFFF. Font bytes come from
+  `FontSystem::get_font(id, weight).data()` plus `db().face(id).index`.
+- `ColrCache` caches two things and the coarse one is load-bearing: a per-font
+  "has usable COLRv0" bool, so an ordinary text run does not leave a "not a
+  color glyph" entry per letter. COLRv1 → the whole font is marked unusable and
+  goes to the bitmap atlas (gradients/transforms/composites have no expression
+  in the winding shader), which is also where CBDT (NotoColorEmoji), sbix and
+  SVG stay.
+- A color glyph is all-or-nothing per frame: if the curve store overflows
+  partway through a layer stack, `push_color_layers` truncates the instances it
+  pushed and returns false so the glyph falls back to the atlas whole. Half a
+  rocket is worse than a soft one.
 - Terminal grid (`grid.rs`): char → glyph id is
   `font.as_swash().charmap().map(ch)` (0 = miss), and the advance is
   `font.as_swash().glyph_metrics(&[]).scale(px).advance_width(id)`. Both are

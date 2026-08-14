@@ -6,6 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::Color;
 use crate::arena::{Arena, REPACK_FRAGMENTATION, Span};
 use crate::atlas::Atlas;
+use crate::colr::ColrCache;
 use crate::curves::{CurveStore, GlyphKey};
 use crate::math;
 use crate::view::Rect;
@@ -269,6 +270,26 @@ fn vector_instance(
             [0.0; 4]
         },
     }
+}
+
+/// One glyph resolved to "what to draw and where", as the COLR path needs it.
+/// Both queueing paths reach it with the same eight numbers — `push_text` from
+/// a shaped run, `push_glyphs` from a [`GlyphSpec`] — and bundling them keeps
+/// the two call sites honest about the order.
+struct GlyphDraw {
+    font_id: fontdb::ID,
+    glyph_id: u16,
+    weight: fontdb::Weight,
+    flags: CacheKeyFlags,
+    /// Unsnapped pen position of the glyph's origin, in block pixels.
+    pos: [f32; 2],
+    font_size: f32,
+    /// The run's color, *before* [`TextRenderer::shade`]: a layer's palette
+    /// color is multiplied by this one's alpha, and a layer that asks for the
+    /// text color takes it whole.
+    color: Color,
+    /// Master blend override, or `None` to use each glyph's shaped weight.
+    weight_t: Option<f32>,
 }
 
 /// A decoration's shape. Every kind draws from one pipeline, so a block's
@@ -713,6 +734,10 @@ pub struct TextRenderer {
 
     atlas: Atlas,
     curves: CurveStore,
+    /// COLRv0 layer lists per (font, glyph). Holds no GPU data — the layers
+    /// themselves are ordinary glyphs in `curves` — so it never takes part in
+    /// eviction.
+    colr: ColrCache,
     /// Curve-store generations the bind group and the retained instances were
     /// built against.
     curves_generation: u64,
@@ -1117,6 +1142,7 @@ impl TextRenderer {
             frame: 0,
             atlas,
             curves,
+            colr: ColrCache::default(),
             arenas: [
                 Arena::new("faf-text under rects", rect_stride),
                 Arena::new("faf-text chips", deco_stride),
@@ -1381,6 +1407,19 @@ impl TextRenderer {
     /// rather than assume.
     pub fn effective_options(&self) -> RendererOptions {
         self.options
+    }
+
+    /// Colors of the vector instances queued so far this frame, in queue order
+    /// — which is draw order, and so the order a color glyph's layers stack in.
+    #[cfg(test)]
+    pub(crate) fn pending_vector_colors(&self) -> Vec<[f32; 4]> {
+        self.scratch.vector.iter().map(|inst| inst.color).collect()
+    }
+
+    /// How many bitmap-atlas quads are queued so far this frame.
+    #[cfg(test)]
+    pub(crate) fn pending_atlas_glyphs(&self) -> usize {
+        self.scratch.atlas.len()
     }
 
     /// Curve-texture memory: (bytes of packed curve data, bytes the texture
@@ -1690,13 +1729,34 @@ impl TextRenderer {
             let baseline_y = pos[1] + run.line_y;
             self.push_run_decorations(&run, pos, default_color);
             for glyph in run.glyphs.iter() {
-                let color = self.shade(
-                    glyph
-                        .color_opt
-                        .map(Color::from_cosmic)
-                        .unwrap_or(default_color),
-                );
+                let run_color = glyph
+                    .color_opt
+                    .map(Color::from_cosmic)
+                    .unwrap_or(default_color);
+                let color = self.shade(run_color);
                 let font_size = glyph.font_size;
+                // Unsnapped glyph origin: the analytic coverage handles
+                // fractional positions exactly.
+                let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
+                let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
+
+                // A COLRv0 glyph is a stack of ordinary outlines: one vector
+                // instance per layer, in palette color, and no atlas at all.
+                if self.push_color_layers(
+                    font_system,
+                    &GlyphDraw {
+                        font_id: glyph.font_id,
+                        glyph_id: glyph.glyph_id,
+                        weight: glyph.font_weight,
+                        flags: glyph.cache_key_flags,
+                        pos: [origin_x, origin_y],
+                        font_size,
+                        color: run_color,
+                        weight_t,
+                    },
+                ) {
+                    continue;
+                }
 
                 if let Some(gc) = self.curves.get_or_insert(
                     font_system,
@@ -1716,11 +1776,6 @@ impl TextRenderer {
                             glyph.cache_key_flags,
                         ));
                     }
-                    // Unsnapped glyph origin: the analytic coverage handles
-                    // fractional positions exactly.
-                    let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
-                    let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
-
                     self.push_vector(vector_instance(
                         &gc,
                         [origin_x, origin_y],
@@ -1760,6 +1815,21 @@ impl TextRenderer {
     ) {
         for spec in glyphs {
             let flags = CacheKeyFlags::empty();
+            if self.push_color_layers(
+                font_system,
+                &GlyphDraw {
+                    font_id: spec.font_id,
+                    glyph_id: spec.glyph_id,
+                    weight: spec.weight,
+                    flags,
+                    pos: spec.pos,
+                    font_size: spec.font_size,
+                    color: spec.color,
+                    weight_t,
+                },
+            ) {
+                continue;
+            }
             if let Some(gc) = self.curves.get_or_insert(
                 font_system,
                 spec.font_id,
@@ -1813,6 +1883,81 @@ impl TextRenderer {
         } else {
             self.scratch.blend.push(instance);
         }
+    }
+
+    /// Queue a COLRv0 color glyph as one vector instance per layer, bottom to
+    /// top, and say whether it did. `false` means "not a color glyph, or not
+    /// one this frame" and the caller carries on with the ordinary outline →
+    /// atlas ladder.
+    ///
+    /// The layers are ordinary glyphs of the same face, so they extract through
+    /// [`CurveStore::get_or_insert`] with every piece of machinery it has —
+    /// band tables, masters, LRU eviction — and cost the color glyph nothing
+    /// beyond one instance each. Instances draw in queue order, so pushing them
+    /// in COLR order *is* the painter's algorithm the format asks for.
+    fn push_color_layers(&mut self, font_system: &mut FontSystem, draw: &GlyphDraw) -> bool {
+        // With the store already in fallback for the frame, a missing layer
+        // would be indistinguishable from a layer with no outline. Take the
+        // atlas for this glyph and try again after the next compaction.
+        if self.curves.overflowed() {
+            return false;
+        }
+        let Some(layers) = self
+            .colr
+            .layers(font_system, draw.font_id, draw.glyph_id, draw.weight)
+        else {
+            return false;
+        };
+
+        let (vector_len, blend_len) = (self.scratch.vector.len(), self.scratch.blend.len());
+        for layer in layers.iter() {
+            let Some(gc) = self.curves.get_or_insert(
+                font_system,
+                draw.font_id,
+                layer.glyph_id,
+                draw.weight,
+                draw.flags,
+            ) else {
+                if self.curves.overflowed() {
+                    // Half a color glyph is worse than a bitmap one: unwind
+                    // and let the caller fall back.
+                    self.scratch.vector.truncate(vector_len);
+                    self.scratch.blend.truncate(blend_len);
+                    return false;
+                }
+                continue; // A layer with no outline paints nothing.
+            };
+            if gc.count == 0 {
+                continue;
+            }
+            if self.scratch.collect_keys {
+                self.scratch.curve_keys.insert(GlyphKey::new(
+                    draw.font_id,
+                    layer.glyph_id,
+                    draw.weight,
+                    draw.flags,
+                ));
+            }
+            // The run's alpha scales the palette's, so fading text out fades
+            // its color glyphs with it; a layer that asked for the text color
+            // (palette index 0xFFFF) takes the run's color whole.
+            let color = match layer.color {
+                Some(c) => Color([c[0], c[1], c[2], c[3] * draw.color.0[3]]),
+                None => draw.color,
+            };
+            self.push_vector(vector_instance(
+                &gc,
+                draw.pos,
+                draw.font_size,
+                self.shade(color),
+                draw.weight_t.unwrap_or(gc.weight_t),
+                self.clip_min_px_per_em,
+            ));
+        }
+        // Every layer blank (or the glyph's layer list empty) still counts as
+        // handled: the base glyph of a color glyph has no outline of its own,
+        // so falling through would only rasterize a blank into the atlas.
+        true
     }
 
     /// Rasterize a glyph into the bitmap atlas and queue its quad. `pos` is the
@@ -3610,6 +3755,140 @@ mod tests {
         let saved = 100.0 * (1.0 - clipped as f64 / plain as f64);
         println!("fragment invocations: {plain} -> {clipped} ({saved:.1}% saved)");
         assert!(plain > 0 && clipped < plain, "{plain} -> {clipped}");
+    }
+
+    // ---- COLRv0 color glyphs ----
+
+    /// Palette 0 of the vendored Twemoji subset, in 🚀's paint order.
+    const ROCKET_LAYERS: [u32; 6] = [0xA0041E, 0xFFAC33, 0xFFCC4D, 0x55ACEE, 0x000000, 0xA0041E];
+
+    fn rgba(hex: u32, alpha: f32) -> [f32; 4] {
+        [
+            ((hex >> 16) & 0xff) as f32 / 255.0,
+            ((hex >> 8) & 0xff) as f32 / 255.0,
+            (hex & 0xff) as f32 / 255.0,
+            alpha,
+        ]
+    }
+
+    /// One color glyph, queued through the shaping-free path so the test names
+    /// the face and the glyph itself.
+    fn queue_color_glyph(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        family: &str,
+        size: f32,
+        color: Color,
+    ) {
+        let (_, queue) = testing::gpu();
+        let font_id = testing::font_id_of(font_system, family);
+        let glyph_id = testing::glyph_id_of(font_system, font_id, '🚀').expect("the face has 🚀");
+        renderer.begin();
+        renderer.glyphs(
+            queue,
+            font_system,
+            &[GlyphSpec {
+                font_id,
+                glyph_id,
+                font_size: size,
+                pos: [20.0, 150.0],
+                color,
+                weight: fontdb::Weight::NORMAL,
+            }],
+        );
+    }
+
+    /// The whole point of #15: a COLRv0 glyph becomes one *vector* instance per
+    /// layer — no atlas quad at all — and they are queued bottom to top in the
+    /// font's own order, which is the order they draw in.
+    #[test]
+    fn a_color_glyph_queues_one_vector_instance_per_layer_in_paint_order() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            40.0,
+            Color::WHITE,
+        );
+
+        let expected: Vec<[f32; 4]> = ROCKET_LAYERS.iter().map(|&c| rgba(c, 1.0)).collect();
+        assert_eq!(renderer.pending_vector_colors(), expected);
+        assert_eq!(renderer.pending_atlas_glyphs(), 0, "nothing rasterized");
+    }
+
+    /// A layer's palette color is the font's, but its *alpha* is the run's:
+    /// fading text out has to fade its color glyphs with it.
+    #[test]
+    fn the_run_alpha_multiplies_into_every_layer_color() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            40.0,
+            Color::rgba(0.0, 1.0, 0.0, 0.25),
+        );
+
+        let expected: Vec<[f32; 4]> = ROCKET_LAYERS.iter().map(|&c| rgba(c, 0.25)).collect();
+        assert_eq!(renderer.pending_vector_colors(), expected);
+    }
+
+    /// The negative case: NotoColorEmoji is CBDT: bitmaps, no outlines, no COLR
+    /// table. It has to keep taking the atlas path exactly as before.
+    #[test]
+    fn a_cbdt_emoji_still_rides_the_bitmap_atlas() {
+        let Some(mut font_system) = testing::bitmap_color_font_system() else {
+            eprintln!("no {} — skipping", testing::CBDT_FONT_PATH);
+            return;
+        };
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            "Noto Color Emoji",
+            40.0,
+            Color::WHITE,
+        );
+
+        assert!(
+            renderer.pending_vector_colors().is_empty(),
+            "a bitmap emoji has no outlines to vectorize"
+        );
+        assert_eq!(renderer.pending_atlas_glyphs(), 1);
+    }
+
+    /// End to end on the GPU: the layers really do come out of the winding
+    /// shader in their palette colors. Every layer is opaque over a black
+    /// clear, so a covered pixel *is* the palette color.
+    #[test]
+    fn color_glyph_layers_render_in_their_palette_colors() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            120.0,
+            Color::WHITE,
+        );
+        let pixels = testing::render_pixels(&mut renderer, W, H);
+        assert!(drew(&pixels), "the color glyph drew something");
+
+        // The nose cone's red and the window's blue are two different layers,
+        // so finding both proves the stack — not just one outline — reached
+        // the screen.
+        for hex in [0xA0041E, 0x55ACEE] {
+            let want = [
+                (hex >> 16) as u8,
+                ((hex >> 8) & 0xff) as u8,
+                (hex & 0xff) as u8,
+            ];
+            let hits = pixels.chunks_exact(4).filter(|px| px[..3] == want).count();
+            assert!(hits > 20, "expected a patch of {hex:06X}, found {hits} px");
+        }
     }
 
     #[test]
