@@ -149,9 +149,9 @@ export interface InitOutput {
     readonly faftextdemo_terminal: (a: number) => number;
     readonly faftextdemo_text: (a: number) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6eb6ae39273879d5: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h33ad5577d77efade: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h33ad5577d77efade_2: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h33ad5577d77efade_3: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714_2: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714_3: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h97af8ec3bf76bae8: (a: number, b: number, c: any, d: any) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
