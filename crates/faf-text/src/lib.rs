@@ -1,14 +1,138 @@
-//! faf-text: a GPU text renderer built for speed.
+//! A GPU text renderer that is fast as f***. Native and WebAssembly, WebGPU
+//! and WebGL2, one code path.
 //!
-//! Glyph outlines are flattened once to quadratic Béziers (em units) and
-//! packed into a data texture; the fragment shader decides inside/outside per
-//! pixel with the non-zero winding rule and analytic antialiasing. Scaling and
-//! subpixel positioning are exact and free — nothing re-rasterizes. Color
-//! emoji fall back to a shelf-packed bitmap atlas. Selection backgrounds and
-//! highlight overlays are instanced rect layers below and above the glyphs.
+//! **Glyphs are rendered from their outlines, on the GPU, every frame.** Each
+//! glyph's Bézier outline is extracted once (via swash, at size 1.0, so the
+//! coordinates are pure em units), cubics are flattened to quadratics, and the
+//! curves are packed into an RGBA32F data texture. Every glyph on screen is one
+//! instanced quad, and the fragment shader decides inside/outside per pixel:
+//! cast a horizontal ray through the sample point, solve `y(t) = 0` for every
+//! quadratic, and accumulate signed, clamped crossing distances — the non-zero
+//! winding rule, with **analytic antialiasing** baked into the clamp. There is
+//! no glyph atlas for outlines, no SDF bake and no MSAA.
 //!
-//! Everything is plain wgpu with WebGL2-safe choices (data textures instead of
-//! storage buffers), so the same code runs native, WebGPU, and WebGL2.
+//! What falls out of that:
+//!
+//! - **Free scaling and true subpixel positioning.** Zooming re-rasterizes
+//!   nothing; the curve data never changes and a glyph is never snapped to the
+//!   pixel grid.
+//! - **Variable weight for free.** A face with a `wght` axis is extracted at
+//!   both ends and the fragment shader mixes the two point-compatible masters
+//!   before the winding test, so weight animates per frame at zero CPU cost
+//!   ([`TextRenderer::text_with_weight`]).
+//! - **Correct antialiasing in 3D.** Coverage comes from screen-space
+//!   derivatives of an interpolated varying, so it is measured on the
+//!   *projected* glyph: a pane seen at a grazing angle is as smooth as a flat
+//!   one ([`TextRenderer::set_block_transform`]).
+//! - **WebGL2 compatibility.** Curve data lives in a texture (`textureLoad`),
+//!   never a storage buffer, so the same shaders run on Vulkan, Metal, DX12,
+//!   GL, WebGPU and WebGL2.
+//!
+//! Color emoji and any glyph without an extractable outline fall back to a
+//! shelf-packed bitmap atlas. Selection backgrounds, highlight overlays and
+//! carets are instanced rect layers below and above the glyphs; underline,
+//! strikethrough, squiggle and rounded chip are a third instanced pipeline
+//! whose fragment shader switches on a [`DecorationKind`].
+//!
+//! # Live demos
+//!
+//! On docs.rs each cell below is a real canvas driven by this renderer compiled
+//! to WebAssembly. Everywhere else — GitHub, crates.io, offline docs — the
+//! animated PNG behind it plays instead, which is the same scene rendered
+//! headless by `cargo run --example gallery`. The full interactive demo is at
+//! <https://meawoppl.github.io/faf-text/demo/>.
+//!
+//! <div class="faf-live-grid">
+//! <div class="faf-live" data-demo="zoom">
+//!
+//! ![font size sweeping 10 to 80 px, with nothing re-rasterizing](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/zoom.apng)
+//!
+//! <span class="faf-live-caption">zoom — one curve set, every size</span>
+//! </div>
+//! <div class="faf-live" data-demo="weight">
+//!
+//! ![a variable font's weight axis blended in the fragment shader](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/weight.apng)
+//!
+//! <span class="faf-live-caption">weight — two masters, lerped per pixel</span>
+//! </div>
+//! <div class="faf-live" data-demo="tilt">
+//!
+//! ![a pane of text turning in 3D under a perspective camera](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/tilt.apng)
+//!
+//! <span class="faf-live-caption">tilt — one matrix a frame</span>
+//! </div>
+//! <div class="faf-live" data-demo="terminal">
+//!
+//! ![a colored log streaming through a terminal grid](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/terminal.apng)
+//!
+//! <span class="faf-live-caption">terminal — cells, no shaping</span>
+//! </div>
+//! </div>
+//!
+//! # Quickstart
+//!
+//! [`TextRenderer`] needs a `wgpu::Device` and the format of whatever it will
+//! draw into; [`TextView`] wraps a shaped cosmic-text buffer with the
+//! hit-testing and selection geometry a host wants. The immediate-mode API is
+//! the shortest path to pixels:
+//!
+//! ```no_run
+//! use faf_text::{Attrs, Color, Cursor, Family, Metrics, RectLayer, TextRenderer, TextView};
+//!
+//! # fn demo(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) {
+//! // Fonts: the embedded blobs, with no system font scan (the only option on
+//! // wasm, and a faster start everywhere else).
+//! let mut font_system = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS]);
+//! let mut renderer = TextRenderer::new(device, format);
+//!
+//! let mut view = TextView::new(&mut font_system, Metrics::new(24.0, 32.0));
+//! view.pos = [40.0, 40.0];
+//! view.set_text(
+//!     &mut font_system,
+//!     "Every pixel of this solves the winding rule.",
+//!     &Attrs::new().family(Family::SansSerif),
+//! );
+//!
+//! // One frame: a selection under the text, then the text itself.
+//! renderer.begin();
+//! for rect in view.selection_rects(Cursor::new(0, 11), Cursor::new(0, 20)) {
+//!     renderer.rect(
+//!         [rect[0], rect[1]],
+//!         [rect[2], rect[3]],
+//!         Color::rgba8(0x3b, 0x63, 0xa8, 0xff),
+//!         RectLayer::Under,
+//!     );
+//! }
+//! renderer.text(queue, &mut font_system, &view.buffer, view.pos, Color::WHITE);
+//! renderer.finish(device, queue, [960.0, 600.0]);
+//!
+//! // ...then, inside a render pass targeting `format`:
+//! // renderer.render(&mut pass);
+//! # }
+//! ```
+//!
+//! A host that redraws the same content every frame should use **retained
+//! blocks** ([`TextRenderer::create_block`] and
+//! [`TextRenderer::set_block_content`]) instead: setting a block's content
+//! re-uploads that block's instance ranges and nothing else, moving it writes
+//! one matrix, and a frame in which nothing changed reports
+//! [`TextRenderer::damaged`] false so the host can skip recording and
+//! presenting entirely.
+//!
+//! # Map of the crate
+//!
+//! | Item | What it is |
+//! | --- | --- |
+//! | [`TextRenderer`] | Pipelines, glyph stores, retained blocks, and the immediate-mode wrapper over one of them. |
+//! | [`TextView`] | A positioned, shaped buffer: hit-testing, cursor motion, selection and decoration geometry. |
+//! | [`Document`] | A large document as chunked [`TextView`]s, shaped and evicted around a viewport. |
+//! | [`TermGrid`] | The monospace cell fast path: no shaping, procedural box drawing, merged background runs. |
+//! | [`math`] | Camera matrices and the pointer-ray/pane hit test that puts a click back into block-local pixels. |
+//! | [`Color`], [`RectLayer`], [`DecorationKind`] | The small value types the drawing calls take. |
+//! | [`RendererOptions`] | Construction-time quality knobs: [`CoverageBlend`] and [`Subpixel`]. |
+//!
+//! cosmic-text is re-exported whole as [`cosmic_text`], and glam as [`glam`],
+//! so a host never has to pin a second copy of either.
 //!
 //! # Layer order
 //!
@@ -39,7 +163,7 @@
 //! glyph id through the font's charmap, fixed cell metrics, merged background
 //! runs, and procedural rects for box drawing. It renders into an ordinary
 //! block through [`GlyphSpec`], so a terminal pane and a prose pane share one
-//! curve store and one draw order. See the [`grid`](crate::TermGrid) docs.
+//! curve store and one draw order.
 //!
 //! # Panes in 3D
 //!
@@ -47,10 +171,11 @@
 //! and the scene a shared camera ([`TextRenderer::set_view_projection`]), so a
 //! pane of text can sit anywhere in a 3D scene for the price of one uniform
 //! write per frame. Antialiasing needs no help there: coverage comes from
-//! screen-space derivatives of an interpolated varying, so it is measured on
-//! the projected glyph and stays correct at grazing angles. [`math`] has the
-//! camera helpers and the ray test that turns a pointer back into the
-//! block-local pixels [`TextView::hit`] wants.
+//! screen-space derivatives, so it is measured on the projected glyph and stays
+//! correct at grazing angles. [`math`] has the camera helpers and the ray test
+//! that turns a pointer back into the block-local pixels [`TextView::hit`]
+//! wants.
+#![warn(missing_docs)]
 
 mod arena;
 mod atlas;
@@ -85,13 +210,27 @@ pub use glam;
 pub struct Color(pub [f32; 4]);
 
 impl Color {
+    /// Opaque white.
     pub const WHITE: Color = Color([1.0, 1.0, 1.0, 1.0]);
+    /// Opaque black.
     pub const BLACK: Color = Color([0.0, 0.0, 0.0, 1.0]);
 
+    /// From four 0..=1 floats.
+    ///
+    /// ```
+    /// # use faf_text::Color;
+    /// assert_eq!(Color::rgba(1.0, 1.0, 1.0, 1.0), Color::WHITE);
+    /// ```
     pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
         Color([r, g, b, a])
     }
 
+    /// From four 8-bit channels — the form a hex color is usually written in.
+    ///
+    /// ```
+    /// # use faf_text::Color;
+    /// let tokyo_night_fg = Color::rgba8(0xc0, 0xca, 0xf5, 0xff);
+    /// ```
     pub fn rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
         Color([
             r as f32 / 255.0,
@@ -101,6 +240,8 @@ impl Color {
         ])
     }
 
+    /// From cosmic-text's packed color, which is how per-span colors arrive
+    /// out of shaping.
     pub fn from_cosmic(c: cosmic_text::Color) -> Self {
         Self::rgba8(c.r(), c.g(), c.b(), c.a())
     }

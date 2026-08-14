@@ -2,6 +2,18 @@
 name = "faf-text"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "GPU text renderer: glyph outlines evaluated per pixel in the fragment shader with the non-zero winding rule. Native, WebGPU and WebGL2, one code path."
+readme = "README.md"
+keywords = ["text-rendering", "gpu", "wgpu", "fonts", "wasm"]
+categories = ["graphics", "rendering", "text-processing", "wasm"]
+
+# Injects the live-demo loader into every docs.rs page: the `.faf-live`
+# placeholders in the crate docs upgrade to wasm canvases driven by the
+# gh-pages `demo/` bundle, with their APNG gallery images left as the fallback.
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "docs-header.html"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }

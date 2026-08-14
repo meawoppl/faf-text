@@ -47,6 +47,22 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   budget has to be generous: with the damage fast-out an idle demo presents
   nothing, virtual time races ahead, and a smaller budget screenshots before
   the first rAF tick even runs. `console.log` shows up as `INFO:CONSOLE`.
+- Documentation assets: `cargo run --release --example gallery -p faf-text`
+  renders `site/gallery/` (a 1200×630 `hero.png` plus `zoom`/`weight`/`tilt`/
+  `terminal` as APNG + a single-frame PNG sibling). `site/` is gitignored;
+  `scripts/build-site.sh` assembles the gh-pages tree (landing page + `demo/`
+  from `web/` + `gallery/`) and never runs the release wasm build itself.
+- Live docs: `crates/faf-text/docs-header.html` is injected by
+  `[package.metadata.docs.rs] rustdoc-args = ["--html-in-header", …]` and
+  upgrades the `.faf-live` placeholder divs in the crate docs into wasm
+  canvases from `https://meawoppl.github.io/faf-text/demo/pkg/`
+  (`window.FAF_DEMO_PKG` overrides). Test it locally by rewriting that URL to
+  a path under `target/doc/` and serving `target/doc`: the four cells do come
+  up headless under SwiftShader, on the WebGL2 fallback.
+- No `include` list in `crates/faf-text/Cargo.toml` on purpose — the default
+  (everything not gitignored) already ships `assets/`, both `.wgsl` files and
+  `docs-header.html`; an `include` would silently drop them. `README.md` there
+  is a symlink to the workspace one, which `cargo package` resolves.
 
 ## Hard-won knowledge
 
@@ -91,6 +107,16 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   mirrored-looking garbage until fixed). Hairline stems need the 3-tap path
   below ~24px.
 - Glyph outlines extracted at size 1.0 + DISABLE_HINTING = pure em units.
+- **Fixed bug worth remembering** — `CurveStore::flush` used a row-granular
+  high-water mark (`total_rows <= uploaded_rows` early return), so a glyph
+  extracted after a flush whose block fit inside the current partial row
+  never reached the texture and drew as nothing, permanently. The fix tracks
+  uploaded *floats* (`uploaded_floats`) and re-uploads from the row holding
+  the first new float; regression test
+  `flush_uploads_glyphs_that_fit_inside_a_partial_row`. Moral: upload
+  high-water marks must use the finest granularity data grows by, not the
+  granularity the transport (rows) prefers. `examples/gallery`'s `warm_up`
+  predates the fix and is now just a determinism nicety.
 - Curve-texture addressing is by *texel*, not curve record: `GlyphCurves.first`
   is a glyph's base texel and everything stored in the block (band header
   entries, index-list entries) is an offset from it, so compaction relocates a

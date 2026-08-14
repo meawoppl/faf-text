@@ -202,7 +202,10 @@ pub struct CurveStore {
     data: Vec<f32>,
     entries: FxHashMap<GlyphKey, Entry>,
     swash: SwashCache,
-    uploaded_rows: u32,
+    /// How much of `data` the texture already holds. Tracked in floats, not
+    /// rows: new glyphs often fit inside the current partial row, and a
+    /// row-granular high-water mark would skip them forever.
+    uploaded_floats: usize,
     width: u32,
     height: u32,
     max_height: u32,
@@ -247,7 +250,7 @@ impl CurveStore {
             data: Vec::new(),
             entries: FxHashMap::default(),
             swash: SwashCache::new(),
-            uploaded_rows: 0,
+            uploaded_floats: 0,
             width,
             height,
             max_height,
@@ -475,7 +478,7 @@ impl CurveStore {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         // Nothing of the old texture survives; the mirror is re-uploaded whole.
-        self.uploaded_rows = 0;
+        self.uploaded_floats = 0;
         self.generation += 1;
         true
     }
@@ -524,21 +527,21 @@ impl CurveStore {
             packed.extend_from_slice(&data[start..end]);
         }
         self.data = packed;
-        self.uploaded_rows = 0;
+        self.uploaded_floats = 0;
         self.generation += 1;
         self.layout_generation += 1;
     }
 
     /// Upload any rows of curve data added since the last flush.
     pub fn flush(&mut self, queue: &wgpu::Queue) {
-        let floats_per_row = floats_per_row(self.width);
-        let total_rows = self.data.len().div_ceil(floats_per_row) as u32;
-        if total_rows <= self.uploaded_rows {
+        if self.data.len() <= self.uploaded_floats {
             return;
         }
-        // Re-upload from the last complete row so a partially-filled row that
-        // gained new curves is refreshed too.
-        let start_row = self.uploaded_rows.saturating_sub(1);
+        let floats_per_row = floats_per_row(self.width);
+        let total_rows = self.data.len().div_ceil(floats_per_row) as u32;
+        // Restart from the row holding the first new float, refreshing the
+        // partially-filled row the new curves may share with old ones.
+        let start_row = (self.uploaded_floats / floats_per_row) as u32;
         let mut rows = Vec::from(&self.data[start_row as usize * floats_per_row..]);
         rows.resize((total_rows - start_row) as usize * floats_per_row, 0.0);
 
@@ -565,7 +568,7 @@ impl CurveStore {
                 depth_or_array_layers: 1,
             },
         );
-        self.uploaded_rows = total_rows;
+        self.uploaded_floats = self.data.len();
     }
 }
 
@@ -837,6 +840,40 @@ mod tests {
     use super::*;
     use crate::testing;
 
+    /// A glyph extracted after a flush, small enough to land inside the
+    /// texture's current partial row, must still be uploaded by the next
+    /// flush. A row-granular high-water mark skipped it forever: the store
+    /// held the curves, the texture never saw them, and the glyph rendered
+    /// as nothing from then on.
+    #[test]
+    fn flush_uploads_glyphs_that_fit_inside_a_partial_row() {
+        let (device, queue) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+
+        let a = get(&mut store, &mut font_system, font_id, 20).expect("glyph 20");
+        store.flush(queue);
+        let after_first = store.uploaded_floats;
+        assert_eq!(after_first, store.data.len());
+
+        // A second small glyph: with 256-texel rows this stays in the same
+        // partial row the first flush already touched.
+        let b = get(&mut store, &mut font_system, font_id, 21).expect("glyph 21");
+        assert!(
+            (b.first as usize * FLOATS_PER_TEXEL)
+                < after_first.next_multiple_of(floats_per_row(store.width)),
+            "repro requires the new glyph to start inside the flushed partial row"
+        );
+        store.flush(queue);
+        assert_eq!(
+            store.uploaded_floats,
+            store.data.len(),
+            "flush must upload data appended within a partial row"
+        );
+        assert_ne!(a.first, b.first);
+    }
+
     /// Extract one glyph by raw id, stamping it with the current frame.
     fn get(
         store: &mut CurveStore,
@@ -890,7 +927,10 @@ mod tests {
         assert!(store.height > 2, "texture should have grown");
         assert_eq!(store.height % 2, 0, "height doubles, so stays even");
         assert!(store.generation > 0, "growth bumps the generation");
-        assert_eq!(store.uploaded_rows, 0, "growth schedules a full re-upload");
+        assert_eq!(
+            store.uploaded_floats, 0,
+            "growth schedules a full re-upload"
+        );
         // The mirror is untouched by growth, so the first glyph is where it was.
         let same = get(&mut store, &mut font_system, font_id, 36).unwrap();
         assert_eq!(same.first, first.first);
@@ -927,7 +967,7 @@ mod tests {
         assert!(!store.needs_compact);
         assert!(store.generation > 0, "compaction bumps the generation");
         assert!(store.data.len() < filled, "compaction frees room");
-        assert_eq!(store.uploaded_rows, 0, "compaction re-uploads everything");
+        assert_eq!(store.uploaded_floats, 0, "compaction re-uploads everything");
         assert!(
             get(&mut store, &mut font_system, font_id, overflowed).is_some_and(|c| c.count > 0),
             "the glyph that overflowed fits after compaction"

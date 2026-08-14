@@ -47,12 +47,15 @@ use crate::view::{LineMetrics, Rect};
 pub struct CellStyle(pub u8);
 
 impl CellStyle {
+    /// No style bits at all — the default a plain [`Cell`] carries.
     pub const NONE: CellStyle = CellStyle(0);
     /// Draws from the family's bold face when one resolved.
     pub const BOLD: CellStyle = CellStyle(1 << 0);
     /// Draws from the family's italic face when one resolved.
     pub const ITALIC: CellStyle = CellStyle(1 << 1);
+    /// Underlines the run out of the decoration pipeline.
     pub const UNDERLINE: CellStyle = CellStyle(1 << 2);
+    /// Strikes the run through, likewise.
     pub const STRIKE: CellStyle = CellStyle(1 << 3);
 
     /// True when every bit of `bits` is set here.
@@ -60,10 +63,12 @@ impl CellStyle {
         self.0 & bits.0 == bits.0
     }
 
+    /// These bits, plus `bits`.
     pub const fn with(self, bits: CellStyle) -> CellStyle {
         CellStyle(self.0 | bits.0)
     }
 
+    /// These bits, minus `bits`.
     pub const fn without(self, bits: CellStyle) -> CellStyle {
         CellStyle(self.0 & !bits.0)
     }
@@ -90,10 +95,14 @@ impl std::ops::BitOr for CellStyle {
 /// back.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
+    /// The character in the cell, or [`Cell::CONTINUATION`] for the right half
+    /// of a wide one.
     pub ch: char,
+    /// Foreground color of the glyph.
     pub fg: Color,
     /// `None` leaves the surface (or whatever is behind the block) showing.
     pub bg: Option<Color>,
+    /// Bold/italic face selection plus underline and strikethrough.
     pub style: CellStyle,
 }
 
@@ -102,6 +111,7 @@ impl Cell {
     /// carries the colors of the cell it continues so background runs merge.
     pub const CONTINUATION: char = '\0';
 
+    /// A cell holding `ch` in `fg`, with no background and no style bits.
     pub fn new(ch: char, fg: Color) -> Self {
         Self {
             ch,
@@ -190,6 +200,40 @@ impl Row {
 /// position in this crate — and rows are viewport rows: row 0 is the top of
 /// what is on screen, which is not the top of the scrollback when
 /// [`TermGrid::set_view_offset`] has been used.
+///
+/// Cells never go through the shaper: a char maps straight to a glyph id
+/// through the face's charmap (cached per face in [`GridFont`]), cell metrics
+/// are rounded to whole pixels, and adjacent cells that share a background
+/// merge into one rect. East Asian Width `W`/`F` characters take two cells, and
+/// anything the charmap misses — combining marks, ZWJ clusters, emoji — falls
+/// back to a one-cell shaped buffer, cached by string. Box drawing and block
+/// elements (U+2500–U+259F) are *generated* as cell-bound rects, so their joins
+/// are seamless at any size.
+///
+/// # Streaming a log
+///
+/// ```no_run
+/// use faf_text::{Color, Family, GridFont, GridScene, TermGrid, TextRenderer};
+///
+/// # fn demo(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) {
+/// let mut fonts = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS_MONO]);
+/// let mut renderer = TextRenderer::new(device, format);
+/// let mut font = GridFont::new(&mut fonts, Family::Monospace, 13.0);
+/// let mut grid = TermGrid::new(120, 40, 2000);
+/// let mut scene = GridScene::new();
+/// let block = renderer.create_block();
+///
+/// grid.push_line("INFO  ready.", Color::WHITE, None);
+/// renderer.begin_frame();
+/// // Translate the viewport into instances and put them in `block` — a
+/// // 200×60 grid of colored cells costs ~0.12 ms of CPU here.
+/// grid.render(&mut renderer, queue, &mut fonts, &mut font, &mut scene, block, [8.0, 8.0]);
+/// renderer.finish(device, queue, [960.0, 600.0]);
+/// # }
+/// ```
+///
+/// [`TermGrid::take_dirty`] says whether anything changed since the last
+/// translation, so an idle grid skips even that.
 pub struct TermGrid {
     cols: u16,
     rows: u16,
@@ -203,6 +247,15 @@ pub struct TermGrid {
 }
 
 impl TermGrid {
+    /// A blank `cols × rows` grid that keeps at most `scrollback_limit` rows
+    /// of history above the screen.
+    ///
+    /// ```
+    /// # use faf_text::{Cell, Color, TermGrid};
+    /// let mut grid = TermGrid::new(80, 24, 1000);
+    /// grid.print(0, 0, "ready.", Color::WHITE, None);
+    /// assert_eq!(grid.cell(0, 0).map(|c| c.ch), Some('r'));
+    /// ```
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize) -> Self {
         Self {
             cols,
@@ -215,10 +268,12 @@ impl TermGrid {
         }
     }
 
+    /// Columns on screen.
     pub fn cols(&self) -> u16 {
         self.cols
     }
 
+    /// Rows on screen, excluding scrollback.
     pub fn rows(&self) -> u16 {
         self.rows
     }
@@ -307,6 +362,8 @@ impl TermGrid {
         self.screen.get(row as usize)?.cluster(col)
     }
 
+    /// Write one cell. Out-of-range coordinates are ignored, and writing over
+    /// the left half of a wide character blanks its continuation.
     pub fn set_cell(&mut self, col: u16, row: u16, cell: Cell) {
         if col >= self.cols {
             return;
@@ -767,6 +824,7 @@ impl GridFont {
         [self.cell[0] * cols as f32, self.cell[1] * rows as f32]
     }
 
+    /// Em size the cell metrics were measured at, in px.
     pub fn font_size(&self) -> f32 {
         self.font_size
     }
@@ -882,12 +940,19 @@ fn resolve_face(
 /// that a 60 fps grid allocates nothing.
 #[derive(Default)]
 pub struct GridScene {
+    /// Cell backgrounds, merged across runs that share a color, plus the
+    /// procedural rects box drawing and block elements are made of. These go
+    /// in a block's under-rect layer.
     pub rects: Vec<(Rect, Color)>,
+    /// One entry per cell that draws a glyph, already resolved to a font and
+    /// glyph id.
     pub glyphs: Vec<GlyphSpec>,
+    /// Underlines and strikethroughs asked for by [`CellStyle`].
     pub decorations: Vec<(Rect, DecorationKind, Color)>,
 }
 
 impl GridScene {
+    /// An empty scene. Keep one per grid and reuse it every frame.
     pub fn new() -> Self {
         Self::default()
     }
