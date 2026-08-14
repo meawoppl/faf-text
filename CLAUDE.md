@@ -17,8 +17,12 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   faf-text` renders every feature to `offscreen.png` (works headless — this
   box has an RTX 3070; wgpu picks Vulkan). `examples/panes3d` does the same for
   3D panes (`panes3d.png`). The offscreen scene is a **regression baseline**:
-  its md5 is `beec6786631dd25e4fcad2c801839244` and any change to placement
-  math has to keep it.
+  its md5 is `729ddb4ccb578c75ebceb95a8bf8249c` (it was
+  `beec6786631dd25e4fcad2c801839244` before the RGBA16F curve storage of #13
+  requantized the outlines) and any change to placement math has to keep it.
+  `panes3d.png` is `80928801bd41af0a08cacf96772270c1` and f16 did *not* move
+  it: at 3D-pane sizes the quantization stays under half a level of 8-bit
+  coverage.
 - Wasm build: `~/.cargo/bin/wasm-pack build crates/faf-text-web --target web
   --out-dir ../../web/pkg --release` (wasm-pack is in ~/.cargo/bin, which is
   NOT on PATH). Release builds spend minutes in wasm-opt; run in background.
@@ -122,6 +126,45 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   entries, index-list entries) is an offset from it, so compaction relocates a
   glyph by memcpy + rewriting `first`. Blocks are always an even number of
   texels so a two-texel curve record never straddles a row.
+- The curve texture is **RGBA16F** (#13). Three things fall out of that and all
+  three are load-bearing:
+  - **Quantize in the flattener, not on upload.** `Flattener::push` rounds
+    every control point to f16, so the bbox, band membership, the early-out
+    sort keys and the shader all describe one outline. Rounding later would let
+    the CPU sort by numbers the GPU does not have.
+  - **f16 holds integers exactly only to 2048**, and band headers/index lists
+    are integers in texels. `banded_block` returns `None` past that and the
+    glyph keeps the flat layout (which addresses records with u32 arithmetic
+    and stores no integers at all). DejaVu Sans and Manrope top out at 254, so
+    it takes a ~550-curve glyph to trip.
+  - **Endpoint sharing only in banded blocks.** p2 of a curve is p0 of the
+    next within a contour (the flattener carries the point, so they are the
+    same float), so a curve is one texel plus one terminator per contour and
+    `fetch_pair`'s two-texel read is unchanged. The flat loop walks records by
+    arithmetic (`i * 2`), which sharing would break — stepping over contour
+    terminators needs an index list or a per-texel branch, and a branch in that
+    loop has measured 25% here. Flat blocks are ≤16 curves, so it costs ~130
+    bytes a glyph and keeps both paths bit-identical
+    (`band_tables_do_not_move_a_single_pixel` still passes exactly).
+- f16 quantization is worth **≤4.9e-4 em** (2^-11 near 1.0), but the *pixel*
+  effect is not that number times px/em: the offscreen scene moved 2882 px of
+  576000, 83% of them by ≤2/255, with a tail to **45/255** on near-tangent
+  edges where a crossing position is ill-conditioned. Proven to be quantization
+  and nothing else by rendering the same shared-endpoint layout through an
+  RGBA32F texture: unquantized it is **byte-identical** to the pre-#13 scene,
+  quantized it reproduces the RGBA16F render exactly. If a scene ever needs
+  more precision than this, the move is per-glyph fixed point (Rgba16Unorm over
+  the bbox, ~1e-5 em), not a wider float.
+- Halving the curve-fetch bytes did **not** move frame time on the 3070 (bench
+  0.549 → 0.545 ms/frame, stress 1.90 → 1.86 inside its ±0.2 noise). The whole
+  offscreen curve set is ~107 KB and already sat in L2, and #12 had already cut
+  the fetch *count*; #13 buys memory (2.6×) and bandwidth headroom for WebGL2
+  and mobile, not frames here.
+- RGBA16F is *better* supported than RGBA32F on WebGL2, not worse: wgpu's GLES
+  backend gives it `TEXTURE_BINDING | FILTERABLE | STORAGE` with no extension,
+  where `Rgba32Float` is sampled-but-unfilterable. A `Float { filterable:
+  false }` bind-group layout accepts it (wgpu only rejects the other
+  direction), so the curve binding did not change.
 - Band tables (>16 curves) split the glyph's **em bbox**, not the instance
   quad: the quad's 1.5px pad is a size-dependent number of em, and bands are
   baked once per glyph. The renderer passes `band_scale`/`band_bias` to map the

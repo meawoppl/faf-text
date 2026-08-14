@@ -1338,6 +1338,14 @@ impl TextRenderer {
         self.options
     }
 
+    /// Curve-texture memory: (bytes of packed curve data, bytes the texture
+    /// itself occupies). The first number is what the glyphs extracted so far
+    /// actually cost; the second is the allocation they live in, which only
+    /// grows by doubling.
+    pub fn curve_memory(&self) -> (usize, usize) {
+        self.curves.memory()
+    }
+
     /// An instance color in the space the pipelines blend in. Under the
     /// default (gamma) blend this is the identity, and instance data is
     /// bit-for-bit what it always was.

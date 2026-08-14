@@ -4,7 +4,7 @@
 //! **Glyphs are rendered from their outlines, on the GPU, every frame.** Each
 //! glyph's Bézier outline is extracted once (via swash, at size 1.0, so the
 //! coordinates are pure em units), cubics are flattened to quadratics, and the
-//! curves are packed into an RGBA32F data texture. Every glyph on screen is one
+//! curves are packed into an RGBA16F data texture. Every glyph on screen is one
 //! instanced quad, and the fragment shader decides inside/outside per pixel:
 //! cast a horizontal ray through the sample point, solve `y(t) = 0` for every
 //! quadratic, and accumulate signed, clamped crossing distances — the non-zero

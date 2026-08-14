@@ -300,6 +300,10 @@ fn glyph_fs(in: GlyphOutput) -> @location(0) vec4<f32> {
 // signed, clamped crossing distances — the non-zero winding rule with analytic
 // antialiasing baked into the clamp. No MSAA, no atlas, no re-raster on zoom.
 //
+// `curve_tex` is RGBA16F: em coordinates quantize to at worst 4.9e-4 em, which
+// is 0.03 px at 64 px/em, and the integers the band tables store are exact to
+// 2048 (curves.rs keeps blocks under that).
+//
 // `first` is the block's base texel and `count` the number of quadratics. When
 // `count` carries BANDED_FLAG the block opens with band tables (see the
 // record-layout comment in curves.rs) and each ray reads only the curves that
@@ -307,12 +311,19 @@ fn glyph_fs(in: GlyphOutput) -> @location(0) vec4<f32> {
 //
 //   [header: BANDS y-band then BANDS x-band entries, one texel each]
 //   [index lists: two per band, texel-aligned, in header order]
-//   [curve records: 2 texels each]
+//   [curve texels: [p0.xy p1.xy] per curve, plus one terminator per contour]
 //
 // A header entry is (descending list offset, curve count, split coordinate,
 // ascending list offset), offsets in texels from `first`; a list entry is a
-// curve record's texel offset from `first`. Bands split the glyph's em bbox
+// curve's texel offset from `first`. Bands split the glyph's em bbox
 // uniformly — `fraction` is the sample's position in that box.
+//
+// Banded blocks share endpoints: p2 of a curve is p0 of the next one in its
+// contour, so it is already sitting in the next texel and a curve costs one
+// texel plus one per contour. The fetch is unchanged — texel t is [p0 p1] and
+// texel t+1 starts with p2 either way — which is also why an unbanded block
+// can keep the unshared 2-texel record ([p0 p1][p2 pad pad]) and be read by
+// the same code.
 //
 // The two lists hold the same curves ordered for the two ray directions —
 // descending by their maximum coordinate along the ray axis, ascending by their
@@ -456,6 +467,10 @@ struct CurvePair {
     b2: vec2<f32>,
 };
 
+// `record` is a texel offset from the block base. The first texel holds
+// [p0.xy p1.xy] and the second starts with p2 — in a banded block that second
+// texel is the *next* curve's (or its contour's terminator), which is what
+// endpoint sharing buys and costs nothing here.
 fn fetch_pair(block: Block, record: u32) -> CurvePair {
     let t0 = textureLoad(curve_tex, texel_coord(block.base + record), 0);
     let t1 = textureLoad(curve_tex, texel_coord(block.base + record + 1u), 0);

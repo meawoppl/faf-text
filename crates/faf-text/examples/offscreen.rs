@@ -230,6 +230,9 @@ async fn run() {
 
     renderer.finish(&device, &queue, [WIDTH as f32, HEIGHT as f32]);
 
+    let (used, allocated) = renderer.curve_memory();
+    println!("curve data: {used} bytes packed, {allocated} bytes allocated");
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Curve storage moved from RGBA32F to RGBA16F with contour-aware endpoint
+  sharing: a banded glyph costs one texel per curve plus one per contour, and
+  the offscreen scene's curve data went from 281 KB to 107 KB. Coordinates are
+  rounded to f16 as they are flattened, so band tables and the shader agree on
+  the outline to the bit.
+
 ## 0.1.0 — 2026-08-13
 
 First release.

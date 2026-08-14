@@ -28,8 +28,9 @@ the same four cells are live wasm canvases.
 **Glyphs are rendered from their outlines, on the GPU, every frame.** Each
 glyph's Bézier outline is extracted once (via swash, at size 1.0 → pure em
 units), cubics are flattened to quadratics, and the curves are packed into an
-RGBA32F data texture. Every glyph on screen is one instanced quad; the fragment
-shader decides inside/outside per pixel:
+RGBA16F data texture — one texel per curve, since a curve's end point is the
+next curve's start point and lives in the next texel. Every glyph on screen is
+one instanced quad; the fragment shader decides inside/outside per pixel:
 
 - Cast a horizontal ray through the sample point, solve `y(t) = 0` for every
   quadratic, and accumulate signed, clamped crossing distances — the non-zero
