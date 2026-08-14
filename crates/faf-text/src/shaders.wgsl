@@ -38,6 +38,18 @@ const BLOCK_SNAP: u32 = 1u;
 const CURVE_TEX_WIDTH: u32 = 256u;
 // Bands per axis. Must match BANDS in curves.rs.
 const BANDS: u32 = 8u;
+// Texels per band header entry: (descending list offset, curve count, split
+// coordinate, ascending list offset). Must match BAND_ENTRY_TEXELS in curves.rs.
+const BAND_ENTRY_TEXELS: u32 = 1u;
+// Pixels per em below which a glyph counts as small: no median band split, and
+// the band loop's early-out tested once per index texel instead of once per
+// curve. Both are wins on long lists and losses on short ones — neighbouring
+// samples pick opposite ray directions, and the tighter break turns four
+// independent fetches into a dependency chain — which is why Lengyel gates the
+// split on size too. The threshold sits a little under the paper's 32 px/em so
+// a glyph rendered at exactly 32 (its own Table-2 workload) lands on the fast
+// side of the fence rather than on it.
+const SPLIT_MIN_PX_PER_EM: f32 = 30.0;
 // Set in a vector instance's `count` field when the glyph's block opens with
 // band tables instead of curve records. Must match BANDED_FLAG in curves.rs.
 const BANDED_FLAG: u32 = 0x80000000u;
@@ -293,13 +305,21 @@ fn glyph_fs(in: GlyphOutput) -> @location(0) vec4<f32> {
 // record-layout comment in curves.rs) and each ray reads only the curves that
 // can cross it, instead of the whole glyph:
 //
-//   [header: BANDS y-band then BANDS x-band entries, 2 per texel]
-//   [index lists: texel-aligned, in header order]
+//   [header: BANDS y-band then BANDS x-band entries, one texel each]
+//   [index lists: two per band, texel-aligned, in header order]
 //   [curve records: 2 texels each]
 //
-// A header entry is (list offset in texels from `first`, curve count); a list
-// entry is a curve record's texel offset from `first`. Bands split the glyph's
-// em bbox uniformly — `fraction` is the sample's position in that box.
+// A header entry is (descending list offset, curve count, split coordinate,
+// ascending list offset), offsets in texels from `first`; a list entry is a
+// curve record's texel offset from `first`. Bands split the glyph's em bbox
+// uniformly — `fraction` is the sample's position in that box.
+//
+// The two lists hold the same curves ordered for the two ray directions —
+// descending by their maximum coordinate along the ray axis, ascending by their
+// minimum — so the loop can stop as soon as a fetched curve sits far enough
+// behind the sample for Eq. 3's saturate to be exactly 0. Past the band's
+// `split` coordinate the ray is fired backwards off the ascending list, so a
+// sample near the right edge of a glyph never walks the curves on its left.
 //
 // A glyph from a variable font stores a second master (the same records at the
 // wght axis maximum) starting at `b_first`, in the same order, so the twin of
@@ -424,31 +444,94 @@ struct Curve {
     p2: vec2<f32>,
 };
 
-fn fetch_curve(block: Block, record: u32) -> Curve {
+// One quadratic's masters, unblended. The banded path keeps them apart because
+// its early-out has to bound BOTH of them (see `record_winding`); B mirrors A
+// on the single-master pipeline, where the second fetch folds away entirely.
+struct CurvePair {
+    a0: vec2<f32>,
+    a1: vec2<f32>,
+    a2: vec2<f32>,
+    b0: vec2<f32>,
+    b1: vec2<f32>,
+    b2: vec2<f32>,
+};
+
+fn fetch_pair(block: Block, record: u32) -> CurvePair {
     let t0 = textureLoad(curve_tex, texel_coord(block.base + record), 0);
     let t1 = textureLoad(curve_tex, texel_coord(block.base + record + 1u), 0);
-    var curve = Curve(t0.xy, t0.zw, t1.xy);
+    var pair = CurvePair(t0.xy, t0.zw, t1.xy, t0.xy, t0.zw, t1.xy);
     if BLEND_MASTERS {
         let b0 = textureLoad(curve_tex, texel_coord(block.b_base + record), 0);
         let b1 = textureLoad(curve_tex, texel_coord(block.b_base + record + 1u), 0);
-        curve.p0 = mix(curve.p0, b0.xy, block.weight_t);
-        curve.p1 = mix(curve.p1, b0.zw, block.weight_t);
-        curve.p2 = mix(curve.p2, b1.xy, block.weight_t);
+        pair.b0 = b0.xy;
+        pair.b1 = b0.zw;
+        pair.b2 = b1.xy;
     }
-    return curve;
+    return pair;
 }
 
-// One curve's contribution to a ray. `record` is its texel offset from the
-// block base; `swap` casts the vertical ray by exchanging the coordinates.
+fn blend_pair(pair: CurvePair, weight_t: f32) -> Curve {
+    if BLEND_MASTERS {
+        return Curve(
+            mix(pair.a0, pair.b0, weight_t),
+            mix(pair.a1, pair.b1, weight_t),
+            mix(pair.a2, pair.b2, weight_t),
+        );
+    }
+    return Curve(pair.a0, pair.a1, pair.a2);
+}
+
+fn fetch_curve(block: Block, record: u32) -> Curve {
+    return blend_pair(fetch_pair(block, record), block.weight_t);
+}
+
+// The coordinate a ray runs along: x for the horizontal cast, y for the
+// vertical one — which the shader fires by swapping the two coordinates, so it
+// reads x there too.
+fn ray_coord(p: vec2<f32>, swap: bool) -> f32 {
+    return select(p.x, p.y, swap);
+}
+
+// How far along the ray one master's control points reach, scaled by the
+// signed `inv`: the maximum for a forward ray, the minimum for a backward one
+// (scaling by a negative number turns the max into the min). `shift` moves the
+// sample along the ray, matching the `offset` the winding math subtracts.
+fn ray_bound(
+    p0: vec2<f32>,
+    p1: vec2<f32>,
+    p2: vec2<f32>,
+    em: vec2<f32>,
+    shift: f32,
+    inv: f32,
+    swap: bool,
+) -> f32 {
+    let c0 = (ray_coord(p0 - em, swap) - shift) * inv;
+    let c1 = (ray_coord(p1 - em, swap) - shift) * inv;
+    let c2 = (ray_coord(p2 - em, swap) - shift) * inv;
+    return max(max(c0, c1), c2);
+}
+
+// One curve's contribution to a ray, and the bound that ends the band's loop.
+// `record` is its texel offset from the block base; `swap` casts the vertical
+// ray by exchanging the coordinates. `inv` is signed: negative fires the ray
+// backwards along the axis, which turns Eq. 3's saturate(0.5 + m*Cx) into
+// saturate(0.5 - m*Cx) without touching the winding math at all — the caller
+// negates the sum to undo the crossing-sign swap that goes with it.
+//
+// Returns (winding, bound). `bound` is how far along the ray the curve's
+// control points reach, in half-pixels from the sample: once it is below -0.5
+// the saturate is exactly 0 for this curve — and, because the list is sorted on
+// the same quantity, for every curve behind it.
 fn record_winding(
     block: Block,
     record: f32,
     em: vec2<f32>,
     offset: vec2<f32>,
-    inv_diameter: f32,
+    inv: f32,
     swap: bool,
-) -> f32 {
-    let curve = fetch_curve(block, u32(record));
+) -> vec2<f32> {
+    let pair = fetch_pair(block, u32(record));
+    let curve = blend_pair(pair, block.weight_t);
     var p0 = curve.p0 - em;
     var p1 = curve.p1 - em;
     var p2 = curve.p2 - em;
@@ -457,47 +540,130 @@ fn record_winding(
         p1 = p1.yx;
         p2 = p2.yx;
     }
-    return curve_winding(p0 - offset, p1 - offset, p2 - offset, inv_diameter);
+    let q0 = p0 - offset;
+    let q1 = p1 - offset;
+    let q2 = p2 - offset;
+    // Single master: the blended points ARE master A's, so this is the exact
+    // quantity `curves.rs` sorted the list on.
+    var bound = max(max(q0.x * inv, q1.x * inv), q2.x * inv);
+    if BLEND_MASTERS {
+        // Bounding the *blended* outline would be wrong here. The list was
+        // sorted by the maximum over both masters — a blended control point
+        // never leaves the masters' per-coordinate hull, so that key holds at
+        // every weight_t — and a tighter bound could end the loop in front of
+        // a curve that still crosses this ray.
+        bound = max(
+            ray_bound(pair.a0, pair.a1, pair.a2, em, offset.x, inv, swap),
+            ray_bound(pair.b0, pair.b1, pair.b2, em, offset.x, inv, swap),
+        );
+    }
+    return vec2<f32>(curve_winding(q0, q1, q2, inv), bound);
 }
 
-// Header entry `slot` (y-bands 0..BANDS, then x-bands): two entries per texel.
-fn band_entry(base: u32, slot: u32) -> vec2<f32> {
-    let texel = textureLoad(curve_tex, texel_coord(base + slot / 2u), 0);
-    return select(texel.zw, texel.xy, (slot & 1u) == 0u);
+// Header entry `slot` (y-bands 0..BANDS, then x-bands): one texel each,
+// (descending list offset, curve count, split coordinate, ascending list
+// offset).
+fn band_entry(base: u32, slot: u32) -> vec4<f32> {
+    return textureLoad(curve_tex, texel_coord(base + slot * BAND_ENTRY_TEXELS), 0);
 }
 
 fn band_of(coord: f32) -> u32 {
     return u32(clamp(i32(coord * f32(BANDS)), 0, i32(BANDS) - 1));
 }
 
-// Winding of every curve in one band's list. Indices come four to a texel;
-// the list order matches the flat loop's, and the curves it leaves out
-// contribute exactly zero, so both paths sum the same terms in the same order.
+// Winding of one band's list, walked until a curve falls behind the sample's
+// antialiasing window. Indices come four to a texel; the curves the band leaves
+// out — and the ones the early-out skips — contribute exactly zero, so the sum
+// is the flat loop's sum, in a different order.
+//
+// `eager` picks how often the break is tested. Off, it is tested once per
+// index texel, on the *last* curve of the four: the list is sorted, so that
+// curve's bound is the smallest of the group and deciding on it is just as
+// conservative, and the three curves a group can overrun contribute exactly
+// zero anyway. On, every curve is tested, which stops sooner but makes each
+// fetch wait on the previous one's compare instead of letting four issue
+// together. Big glyphs walk long lists and want the tighter test (0.54 vs 0.59
+// ms/frame in `examples/bench`); at 11 px the list is a texel or two long, the
+// break almost never fires, and paying the dependency chain for it cost 7% in
+// `examples/stress` — so it rides the same size gate the median split does.
 fn band_winding(
     block: Block,
-    entry: vec2<f32>,
+    list: u32,
+    count: u32,
+    em: vec2<f32>,
+    offset: vec2<f32>,
+    inv: f32,
+    swap: bool,
+    eager: bool,
+) -> f32 {
+    let base = block.base + list;
+    var wind = 0.0;
+    for (var i = 0u; i < count; i += 4u) {
+        let indices = textureLoad(curve_tex, texel_coord(base + i / 4u), 0);
+        let c0 = record_winding(block, indices.x, em, offset, inv, swap);
+        wind += c0.x;
+        var bound = c0.y;
+        if eager && c0.y < -0.5 {
+            break;
+        }
+        if i + 1u < count {
+            let c1 = record_winding(block, indices.y, em, offset, inv, swap);
+            wind += c1.x;
+            bound = c1.y;
+            if eager && c1.y < -0.5 {
+                break;
+            }
+        }
+        if i + 2u < count {
+            let c2 = record_winding(block, indices.z, em, offset, inv, swap);
+            wind += c2.x;
+            bound = c2.y;
+            if eager && c2.y < -0.5 {
+                break;
+            }
+        }
+        if i + 3u < count {
+            let c3 = record_winding(block, indices.w, em, offset, inv, swap);
+            wind += c3.x;
+            bound = c3.y;
+        }
+        if bound < -0.5 {
+            break;
+        }
+    }
+    return wind;
+}
+
+// One band, fired toward the nearer end of the glyph. A forward ray counts the
+// crossings ahead of the sample and stops at the first curve behind it, so it
+// is cheap on the high side of a band and dear on the low side; a backward ray
+// is the mirror image. Splitting at the median therefore roughly halves the
+// average walk: samples below the split fire backwards, samples above keep
+// going forwards.
+//
+// The two lists hold the same curves, so both directions compute the same
+// number: saturate(0.5 - m*Cx) = 1 - saturate(0.5 + m*Cx), and the crossing
+// signs of a closed contour sum to zero along the whole line, which is exactly
+// what swapping them (the -1 below) accounts for.
+//
+// The choice is made in *data*, not control flow — one loop, walked with a
+// different list offset and a flipped `inv`. Branching to two copies of the
+// loop instead costs far more than the split saves: neighbouring fragments
+// land on opposite sides of it all the time, and a warp then executes both.
+fn band_rays(
+    block: Block,
+    entry: vec4<f32>,
     em: vec2<f32>,
     offset: vec2<f32>,
     inv_diameter: f32,
     swap: bool,
+    big: bool,
 ) -> f32 {
-    let list = block.base + u32(entry.x);
-    let count = u32(entry.y);
-    var wind = 0.0;
-    for (var i = 0u; i < count; i += 4u) {
-        let indices = textureLoad(curve_tex, texel_coord(list + i / 4u), 0);
-        wind += record_winding(block, indices.x, em, offset, inv_diameter, swap);
-        if i + 1u < count {
-            wind += record_winding(block, indices.y, em, offset, inv_diameter, swap);
-        }
-        if i + 2u < count {
-            wind += record_winding(block, indices.z, em, offset, inv_diameter, swap);
-        }
-        if i + 3u < count {
-            wind += record_winding(block, indices.w, em, offset, inv_diameter, swap);
-        }
-    }
-    return wind;
+    let back = big && ray_coord(em, swap) < entry.z;
+    let list = select(u32(entry.x), u32(entry.w), back);
+    let inv = select(inv_diameter, -inv_diameter, back);
+    let sign = select(1.0, -1.0, back);
+    return sign * band_winding(block, list, u32(entry.y), em, offset, inv, swap, big);
 }
 
 @fragment
@@ -524,6 +690,9 @@ fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
     var wind_y = array<f32, 3>(0.0, 0.0, 0.0);
     // Uniform per primitive, so the branch stays coherent across the quad.
     if (in.count & BANDED_FLAG) != 0u {
+        // Big enough for the median split and the per-curve early-out; a
+        // small glyph's band lists are too short for either to pay off.
+        let big = max(fw.x, fw.y) * SPLIT_MIN_PX_PER_EM < 1.0;
         for (var tap = 0u; tap < taps; tap += 1u) {
             let off = (f32(tap) + 0.5) / f32(taps) - 0.5;
             // A tap can shift the ray across a band boundary at small sizes,
@@ -531,12 +700,12 @@ fn vector_fs(in: VectorOutput) -> @location(0) vec4<f32> {
             // fragment's — one extra header fetch buys exactness.
             let oy = vec2<f32>(0.0, off * fw.y);
             let y_band = band_of(in.fraction.y + off * fw.y * in.frac_per_em.y);
-            wind_x[tap] = band_winding(
-                block, band_entry(in.first, y_band), in.em, oy, inv_diameter.x, false);
+            wind_x[tap] = band_rays(
+                block, band_entry(in.first, y_band), in.em, oy, inv_diameter.x, false, big);
             let ox = vec2<f32>(0.0, off * fw.x);
             let x_band = band_of(in.fraction.x + off * fw.x * in.frac_per_em.x);
-            wind_y[tap] = band_winding(
-                block, band_entry(in.first, BANDS + x_band), in.em, ox, inv_diameter.y, true);
+            wind_y[tap] = band_rays(
+                block, band_entry(in.first, BANDS + x_band), in.em, ox, inv_diameter.y, true, big);
         }
     } else {
         for (var i = 0u; i < in.count; i += 1u) {

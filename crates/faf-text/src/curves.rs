@@ -26,17 +26,28 @@ pub const CURVE_TEX_MAX_HEIGHT: u32 = 8192;
 //
 // Banded block (`count` > `BAND_MIN_CURVES`):
 //
-//     [header]              BANDS texels: BANDS y-band then BANDS x-band
-//                           entries, each (list offset in texels from the
-//                           block base, curve count) — 2 entries per texel
-//     [index lists]         the 2*BANDS lists in header order, each starting
-//                           on a texel boundary, region padded to even
+//     [header]              2*BANDS texels: BANDS y-band then BANDS x-band
+//                           entries, one texel each — (descending list offset,
+//                           curve count, split coordinate, ascending list
+//                           offset), offsets in texels from the block base
+//     [index lists]         two lists per band (descending then ascending) in
+//                           header order, each starting on a texel boundary,
+//                           region padded to even
 //     [curve record 0]…     2 texels each
 //
 // A list entry is the texel offset of that curve's record from the block base
 // (float, exact to 2^24 — a glyph would need 8M texels to lose precision), so
 // the shader resolves a curve without knowing where the record region starts.
 // The two shapes are told apart by [`BANDED_FLAG`] in the instance's `count`.
+//
+// A band's two lists hold the *same* curves in opposite orders: descending by
+// the member's maximum coordinate along the ray axis for rays fired in the
+// +axis direction, ascending by its minimum for rays fired backwards. Control
+// points bound the curve (convex hull), so the shader can stop walking a list
+// the moment a fetched curve's bound has fallen behind the antialiasing
+// window — every curve after it is further behind still. `split` is the median
+// of the members' ray-axis midpoints: samples past it fire backwards, so
+// neither side of a glyph pays for the curves on the other.
 //
 // A glyph from a variable font with a `wght` axis stores a second master: the
 // same records extracted at the axis maximum, in a parallel region right after
@@ -52,9 +63,12 @@ const FLOATS_PER_CURVE: usize = TEXELS_PER_CURVE * FLOATS_PER_TEXEL;
 
 /// Bands per axis. Must match `BANDS` in `shaders.wgsl`.
 pub const BANDS: usize = 8;
-/// Texels the band header occupies: 2*BANDS entries × 2 floats, 4 floats per
-/// texel.
-const HEADER_TEXELS: usize = BANDS * 2 * 2 / FLOATS_PER_TEXEL;
+/// Texels per band header entry: (descending list offset, curve count, split
+/// coordinate, ascending list offset) — one texel. Must match
+/// `BAND_ENTRY_TEXELS` in `shaders.wgsl`.
+pub const BAND_ENTRY_TEXELS: usize = 1;
+/// Texels the band header occupies: 2*BANDS entries, one texel each.
+const HEADER_TEXELS: usize = BANDS * 2 * BAND_ENTRY_TEXELS;
 /// Glyphs with more curves than this get band tables; at or below it the flat
 /// loop is cheaper than the indirection.
 const BAND_MIN_CURVES: u32 = 16;
@@ -666,6 +680,27 @@ fn control_span(record: &[f32], axis: usize) -> (f32, f32) {
     )
 }
 
+/// Every curve's control-point range along one axis, spanning both masters.
+///
+/// A blended control point is a lerp of the two masters' and so never leaves
+/// their per-coordinate hull: one span bounds the glyph at every `weight_t`.
+/// Both band membership and the early-out sort keys ride on that.
+fn spans(records: &[f32], b_records: Option<&[f32]>, axis: usize) -> Vec<(f32, f32)> {
+    records
+        .chunks_exact(FLOATS_PER_CURVE)
+        .enumerate()
+        .map(|(index, record)| {
+            let (mut lo, mut hi) = control_span(record, axis);
+            if let Some(b) = b_records {
+                let (b_lo, b_hi) = control_span(&b[index * FLOATS_PER_CURVE..], axis);
+                lo = lo.min(b_lo);
+                hi = hi.max(b_hi);
+            }
+            (lo, hi)
+        })
+        .collect()
+}
+
 /// Curve indices per band along one axis of `[min, max]` (`axis` 0 = x,
 /// 1 = y), for curves already packed as flat records.
 ///
@@ -688,13 +723,7 @@ fn band_lists(
     let eps = height * BAND_EPSILON;
     let last_band = (BANDS - 1) as f32;
     let mut lists = vec![Vec::new(); BANDS];
-    for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
-        let (mut lo, mut hi) = control_span(record, axis);
-        if let Some(b) = b_records {
-            let (b_lo, b_hi) = control_span(&b[index * FLOATS_PER_CURVE..], axis);
-            lo = lo.min(b_lo);
-            hi = hi.max(b_hi);
-        }
+    for (index, (lo, hi)) in spans(records, b_records, axis).into_iter().enumerate() {
         let first = (((lo - eps - min) / height).floor()).clamp(0.0, last_band) as usize;
         let last = (((hi + eps - min) / height).floor()).clamp(0.0, last_band) as usize;
         for list in &mut lists[first..=last] {
@@ -704,36 +733,103 @@ fn band_lists(
     lists
 }
 
+/// One band's membership, ordered for both ray directions, plus the
+/// coordinate that decides which direction a sample fires in.
+struct Band {
+    /// Members ordered by *decreasing* maximum coordinate along the ray axis.
+    /// A ray fired in the +axis direction meets them far end first, so the
+    /// first curve whose maximum has dropped behind the sample's antialiasing
+    /// window ends the loop: every curve after it is further behind still.
+    descending: Vec<u32>,
+    /// The same members ordered by *increasing* minimum coordinate, for the
+    /// rays the median split fires in the -axis direction.
+    ascending: Vec<u32>,
+    /// Median of the members' ray-axis midpoints; samples past it fire
+    /// backwards.
+    split: f32,
+}
+
+/// The bands along one axis of `[min, max]`, with each band's list sorted for
+/// the shader's early-out and its median split computed.
+///
+/// The sort keys span both masters (see [`spans`]), which is what keeps the
+/// early-out conservative at every `weight_t`: the shader compares the same
+/// two-master extreme, and the blended outline can only sit inside it. Sorting
+/// on master A alone would let a blend toward B put a curve that still crosses
+/// the ray behind the curve that ends the loop.
+fn bands(records: &[f32], b_records: Option<&[f32]>, axis: usize, min: f32, max: f32) -> Vec<Band> {
+    // Rays run across the banding axis: y-bands are crossed by horizontal
+    // rays, x-bands by vertical ones.
+    let spans = spans(records, b_records, 1 - axis);
+    band_lists(records, b_records, axis, min, max)
+        .into_iter()
+        .map(|members| {
+            let mut descending = members.clone();
+            descending.sort_by(|a, b| spans[*b as usize].1.total_cmp(&spans[*a as usize].1));
+            let mut ascending = members;
+            ascending.sort_by(|a, b| spans[*a as usize].0.total_cmp(&spans[*b as usize].0));
+            Band {
+                split: median_split(&ascending, &spans),
+                descending,
+                ascending,
+            }
+        })
+        .collect()
+}
+
+/// Where to split a band: the median of its members' ray-axis midpoints. A
+/// sample sitting there has about half the band's curves ahead of it and half
+/// behind, so the early-out fires after a similar number of fetches whichever
+/// way the ray goes. An empty band never reaches the shader, and 0.0 is as
+/// good a coordinate as any for it.
+fn median_split(members: &[u32], spans: &[(f32, f32)]) -> f32 {
+    if members.is_empty() {
+        return 0.0;
+    }
+    let mut mids: Vec<f32> = members
+        .iter()
+        .map(|&i| (spans[i as usize].0 + spans[i as usize].1) * 0.5)
+        .collect();
+    mids.sort_by(f32::total_cmp);
+    mids[mids.len() / 2]
+}
+
 /// Lay out a banded block: header, index lists, then master A's curve records
 /// and master B's parallel copy. See the record-layout comment at the top of
 /// this file.
 fn banded_block(records: &[f32], b_records: Option<&[f32]>, bbox: [f32; 4]) -> Vec<f32> {
-    let mut lists = band_lists(records, b_records, 1, bbox[1], bbox[3]);
-    lists.extend(band_lists(records, b_records, 0, bbox[0], bbox[2]));
+    let mut table = bands(records, b_records, 1, bbox[1], bbox[3]);
+    table.extend(bands(records, b_records, 0, bbox[0], bbox[2]));
 
-    // Lists start on texel boundaries (the shader walks them four at a time)
-    // and the region as a whole is padded to an even texel count, which keeps
-    // the records that follow two-texel aligned.
-    let list_texels: usize = lists
+    // Two lists per band — same members, opposite orders. Each starts on a
+    // texel boundary (the shader walks them four at a time) and the region as
+    // a whole is padded to an even texel count, which keeps the records that
+    // follow two-texel aligned.
+    let list_texels: usize = table
         .iter()
-        .map(|list| list.len().div_ceil(FLOATS_PER_TEXEL))
+        .map(|band| 2 * band.descending.len().div_ceil(FLOATS_PER_TEXEL))
         .sum::<usize>()
         .next_multiple_of(TEXELS_PER_CURVE);
     let records_offset = HEADER_TEXELS + list_texels;
 
     let mut block = Vec::with_capacity(records_offset * FLOATS_PER_TEXEL + records.len());
     let mut offset = HEADER_TEXELS;
-    for list in &lists {
+    for band in &table {
+        let texels = band.descending.len().div_ceil(FLOATS_PER_TEXEL);
         block.push(offset as f32);
-        block.push(list.len() as f32);
-        offset += list.len().div_ceil(FLOATS_PER_TEXEL);
+        block.push(band.descending.len() as f32);
+        block.push(band.split);
+        block.push((offset + texels) as f32);
+        offset += 2 * texels;
     }
     debug_assert_eq!(block.len(), HEADER_TEXELS * FLOATS_PER_TEXEL);
-    for list in &lists {
-        for &index in list {
-            block.push((records_offset + index as usize * TEXELS_PER_CURVE) as f32);
+    for band in &table {
+        for list in [&band.descending, &band.ascending] {
+            for &index in list {
+                block.push((records_offset + index as usize * TEXELS_PER_CURVE) as f32);
+            }
+            block.resize(block.len().next_multiple_of(FLOATS_PER_TEXEL), 0.0);
         }
-        block.resize(block.len().next_multiple_of(FLOATS_PER_TEXEL), 0.0);
     }
     block.resize(records_offset * FLOATS_PER_TEXEL, 0.0);
     block.extend_from_slice(records);
@@ -1132,15 +1228,23 @@ mod tests {
         }
     }
 
+    /// One band as the shader reads it back out of a block.
+    struct DecodedBand {
+        /// Members in the order the forward ray walks them.
+        descending: Vec<u32>,
+        /// Members in the order the backward ray walks them.
+        ascending: Vec<u32>,
+        split: f32,
+    }
+
     /// Decode a banded block the way the shader does: header entry per band,
-    /// index list, curve records. Returns each band's resolved curve indices.
-    fn decode_bands(block: &[f32], count: u32, bbox: [f32; 4]) -> Vec<Vec<u32>> {
+    /// its two index lists, curve records.
+    fn decode_bands(block: &[f32], count: u32, bbox: [f32; 4]) -> Vec<DecodedBand> {
         let records_offset = block.len() / FLOATS_PER_TEXEL - count as usize * TEXELS_PER_CURVE;
         let mut decoded = Vec::new();
         for slot in 0..2 * BANDS {
-            let list = block[slot * 2] as usize;
-            let len = block[slot * 2 + 1] as usize;
-            assert!(list >= HEADER_TEXELS && list + len.div_ceil(4) <= records_offset);
+            let entry = &block[slot * FLOATS_PER_TEXEL..][..FLOATS_PER_TEXEL];
+            let len = entry[1] as usize;
             let axis = if slot < BANDS { 1 } else { 0 };
             let band = slot % BANDS;
             let height = (bbox[axis + 2] - bbox[axis]) / BANDS as f32;
@@ -1150,25 +1254,39 @@ mod tests {
             );
             let eps = height * BAND_EPSILON;
 
-            let mut indices = Vec::new();
-            for i in 0..len {
-                let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
-                assert!(texel >= records_offset, "list entry points into the header");
-                assert_eq!((texel - records_offset) % TEXELS_PER_CURVE, 0);
-                let start = texel * FLOATS_PER_TEXEL;
-                let record = &block[start..start + FLOATS_PER_CURVE];
-                let coords = [record[axis], record[2 + axis], record[4 + axis]];
-                let curve_lo = coords.iter().copied().fold(f32::INFINITY, f32::min);
-                let curve_hi = coords.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                assert!(
-                    curve_hi >= lo - eps && curve_lo <= hi + eps,
-                    "band {slot} lists a curve it does not overlap"
-                );
-                indices.push(((texel - records_offset) / TEXELS_PER_CURVE) as u32);
+            let mut lists = Vec::new();
+            for list in [entry[0] as usize, entry[3] as usize] {
+                assert!(list >= HEADER_TEXELS && list + len.div_ceil(4) <= records_offset);
+                let mut indices = Vec::new();
+                for i in 0..len {
+                    let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
+                    assert!(texel >= records_offset, "list entry points into the header");
+                    assert_eq!((texel - records_offset) % TEXELS_PER_CURVE, 0);
+                    let start = texel * FLOATS_PER_TEXEL;
+                    let record = &block[start..start + FLOATS_PER_CURVE];
+                    let coords = [record[axis], record[2 + axis], record[4 + axis]];
+                    let curve_lo = coords.iter().copied().fold(f32::INFINITY, f32::min);
+                    let curve_hi = coords.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    assert!(
+                        curve_hi >= lo - eps && curve_lo <= hi + eps,
+                        "band {slot} lists a curve it does not overlap"
+                    );
+                    indices.push(((texel - records_offset) / TEXELS_PER_CURVE) as u32);
+                }
+                lists.push(indices);
             }
-            decoded.push(indices);
+            decoded.push(DecodedBand {
+                descending: lists[0].clone(),
+                ascending: lists[1].clone(),
+                split: entry[2],
+            });
         }
         decoded
+    }
+
+    /// A curve's control-point span along `axis`, straight out of a record.
+    fn record_span(records: &[f32], index: u32, axis: usize) -> (f32, f32) {
+        control_span(&records[index as usize * FLOATS_PER_CURVE..], axis)
     }
 
     #[test]
@@ -1215,11 +1333,12 @@ mod tests {
         assert_eq!(banded.texels % 2, 0);
 
         // Every band resolves to curves it overlaps (checked in decode_bands),
-        // and no curve that overlaps a band is missing from it.
+        // and no curve that overlaps a band is missing from either of its two
+        // lists.
         let block = slice_of(&store, &banded);
         let decoded = decode_bands(&block, banded.count, banded.bbox);
         let records = &block[block.len() - banded.count as usize * FLOATS_PER_CURVE..];
-        for (slot, indices) in decoded.iter().enumerate() {
+        for (slot, band) in decoded.iter().enumerate() {
             let axis = if slot < BANDS { 1 } else { 0 };
             let expected = &band_lists(
                 records,
@@ -1228,14 +1347,73 @@ mod tests {
                 banded.bbox[axis],
                 banded.bbox[axis + 2],
             )[slot % BANDS];
-            assert_eq!(indices, expected, "band {slot} lost curves");
+            for list in [&band.descending, &band.ascending] {
+                let mut sorted = list.clone();
+                sorted.sort_unstable();
+                assert_eq!(&sorted, expected, "band {slot} lost curves");
+            }
         }
         assert!(
             decoded
                 .iter()
-                .any(|band| band.len() < banded.count as usize),
+                .any(|band| band.descending.len() < banded.count as usize),
             "banding should cut some band's loop below the full curve set"
         );
+    }
+
+    /// The property the shader's early-out rests on: walking a band's list
+    /// forwards, a curve's maximum along the ray axis never rises again, so
+    /// the first curve whose maximum has fallen behind the sample proves every
+    /// curve after it has too (and the mirror image for the backward ray).
+    #[test]
+    fn band_lists_are_sorted_by_the_ray_axis_extremes_the_shader_breaks_on() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let banded = (36..200)
+            .filter_map(|glyph_id| get(&mut store, &mut font_system, font_id, glyph_id))
+            .find(|c| c.banded)
+            .expect("some glyph exceeds the banding threshold");
+        let block = slice_of(&store, &banded);
+        let decoded = decode_bands(&block, banded.count, banded.bbox);
+        let records = &block[block.len() - banded.count as usize * FLOATS_PER_CURVE..];
+
+        let mut split_inside = 0;
+        for (slot, band) in decoded.iter().enumerate() {
+            // Rays run across the banding axis: y-bands are crossed by
+            // horizontal rays, x-bands by vertical ones.
+            let ray = if slot < BANDS { 0 } else { 1 };
+            for pair in band.descending.windows(2) {
+                let (a, b) = (
+                    record_span(records, pair[0], ray).1,
+                    record_span(records, pair[1], ray).1,
+                );
+                assert!(a >= b, "band {slot} is not descending by maximum");
+            }
+            for pair in band.ascending.windows(2) {
+                let (a, b) = (
+                    record_span(records, pair[0], ray).0,
+                    record_span(records, pair[1], ray).0,
+                );
+                assert!(a <= b, "band {slot} is not ascending by minimum");
+            }
+            // The split is a coordinate the band's own curves reach, and it
+            // leaves work on both sides: neither direction is a no-op.
+            if let (Some(&first), Some(&last)) = (band.ascending.first(), band.descending.first()) {
+                let lo = record_span(records, first, ray).0;
+                let hi = record_span(records, last, ray).1;
+                assert!(
+                    band.split >= lo && band.split <= hi,
+                    "band {slot} split {} is outside [{lo}, {hi}]",
+                    band.split
+                );
+                split_inside += 1;
+            }
+        }
+        assert!(split_inside > 0, "the glyph should have populated bands");
     }
 
     #[test]
@@ -1244,6 +1422,7 @@ mod tests {
         for expected in [
             format!("const CURVE_TEX_WIDTH: u32 = {CURVE_TEX_WIDTH}u;"),
             format!("const BANDS: u32 = {BANDS}u;"),
+            format!("const BAND_ENTRY_TEXELS: u32 = {BAND_ENTRY_TEXELS}u;"),
             format!("const BANDED_FLAG: u32 = 0x{BANDED_FLAG:08X}u;"),
         ] {
             assert!(
@@ -1433,14 +1612,16 @@ mod tests {
         let a_texels = banded.count as usize * TEXELS_PER_CURVE;
 
         for slot in 0..2 * BANDS {
-            let list = block[slot * 2] as usize;
-            let len = block[slot * 2 + 1] as usize;
-            for i in 0..len {
-                let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
-                assert!(
-                    (records_offset..records_offset + a_texels).contains(&texel),
-                    "band {slot} points outside master A's records"
-                );
+            let entry = &block[slot * FLOATS_PER_TEXEL..][..FLOATS_PER_TEXEL];
+            let len = entry[1] as usize;
+            for list in [entry[0] as usize, entry[3] as usize] {
+                for i in 0..len {
+                    let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
+                    assert!(
+                        (records_offset..records_offset + a_texels).contains(&texel),
+                        "band {slot} points outside master A's records"
+                    );
+                }
             }
         }
         // Membership is decided over both masters, so a blended curve can
@@ -1449,8 +1630,31 @@ mod tests {
             .iter()
             .enumerate()
         {
-            let expected = block[slot * 2 + 1] as usize;
+            let expected = block[slot * FLOATS_PER_TEXEL + 1] as usize;
             assert_eq!(list.len(), expected, "y-band {slot} lost curves");
+        }
+
+        // …and the sort keys span both masters too. The shader's early-out
+        // compares the same two-master extreme, so a list ordered by master A
+        // alone could break off in front of a curve that a blend toward B has
+        // pushed back across the ray.
+        let ray_spans = spans(&a, Some(&b), 0);
+        for (slot, band) in bands(&a, Some(&b), 1, banded.bbox[1], banded.bbox[3])
+            .iter()
+            .enumerate()
+        {
+            for pair in band.descending.windows(2) {
+                assert!(
+                    ray_spans[pair[0] as usize].1 >= ray_spans[pair[1] as usize].1,
+                    "y-band {slot} is not descending by the two-master maximum"
+                );
+            }
+            for pair in band.ascending.windows(2) {
+                assert!(
+                    ray_spans[pair[0] as usize].0 <= ray_spans[pair[1] as usize].0,
+                    "y-band {slot} is not ascending by the two-master minimum"
+                );
+            }
         }
     }
 

@@ -129,6 +129,39 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   range overlaps it ±5% of a band height — leave a curve out and its winding
   contribution is exactly 0.0, which is why banding is bit-for-bit
   pixel-identical to the flat loop (assert this with the offscreen example).
+- Sorted band lists + early-out + median split (#12) keep that bit-identity:
+  every skipped curve contributes exactly 0.0, and reordering the adds turns
+  out not to matter because a band+ray almost never has more than two *nonzero*
+  terms (addition of two floats is commutative to the bit). `offscreen.png` and
+  `panes3d.png` md5s are unchanged, and so is `band_tables_do_not_move_a_single_pixel`,
+  which now also renders at 40px so the backward-ray path is covered.
+- **The backward ray fires toward the *near* edge of the glyph, not the far
+  one.** A forward (+axis) ray counts crossings *ahead* of the sample and stops
+  at the first curve behind it, so it is cheap on the high side of a band and
+  dear on the low side; samples below the median split must therefore fire
+  backwards. Getting that comparison inverted still renders correctly (the two
+  directions are mathematically equal) and cost 45% — `bench` went 0.63 → 0.85
+  instead of → 0.59. Correct-but-slow is the failure mode to watch for here.
+- Backward rays need no branch in `curve_winding`: pass a **negative**
+  `inv_diameter` (which turns saturate(0.5 + m·Cx) into saturate(0.5 − m·Cx))
+  and negate the band's sum (which undoes the crossing-sign swap). The identity
+  saturate(0.5 − x) = 1 − saturate(0.5 + x) plus "signed crossings over a whole
+  line sum to zero" makes the two directions agree exactly.
+- Pick the ray direction with `select`, never with an `if` around two copies of
+  the loop: neighbouring fragments land on opposite sides of a split constantly,
+  and a warp executing both copies eats the whole win.
+- The early-out's *granularity* is size-dependent and that is worth 7%: testing
+  the break after every curve makes each fetch wait on the previous compare,
+  which is a loss at 11px (`stress` 1.87 → 2.0) and a win at 32px (`bench` 0.59
+  → 0.54). Below the size gate the break is tested once per index texel, on the
+  last of the four — the list is sorted, so that curve's bound is the smallest
+  of the group and the test is just as conservative.
+- A sorted list's key must bound **both** masters (max over A's and B's control
+  points), and the shader's early-out has to compare that same two-master
+  number — not the blended outline's max, which is smaller and would break the
+  loop in front of a curve that still crosses the ray. `fetch_pair` keeps the
+  masters apart for exactly that; `fetch_curve` is `blend_pair(fetch_pair(…))`
+  so the flat path is unchanged.
 - Variable weight: a `wght` face is extracted at both axis ends and master B's
   records go in a parallel region after A's, so one constant (`b_offset =
   count * 2` texels) reaches any twin and band lists keep indexing A. Band

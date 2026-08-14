@@ -2357,8 +2357,12 @@ mod tests {
         let mut font_system = testing::font_system();
         // Every one of these glyphs clears the 16-curve banding threshold. 11px
         // takes the three-tap path, where a tap's ray offset can land in
-        // another band; 30px takes the single-ray one.
-        for size in [11.0, 30.0] {
+        // another band; 30px takes the single-ray one; 40px additionally clears
+        // SPLIT_MIN_PX_PER_EM, so half its samples fire their rays *backwards*
+        // off the band's second list — the same coverage by a different route
+        // (saturate(0.5 - m*Cx) = 1 - saturate(0.5 + m*Cx), crossing signs
+        // swapped), and this asserts it lands on the same bytes.
+        for size in [11.0, 30.0, 40.0] {
             let sample = view(&mut font_system, "Q@g&%8", size, [6.0, 6.0]);
             let mut with_bands = renderer(2048, 2048);
             let banded = frame(&mut with_bands, &mut font_system, &sample, None);

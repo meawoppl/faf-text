@@ -45,8 +45,12 @@ shader decides inside/outside per pixel:
 - Glyphs past 16 curves carry per-axis **band tables** ahead of their curve
   data: eight bands per axis, each listing only the curves that can cross a ray
   in it, so a fragment loops over a fraction of the glyph instead of all of it.
-  Coverage is unchanged to the bit — a curve a band leaves out contributes
-  exactly zero.
+  Each band's list is **sorted along the ray**, so the loop stops at the first
+  curve the antialiasing window has left behind, and a band is **split at its
+  median**: samples on the low side fire their ray backwards, off a second list
+  sorted the other way, so no sample walks the curves on the far side of the
+  glyph from it. Coverage is unchanged to the bit — a curve a band leaves out,
+  or the early-out skips, contributes exactly zero.
 
 Because coverage is analytic, glyphs get **true subpixel positioning** (no
 snapping, no subpixel atlas bins) and **free scaling** — zooming re-rasterizes
