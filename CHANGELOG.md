@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-14
+
+- Band lists are sorted so each ray stops at the first curve past its
+  antialiasing window, and bands split at the median of their curves with rays
+  on each side firing toward the near edge. The Lengyel-2017 benchmark drops
+  from 0.64 to 0.54 ms/frame at 32 px/em with output byte-identical; small
+  sizes keep the previous path via the existing size gate.
 
 - Corner-clipped glyph geometry above 48 px/em: each corner of a glyph's quad
   is cut back to the outline's own support plane along the diagonal, turning
