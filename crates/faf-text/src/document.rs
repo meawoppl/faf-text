@@ -39,11 +39,14 @@ const EST_ADVANCE_RATIO: f32 = 0.55;
 /// **within that line** (the same convention as [`Cursor::index`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DocCursor {
+    /// Line index across the whole document, not within a chunk.
     pub line: usize,
+    /// Byte offset into that line's text, excluding the newline.
     pub byte: usize,
 }
 
 impl DocCursor {
+    /// A cursor at `byte` within `line`.
     pub const fn new(line: usize, byte: usize) -> Self {
         Self { line, byte }
     }
@@ -73,6 +76,31 @@ struct Chunk {
 }
 
 /// A large body of text that shapes lazily, one viewport at a time.
+///
+/// The text is split into [`CHUNK_LINES`]-line chunks. Only the chunks
+/// covering the viewport (± [`WINDOW_CHUNKS`]) are shaped into [`TextView`]s;
+/// chunks that drift more than [`RETAIN_CHUNKS`] away are dropped and
+/// re-shaped if they come back. Unshaped chunks contribute an *estimated*
+/// height, so scrolling never has to shape the whole file to know how tall it
+/// is, and every estimate is replaced by a measurement the first time its
+/// chunk lays out.
+///
+/// ```no_run
+/// use faf_text::{Attrs, Document, Metrics};
+///
+/// let mut fonts = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS]);
+/// let mut doc = Document::new(Metrics::new(16.0, 22.0));
+/// doc.set_attrs(&Attrs::new());
+/// doc.set_text(&std::fs::read_to_string("war-and-peace.txt").unwrap());
+///
+/// // Shape only what a 900×600 pane scrolled to y = 12_000 can see.
+/// doc.set_viewport(&mut fonts, 900.0, 12_000.0, 600.0);
+/// for view in doc.visible() {
+///     // `view.pos` is in document space: subtract `doc.scroll_y()` to draw.
+///     let _ = view.pos;
+/// }
+/// assert!(doc.stats().resident_chunks < doc.chunk_count());
+/// ```
 pub struct Document {
     text: String,
     /// Byte offset of every line start. Always begins with 0, so
@@ -102,6 +130,8 @@ pub struct Document {
 }
 
 impl Document {
+    /// An empty document laid out at `metrics`. Give it text with
+    /// [`Document::set_text`] and a window with [`Document::set_viewport`].
     pub fn new(metrics: Metrics) -> Self {
         let mut doc = Self {
             text: String::new(),
@@ -125,11 +155,13 @@ impl Document {
     }
 
     /// Default attributes for every shaped chunk. Invalidates shaped chunks.
+    /// Set the attributes every chunk is shaped with. Invalidates shaping.
     pub fn set_attrs(&mut self, attrs: &Attrs) {
         self.attrs = AttrsOwned::new(attrs);
         self.invalidate_shaping();
     }
 
+    /// Font size and line height the document is laid out at.
     pub fn metrics(&self) -> Metrics {
         self.metrics
     }
@@ -171,6 +203,7 @@ impl Document {
         &self.text
     }
 
+    /// Lines in the document. A trailing newline does not add one.
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
     }
@@ -187,14 +220,18 @@ impl Document {
         *self.tops.last().unwrap_or(&0.0)
     }
 
+    /// Top of the viewport in document px, as the last
+    /// [`Document::set_viewport`] left it.
     pub fn scroll_y(&self) -> f32 {
         self.scroll_y
     }
 
+    /// Height of the viewport in px.
     pub fn viewport_height(&self) -> f32 {
         self.viewport_h
     }
 
+    /// Shaping and eviction counters, for tests and diagnostics.
     pub fn stats(&self) -> DocStats {
         self.stats
     }

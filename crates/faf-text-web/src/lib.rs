@@ -1,6 +1,77 @@
-//! wasm-bindgen glue: binds the faf-text renderer to an HTML canvas with
-//! pointer-driven selection, keyboard editing, IME composition and search
-//! highlighting.
+//! wasm-bindgen glue: binds the [faf-text](faf_text) renderer to an HTML
+//! canvas with pointer-driven selection, keyboard editing, IME composition,
+//! search highlighting, a 3D tilt and a display-only terminal mode.
+//!
+//! Everything is exposed through one JS class, [`FafTextDemo`]. It drives the
+//! demo page at `web/index.html` and, compiled to gh-pages, the live cells in
+//! faf-text's own rustdoc.
+//!
+//! # The canvas API
+//!
+//! ```js
+//! import init, { FafTextDemo } from './pkg/faf_text_web.js';
+//! await init();
+//!
+//! // wgpu cannot recover from a browser that exposes `navigator.gpu` but
+//! // returns a null adapter, so probe from JS and ask for WebGL2 instead.
+//! let forceGl = true;
+//! try { forceGl = !(navigator.gpu && await navigator.gpu.requestAdapter()); } catch {}
+//!
+//! const canvas = document.getElementById('canvas');
+//! const dpr = window.devicePixelRatio || 1;
+//! canvas.width = Math.round(canvas.clientWidth * dpr);
+//! canvas.height = Math.round(canvas.clientHeight * dpr);
+//!
+//! const demo = await FafTextDemo.attach(canvas, dpr, forceGl);
+//! demo.set_text('Every pixel of this solves the winding rule.');
+//! demo.set_search('winding');
+//! requestAnimationFrame(function tick(t) {
+//!   demo.set_weight_blend(0.5 + 0.5 * Math.sin(t / 700)); // free: a GPU lerp
+//!   demo.render();                                        // false when idle
+//!   requestAnimationFrame(tick);
+//! });
+//! ```
+//!
+//! The surface is created by [`FafTextDemo::attach`], which prefers WebGPU and
+//! falls back to WebGL2; [`FafTextDemo::backend`] reports which one it got, and
+//! [`FafTextDemo::resize`] re-configures it. Sizes crossing this boundary are
+//! **physical pixels** (CSS pixels × `devicePixelRatio`) except
+//! [`FafTextDemo::set_font_size`], which is CSS px, and
+//! [`FafTextDemo::caret_css_rect`], which comes back in CSS px so an IME input
+//! can be parked on the caret.
+//!
+//! Groups of methods:
+//!
+//! - **Content and editing** — [`set_text`](FafTextDemo::set_text),
+//!   [`text`](FafTextDemo::text), [`insert_text`](FafTextDemo::insert_text),
+//!   [`key_input`](FafTextDemo::key_input) (raw `KeyboardEvent.key`; returns
+//!   whether to `preventDefault`), and the
+//!   [`composition_start`](FafTextDemo::composition_start) /
+//!   [`composition_update`](FafTextDemo::composition_update) /
+//!   [`composition_end`](FafTextDemo::composition_end) trio, which shapes IME
+//!   preedit text inline and underlined.
+//! - **Pointer and selection** — [`pointer_down`](FafTextDemo::pointer_down),
+//!   [`pointer_move`](FafTextDemo::pointer_move),
+//!   [`pointer_up`](FafTextDemo::pointer_up),
+//!   [`selected_text`](FafTextDemo::selected_text). Under a 3D tilt these cast
+//!   a ray onto the pane's own plane instead of reading a pixel, so selection
+//!   lands on the same words it would flat.
+//! - **Search** — [`set_search`](FafTextDemo::set_search) and
+//!   [`set_search_mode`](FafTextDemo::set_search_mode), which marks matches as
+//!   a highlight rect or as an `underline`, `squiggle` or `chip` out of the
+//!   decoration pipeline.
+//! - **Animation** — [`set_font_size`](FafTextDemo::set_font_size),
+//!   [`set_weight_blend`](FafTextDemo::set_weight_blend) (a fragment-shader
+//!   lerp between the variable font's two masters) and
+//!   [`set_tilt`](FafTextDemo::set_tilt). All three are cheap enough to drive
+//!   from a per-frame sine; only the font size re-shapes.
+//! - **Terminal** — [`set_terminal`](FafTextDemo::set_terminal) swaps the
+//!   editable pane for a synthetic colored log streaming through a
+//!   [`TermGrid`]. The editable blocks are hidden, not
+//!   destroyed, so toggling back restores the text, caret and selection.
+//! - **Frames** — [`render`](FafTextDemo::render) returns `false` when the
+//!   scene graph reports no damage: nothing was recorded and nothing was
+//!   presented, so an idle demo really does cost zero draw calls.
 
 use std::ops::Range;
 

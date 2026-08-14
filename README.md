@@ -3,6 +3,26 @@
 A GPU text renderer that is fast as f***. Native and WebAssembly, WebGPU and
 WebGL2, one code path.
 
+![faf-text](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/hero.png)
+
+**[Try the live demo →](https://meawoppl.github.io/faf-text/demo/)** · [docs.rs](https://docs.rs/faf-text)
+
+Glyph outlines are evaluated *per pixel* in the fragment shader with the
+non-zero winding rule. There is no atlas for outlines, no SDF bake and no MSAA,
+so scaling is free, positioning is exactly subpixel, and text stays correctly
+antialiased at any angle in 3D.
+
+| | |
+| --- | --- |
+| ![font size sweeping 10 to 80 px](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/zoom.apng) | ![a variable font's weight axis blended on the GPU](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/weight.apng) |
+| **Zoom re-rasterizes nothing.** The curve data is byte-identical in every frame. | **Variable weight is a GPU lerp** between two masters, mixed before the winding test. |
+| ![a pane of text turning in 3D](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/tilt.apng) | ![a colored log streaming through a terminal grid](https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/terminal.apng) |
+| **A pane in 3D costs one matrix a frame.** Coverage is measured on the projected glyph. | **Terminal cells skip the shaper entirely,** and box drawing is generated, not shaped. |
+
+Those are animated PNGs, rendered headless by `cargo run --example gallery -p
+faf-text` and served from the `gh-pages` branch; on [docs.rs](https://docs.rs/faf-text)
+the same four cells are live wasm canvases.
+
 ## How it works
 
 **Glyphs are rendered from their outlines, on the GPU, every frame.** Each
@@ -170,6 +190,13 @@ Web demo:
 wasm-pack build crates/faf-text-web --target web --out-dir ../../web/pkg --release
 python3 -m http.server -d web 8000
 # open http://localhost:8000
+```
+
+Documentation assets and the `gh-pages` tree:
+
+```sh
+cargo run --release --example gallery -p faf-text  # site/gallery/*.png, *.apng
+scripts/build-site.sh                              # site/ = landing + demo + gallery
 ```
 
 ## Current limitations

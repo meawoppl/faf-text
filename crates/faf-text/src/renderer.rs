@@ -76,7 +76,9 @@ pub enum Subpixel {
 ///   [`Subpixel::Rgb`]); the panel's stripe order and geometry it cannot know.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RendererOptions {
+    /// The space coverage is composited in.
     pub blend: CoverageBlend,
+    /// Whether coverage is sampled per LCD stripe.
     pub subpixel: Subpixel,
 }
 
@@ -256,7 +258,11 @@ pub enum DecorationKind {
     Squiggle,
     /// A rounded-rect background: inline code, pills, tags. Drawn *under* the
     /// glyphs, unlike the line kinds.
-    Chip { radius_px: f32 },
+    Chip {
+        /// Corner radius in px. The shader clamps it to half the shorter side,
+        /// so an over-large radius yields a stadium rather than a mess.
+        radius_px: f32,
+    },
 }
 
 impl DecorationKind {
@@ -338,12 +344,15 @@ impl DecorationInstance {
 /// keys, so a grid and a prose pane share glyph data.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphSpec {
+    /// Face the glyph id belongs to.
     pub font_id: fontdb::ID,
+    /// Glyph id within that face — from the charmap, not a character.
     pub glyph_id: u16,
     /// Em size in px, as a shaped glyph's `font_size`.
     pub font_size: f32,
     /// Pen position: the glyph's baseline origin, block-local px.
     pub pos: [f32; 2],
+    /// Color for this glyph, overriding the block's default.
     pub color: Color,
     /// Weight the glyph is fetched at. On a variable face this picks the
     /// `wght` blend; on a static one it only keys the cache, so
@@ -570,6 +579,55 @@ impl Scratch {
 /// The immediate-mode API ([`TextRenderer::begin`], [`TextRenderer::rect`],
 /// [`TextRenderer::text`], [`TextRenderer::finish`]) is a thin wrapper over one
 /// internal block that is rebuilt every frame.
+///
+/// # Retained blocks
+///
+/// ```no_run
+/// use faf_text::{Attrs, BlockContent, Color, Family, Metrics, TextRenderer, TextView};
+///
+/// # fn demo(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) {
+/// let mut fonts = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS]);
+/// let mut renderer = TextRenderer::new(device, format);
+///
+/// let mut view = TextView::new(&mut fonts, Metrics::new(18.0, 26.0));
+/// view.set_text(&mut fonts, "retained", &Attrs::new().family(Family::SansSerif));
+///
+/// let block = renderer.create_block();
+/// renderer.set_block_content(
+///     queue,
+///     &mut fonts,
+///     block,
+///     &BlockContent {
+///         buffer: Some(&view.buffer),
+///         default_color: Color::WHITE,
+///         ..Default::default()
+///     },
+/// );
+///
+/// // Later frames: scrolling writes one uniform and re-uploads no instance.
+/// loop {
+///     renderer.begin_frame();
+///     renderer.set_block_offset(block, [40.0, 40.0]);
+///     renderer.finish(device, queue, [960.0, 600.0]);
+///     if !renderer.damaged() {
+///         continue; // nothing changed: skip recording and presenting
+///     }
+///     // ...record a render pass and call `renderer.render(&mut pass)`.
+/// }
+/// # }
+/// ```
+///
+/// # Immediate mode
+///
+/// ```no_run
+/// # use faf_text::{Color, RectLayer, TextRenderer};
+/// # fn demo(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut TextRenderer) {
+/// renderer.begin();
+/// renderer.rect([8.0, 8.0], [120.0, 24.0], Color::rgba(0.2, 0.2, 0.3, 1.0), RectLayer::Under);
+/// // ...plus `text`, `decoration`, `chip` calls.
+/// renderer.finish(device, queue, [960.0, 600.0]);
+/// # }
+/// ```
 pub struct TextRenderer {
     rect_pipeline: wgpu::RenderPipeline,
     /// Chips and line decorations both draw with this one.

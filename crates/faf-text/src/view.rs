@@ -18,8 +18,11 @@ pub type Rect = [f32; 4];
 /// (below the baseline), a strikeout offset positive.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineMetrics {
+    /// Top of an underline stroke, in em, y-up from the baseline (negative).
     pub underline_offset: f32,
+    /// Top of a strikeout stroke, in em, y-up from the baseline (positive).
     pub strikeout_offset: f32,
+    /// Stroke thickness in em, shared by both.
     pub thickness: f32,
 }
 
@@ -130,6 +133,9 @@ fn is_blank(s: &str) -> bool {
 /// A shaped text block positioned on screen, with hit-testing and
 /// selection-geometry helpers layered on top of a cosmic-text [`Buffer`].
 pub struct TextView {
+    /// The shaped buffer. Hand it straight to [`crate::TextRenderer::text`] or
+    /// [`crate::BlockContent::buffer`]; read [`Buffer::layout_runs`] for the
+    /// laid-out glyphs.
     pub buffer: Buffer,
     /// Top-left corner in screen pixels.
     pub pos: [f32; 2],
@@ -141,6 +147,8 @@ pub struct TextView {
 }
 
 impl TextView {
+    /// An empty view laid out at `metrics`, parked at the origin. Set
+    /// [`TextView::pos`] and give it text with [`TextView::set_text`].
     pub fn new(font_system: &mut FontSystem, metrics: Metrics) -> Self {
         Self {
             buffer: Buffer::new(font_system, metrics),
@@ -149,6 +157,15 @@ impl TextView {
         }
     }
 
+    /// Replace the text and re-shape it with one set of attributes.
+    ///
+    /// ```
+    /// # use faf_text::{Attrs, Family, Metrics, TextView};
+    /// let mut fonts = faf_text::font_system_from_fonts(&[faf_text::FONT_DEJAVU_SANS]);
+    /// let mut view = TextView::new(&mut fonts, Metrics::new(16.0, 22.0));
+    /// view.set_text(&mut fonts, "shaped", &Attrs::new().family(Family::SansSerif));
+    /// assert_eq!(view.find_all("ape").len(), 1);
+    /// ```
     pub fn set_text(&mut self, font_system: &mut FontSystem, text: &str, attrs: &Attrs) {
         self.buffer.set_text(text, attrs, Shaping::Advanced, None);
         self.reshaped(font_system);
@@ -182,6 +199,9 @@ impl TextView {
         self.reshaped(font_system);
     }
 
+    /// Change font size / line height and re-shape. Cheap enough to drive from
+    /// a per-frame animation at demo sizes, but it *is* a re-shape — animating
+    /// weight instead ([`crate::TextRenderer::text_with_weight`]) is free.
     pub fn set_metrics(&mut self, font_system: &mut FontSystem, metrics: Metrics) {
         self.buffer.set_metrics(metrics);
         self.reshaped(font_system);
