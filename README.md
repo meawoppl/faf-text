@@ -212,3 +212,9 @@ python3 -m http.server -d web 8000
   entirely (`take_dirty`).
 - The grid draws box-drawing arcs (U+256D–U+2570) as sharp corners and
   diagonals as one-pixel staircases — rects are the only primitive it emits.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option. Vendored fonts keep their own licenses (DejaVu: Bitstream Vera
+derivative; Manrope: OFL 1.1, see `crates/faf-text/assets/`).
