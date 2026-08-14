@@ -229,15 +229,21 @@ fn push_log_line(term: &mut Terminal) {
 }
 
 /// Redraw the three header rows, which the stream scrolls away every line: a
-/// double-line box with a single-line column tee'd into both rails, so the
-/// mixed joins are on screen the whole time.
+/// double-line box with, when the width allows, a single-line column tee'd
+/// into both rails so the mixed joins are on screen the whole time.
+///
+/// The layout is width-adaptive — docs.rs demo cells run grids as narrow as
+/// ~50 columns, where the full status + legend would collide and clip through
+/// the border. Every piece checks that it fits before drawing, and the status
+/// truncates rather than overrun the box.
 fn draw_header(grid: &mut TermGrid, backend: &str) {
     let (cols, rows) = (grid.cols(), grid.rows());
     if cols < 24 || rows < 6 {
         return;
     }
-    let split = cols / 2;
-    for col in 1..cols - 1 {
+    let interior_end = cols - 1; // exclusive: last content column is cols - 2
+
+    for col in 1..interior_end {
         grid.set_cell(col, 0, Cell::new('═', TERM_BLUE));
         grid.set_cell(col, 1, Cell::new(' ', TERM_FG));
         grid.set_cell(col, 2, Cell::new('═', TERM_BLUE));
@@ -248,24 +254,45 @@ fn draw_header(grid: &mut TermGrid, backend: &str) {
     grid.set_cell(cols - 1, 1, Cell::new('║', TERM_BLUE));
     grid.set_cell(0, 2, Cell::new('╚', TERM_BLUE));
     grid.set_cell(cols - 1, 2, Cell::new('╝', TERM_BLUE));
-    // The tees are part of the rails, so they wear the rail's color: a cell
-    // of another color would leave a visible notch in an otherwise clean join.
-    grid.set_cell(split, 0, Cell::new('╤', TERM_BLUE));
-    grid.set_cell(split, 1, Cell::new('│', TERM_DIM));
-    grid.set_cell(split, 2, Cell::new('╧', TERM_BLUE));
 
-    grid.print(3, 0, "╡ faf-text terminal grid ╞", TERM_CYAN, None);
-    grid.print(
-        2,
-        1,
-        &format!("{cols}×{rows} cells · {backend} · streaming"),
-        TERM_FG,
-        None,
-    );
-    let mut col = split + 2;
-    for (level, color) in LEVELS {
-        col = grid.print(col, 1, level, TERM_BG, Some(color));
-        col = grid.print(col, 1, " ", TERM_FG, None);
+    // Title: full, short, or none — whatever the top rail can hold.
+    for title in ["╡ faf-text terminal grid ╞", "╡ faf-text ╞"] {
+        let len = title.chars().count() as u16;
+        if 3 + len < interior_end {
+            grid.print(3, 0, title, TERM_CYAN, None);
+            break;
+        }
+    }
+
+    // Status, truncated to the interior. Prefer dropping the suffix words
+    // over cutting mid-word.
+    let full = format!("{cols}×{rows} cells · {backend} · streaming");
+    let brief = format!("{cols}×{rows} · {backend}");
+    let tiny = format!("{cols}×{rows}");
+    let budget = (interior_end - 2) as usize;
+    let status = [full, brief, tiny]
+        .into_iter()
+        .find(|s| s.chars().count() <= budget)
+        .unwrap_or_default();
+    let status_end = grid.print(2, 1, &status, TERM_FG, None);
+
+    // Legend + split tee only when they genuinely fit to the right of the
+    // status: the tee is part of the rails (rail-colored — a different color
+    // leaves a notch in the join), and the chips must not touch the border.
+    let legend_w: u16 = LEVELS
+        .iter()
+        .map(|(level, _)| level.chars().count() as u16 + 1)
+        .sum();
+    let split = cols / 2;
+    if split > status_end + 1 && split + 2 + legend_w < interior_end {
+        grid.set_cell(split, 0, Cell::new('╤', TERM_BLUE));
+        grid.set_cell(split, 1, Cell::new('│', TERM_DIM));
+        grid.set_cell(split, 2, Cell::new('╧', TERM_BLUE));
+        let mut col = split + 2;
+        for (level, color) in LEVELS {
+            col = grid.print(col, 1, level, TERM_BG, Some(color));
+            col = grid.print(col, 1, " ", TERM_FG, None);
+        }
     }
 }
 
