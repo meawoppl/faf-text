@@ -1,19 +1,28 @@
 use cosmic_text::{CacheKey, CacheKeyFlags, Command, FontSystem, SwashCache, fontdb};
+use half::f16;
 use rustc_hash::FxHashMap;
 
-/// Width in texels of the RGBA32F curve data texture. Must be even so a
+/// Width in texels of the RGBA16F curve data texture. Must be even so a
 /// curve's two texels never straddle a row, and must match `CURVE_TEX_WIDTH`
 /// in `shaders.wgsl`.
 pub const CURVE_TEX_WIDTH: u32 = 256;
 /// Height the curve texture starts at; it doubles on overflow up to
 /// [`CURVE_TEX_MAX_HEIGHT`] (or the device's limit, whichever is smaller).
 pub const CURVE_TEX_HEIGHT: u32 = 2048;
-/// Ceiling on curve-texture height. 256 × 8192 RGBA32F is 32 MiB and holds
-/// ~1M quadratics; past that we evict instead of growing.
+/// Ceiling on curve-texture height. 256 × 8192 RGBA16F is 16 MiB and holds
+/// ~2M quadratics; past that we evict instead of growing.
 pub const CURVE_TEX_MAX_HEIGHT: u32 = 8192;
 
 // --- Record layout. Everything that knows how a curve maps to texels lives
 // here, so band tables and master pairs can change it in one place.
+//
+// Texels are RGBA16F: four halves, 8 bytes. Control points are em coordinates
+// in roughly [-0.2, 1.2], where f16's 11-bit significand quantizes to at worst
+// 2^-11 = 4.9e-4 em (0.031 px at 64 px/em, 0.15 px at 300); outlines are
+// *rounded to f16 as they are flattened*, so bboxes, band membership and the
+// early-out sort keys are all computed from the very numbers the shader reads.
+// Integers stored in a texel — texel offsets and curve counts — are exact only
+// up to [`F16_EXACT_INT`] = 2048, which is what bounds a banded block's size.
 //
 // A glyph owns one contiguous, even-texel-aligned block of the texture;
 // `GlyphCurves::first` is the block's base texel and every offset stored inside
@@ -26,35 +35,79 @@ pub const CURVE_TEX_MAX_HEIGHT: u32 = 8192;
 //
 // Banded block (`count` > `BAND_MIN_CURVES`):
 //
-//     [header]              BANDS texels: BANDS y-band then BANDS x-band
-//                           entries, each (list offset in texels from the
-//                           block base, curve count) — 2 entries per texel
-//     [index lists]         the 2*BANDS lists in header order, each starting
-//                           on a texel boundary, region padded to even
-//     [curve record 0]…     2 texels each
+//     [header]              2*BANDS texels: BANDS y-band then BANDS x-band
+//                           entries, one texel each — (descending list offset,
+//                           curve count, split coordinate, ascending list
+//                           offset), offsets in texels from the block base
+//     [index lists]         two lists per band (descending then ascending) in
+//                           header order, each starting on a texel boundary,
+//                           region padded to even
+//     [curve texels]        one per curve plus one per contour, see below
 //
-// A list entry is the texel offset of that curve's record from the block base
-// (float, exact to 2^24 — a glyph would need 8M texels to lose precision), so
-// the shader resolves a curve without knowing where the record region starts.
-// The two shapes are told apart by [`BANDED_FLAG`] in the instance's `count`.
+// A list entry is the texel offset of that curve's record from the block base,
+// so the shader resolves a curve without knowing where the record region
+// starts. The two shapes are told apart by [`BANDED_FLAG`] in the instance's
+// `count`.
+//
+// **Endpoint sharing (banded blocks).** Within a contour p2 of curve i is p0
+// of curve i+1 — the flattener emits contours contiguously and carries the
+// point across, so the two are the same float, not merely equal — and the
+// texel [p0.xy p1.xy] of the next curve therefore already holds this curve's
+// p2 in its first two lanes. A contour of n curves is n+1 texels: n curve
+// texels plus a terminator holding the last p2 (the contour's own first point
+// again, since contours close). The shader's two-texel fetch is unchanged: it
+// reads t0 = [p0 p1] and takes t1.xy as p2, which is the next curve's texel or
+// the terminator. That halves the record region, 2 texels/curve → ~1.1.
+//
+// Flat blocks keep the unshared 2-texel record. Sharing needs an index list to
+// step over contour terminators — or a per-texel branch in the innermost loop,
+// which this shader has measured at 25% — and the flat path walks records by
+// arithmetic alone (`i * TEXELS_PER_CURVE`). A flat block is at most
+// `BAND_MIN_CURVES` curves, so what that leaves on the table is ~130 bytes a
+// glyph. Both shapes hold the same f16 values, so a glyph rendered flat and
+// banded is still bit-identical (`band_tables_do_not_move_a_single_pixel`).
+//
+// A band's two lists hold the *same* curves in opposite orders: descending by
+// the member's maximum coordinate along the ray axis for rays fired in the
+// +axis direction, ascending by its minimum for rays fired backwards. Control
+// points bound the curve (convex hull), so the shader can stop walking a list
+// the moment a fetched curve's bound has fallen behind the antialiasing
+// window — every curve after it is further behind still. `split` is the median
+// of the members' ray-axis midpoints: samples past it fire backwards, so
+// neither side of a glyph pays for the curves on the other.
 //
 // A glyph from a variable font with a `wght` axis stores a second master: the
 // same records extracted at the axis maximum, in a parallel region right after
-// master A's, in the same order. [`GlyphCurves::b_offset`] is the texel
-// distance from any A record to its B twin (`count * TEXELS_PER_CURVE`), so
-// band lists keep indexing A alone and the shader reaches B by adding it.
+// master A's, packed the same way (same commands, so the same contours and the
+// same texel for every curve). [`GlyphCurves::record_texels`] is the texel
+// distance from any A record to its B twin, so band lists keep indexing A
+// alone and the shader reaches B by adding it.
 
-/// Floats per RGBA32F texel.
+/// Halves per RGBA16F texel.
 const FLOATS_PER_TEXEL: usize = 4;
-/// Two RGBA32F texels (8 floats) per quadratic: [p0.xy p1.xy] [p2.xy pad pad].
+/// Bytes one texel occupies in the texture.
+const BYTES_PER_TEXEL: usize = FLOATS_PER_TEXEL * 2;
+/// Two RGBA16F texels (8 halves) per quadratic in a flat block:
+/// [p0.xy p1.xy] [p2.xy pad pad].
 const TEXELS_PER_CURVE: usize = 2;
 const FLOATS_PER_CURVE: usize = TEXELS_PER_CURVE * FLOATS_PER_TEXEL;
+/// Largest integer an f16 lane holds exactly (2^11; 2049 is not
+/// representable). Band headers and index lists are integers in lanes, so a
+/// block whose offsets would pass this cannot be banded — it falls back to the
+/// flat layout, which addresses records by arithmetic on a u32 and has no
+/// integers in the texture at all. Real glyphs are an order of magnitude
+/// under: the largest offset DejaVu Sans or Manrope encodes is 254
+/// (`banded_blocks_only_encode_integers_f16_holds_exactly` prints it).
+const F16_EXACT_INT: usize = 2048;
 
 /// Bands per axis. Must match `BANDS` in `shaders.wgsl`.
 pub const BANDS: usize = 8;
-/// Texels the band header occupies: 2*BANDS entries × 2 floats, 4 floats per
-/// texel.
-const HEADER_TEXELS: usize = BANDS * 2 * 2 / FLOATS_PER_TEXEL;
+/// Texels per band header entry: (descending list offset, curve count, split
+/// coordinate, ascending list offset) — one texel. Must match
+/// `BAND_ENTRY_TEXELS` in `shaders.wgsl`.
+pub const BAND_ENTRY_TEXELS: usize = 1;
+/// Texels the band header occupies: 2*BANDS entries, one texel each.
+const HEADER_TEXELS: usize = BANDS * 2 * BAND_ENTRY_TEXELS;
 /// Glyphs with more curves than this get band tables; at or below it the flat
 /// loop is cheaper than the indirection.
 const BAND_MIN_CURVES: u32 = 16;
@@ -66,6 +119,21 @@ const BAND_EPSILON: f32 = 0.05;
 /// Set in the vector instance's `count` field when the glyph's block is
 /// banded. Must match `BANDED_FLAG` in `shaders.wgsl`.
 pub const BANDED_FLAG: u32 = 0x8000_0000;
+/// Smallest triangle a corner clip may remove, as a fraction of the em bbox's
+/// area. Below this the four extra triangles the octagon costs are not worth
+/// the fragments they save (Lengyel 2017 §3 uses the same shape of test).
+const CLIP_MIN_AREA: f32 = 0.04;
+/// Outward normals of the four bbox corners, in the order
+/// [`GlyphCurves::clips`] lists them: the unit quad's (0,0), (1,0), (1,1),
+/// (0,1), which in em space (y-up) is (min_x, max_y), (max_x, max_y),
+/// (max_x, min_y), (min_x, min_y).
+///
+/// 45° only. Lengyel tests a couple of candidate normals per corner and keeps
+/// the best; a non-45° plane cuts a scalene triangle, which needs two legs per
+/// corner (eight instance floats) instead of one. The diagonal is the workhorse
+/// — it is the normal that sees the empty corner of an `A`, a `T` or a `7` —
+/// so one vec4 buys nearly all of the win at half the instance cost.
+const CLIP_NORMALS: [[f32; 2]; 4] = [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]];
 /// The variation axis a glyph's two masters are extracted at the ends of.
 const WGHT: swash::Tag = u32::from_be_bytes(*b"wght");
 
@@ -95,12 +163,26 @@ pub struct GlyphCurves {
     pub bbox: [f32; 4],
     /// Whether the block starts with band tables.
     pub banded: bool,
-    /// Texels from a master-A record to its master-B twin, or 0 when the glyph
-    /// has a single master (a static face, or masters that do not interpolate).
-    pub b_offset: u32,
+    /// How deep each bbox corner may be cut away, in em, before the cut can
+    /// reach ink: the isoceles right triangle at corner `i` with legs
+    /// `clips[i]` holds no part of either master's outline. 0 where the corner
+    /// is not worth clipping (see [`corner_clips`]). Corner order is the unit
+    /// quad's (0,0), (1,0), (1,1), (0,1) — see [`CLIP_NORMALS`].
+    ///
+    /// CPU-side only: the renderer turns these into an instance attribute the
+    /// vertex shader builds an octagon from, so nothing about the texture
+    /// layout changes.
+    pub clips: [f32; 4],
+    /// Whether a master-B region follows master A's. False for a static face,
+    /// or for masters that do not interpolate.
+    pub dual_master: bool,
     /// Blend factor matching the weight the text was shaped at: 0 = axis
-    /// minimum, 1 = axis maximum. Meaningless when `b_offset` is 0.
+    /// minimum, 1 = axis maximum. Meaningless without a second master.
     pub weight_t: f32,
+    /// Texels one master's records occupy: `2 * count` in a flat block,
+    /// `count + contours` (rounded up to even) in a banded one, where endpoint
+    /// sharing applies. Also the A→B stride of a dual-master glyph.
+    pub(crate) record_texels: u32,
     /// Length of the whole block in texels — what compaction moves.
     texels: u32,
 }
@@ -120,10 +202,10 @@ impl GlyphCurves {
     /// the `b_first` the vector instance carries. A block always begins with
     /// master A, so a dual-master glyph can never land on 0.
     pub fn b_first(&self) -> u32 {
-        if self.b_offset == 0 {
-            0
+        if self.dual_master {
+            self.first + self.record_texels
         } else {
-            self.first + self.b_offset
+            0
         }
     }
 }
@@ -197,12 +279,12 @@ pub struct CurveStore {
     /// that is missing belonged to an evicted glyph.
     pub relocations: FxHashMap<u32, u32>,
     device: wgpu::Device,
-    /// CPU mirror of the packed curve floats; the un-uploaded tail is flushed
+    /// CPU mirror of the packed curve halves; the un-uploaded tail is flushed
     /// to the texture by `flush`.
-    data: Vec<f32>,
+    data: Vec<f16>,
     entries: FxHashMap<GlyphKey, Entry>,
     swash: SwashCache,
-    /// How much of `data` the texture already holds. Tracked in floats, not
+    /// How much of `data` the texture already holds. Tracked in halves, not
     /// rows: new glyphs often fit inside the current partial row, and a
     /// row-granular high-water mark would skip them forever.
     uploaded_floats: usize,
@@ -388,9 +470,9 @@ impl CurveStore {
 
         // Flattened into scratch buffers first: the band tables go in front of
         // the records, and the curve count decides whether there are any.
-        let (records, mut bbox) = flatten(&a_commands);
+        let (records, contours, mut bbox) = flatten(&a_commands);
         let b_records = b_commands.map(|commands| {
-            let (b_records, b_bbox) = flatten(&commands);
+            let (b_records, _, b_bbox) = flatten(&commands);
             // The quad has to cover every weight the glyph can be drawn at.
             for i in 0..2 {
                 bbox[i] = bbox[i].min(b_bbox[i]);
@@ -399,7 +481,8 @@ impl CurveStore {
             b_records
         });
         // Same commands in, same records out — this only guards the layout
-        // invariant the shader's fixed A→B stride depends on.
+        // invariant the shader's fixed A→B stride depends on. The contours are
+        // the same for the same reason, so one packing serves both masters.
         let b_records = b_records.filter(|b| b.len() == records.len());
 
         let count = (records.len() / FLOATS_PER_CURVE) as u32;
@@ -409,29 +492,33 @@ impl CurveStore {
                 count: 0,
                 bbox: [0.0; 4],
                 banded: false,
-                b_offset: 0,
+                clips: [0.0; 4],
+                dual_master: false,
                 weight_t: 0.0,
+                record_texels: 0,
                 texels: 0,
             }));
         }
 
-        let (b_offset, weight_t) = match (&b_records, axis) {
-            (Some(_), Some((min, max))) => (
-                count * TEXELS_PER_CURVE as u32,
-                weight_blend(weight, min, max),
-            ),
-            _ => (0, 0.0),
-        };
-
-        let banded = count > self.band_min_curves;
-        let block = if banded {
-            banded_block(&records, b_records.as_deref(), bbox)
-        } else {
-            let mut block = records;
-            if let Some(b) = &b_records {
-                block.extend_from_slice(b);
+        // A block whose offsets outgrow f16's exact integers keeps the flat
+        // layout, which stores no integers at all.
+        let block = (count > self.band_min_curves)
+            .then(|| banded_block(&records, b_records.as_deref(), &contours, bbox))
+            .flatten();
+        let (block, banded, record_texels) = match block {
+            Some(block) => {
+                let record_texels = shared_texels(count as usize, contours.len());
+                (block, true, record_texels)
             }
-            block
+            None => (
+                flat_block(&records, b_records.as_deref()),
+                false,
+                count * TEXELS_PER_CURVE as u32,
+            ),
+        };
+        let (dual_master, weight_t) = match (&b_records, axis) {
+            (Some(_), Some((min, max))) => (true, weight_blend(weight, min, max)),
+            _ => (false, 0.0),
         };
         debug_assert_eq!(block.len() % FLOATS_PER_CURVE, 0, "blocks are even texels");
 
@@ -439,7 +526,10 @@ impl CurveStore {
         // and no curve record ever straddles a texture row.
         let first = (self.data.len() / FLOATS_PER_TEXEL) as u32;
         let texels = (block.len() / FLOATS_PER_TEXEL) as u32;
-        self.data.extend_from_slice(&block);
+        // Control points were rounded to f16 as they were flattened, so this
+        // conversion is exact for them; the integers the band tables carry are
+        // exact by construction (see F16_EXACT_INT).
+        self.data.extend(block.iter().map(|&v| f16::from_f32(v)));
         let used = self.data.len() / FLOATS_PER_TEXEL;
         if used > self.capacity() && !self.grow_to_fit(used) {
             self.data.truncate(first as usize * FLOATS_PER_TEXEL);
@@ -450,8 +540,10 @@ impl CurveStore {
             count,
             bbox,
             banded,
-            b_offset,
+            clips: corner_clips(&records, b_records.as_deref(), bbox),
+            dual_master,
             weight_t,
+            record_texels,
             texels,
         }))
     }
@@ -532,6 +624,14 @@ impl CurveStore {
         self.layout_generation += 1;
     }
 
+    /// (Bytes of packed curve data, bytes the texture occupies).
+    pub fn memory(&self) -> (usize, usize) {
+        (
+            self.data.len() / FLOATS_PER_TEXEL * BYTES_PER_TEXEL,
+            self.capacity() * BYTES_PER_TEXEL,
+        )
+    }
+
     /// Upload any rows of curve data added since the last flush.
     pub fn flush(&mut self, queue: &wgpu::Queue) {
         if self.data.len() <= self.uploaded_floats {
@@ -543,7 +643,10 @@ impl CurveStore {
         // partially-filled row the new curves may share with old ones.
         let start_row = (self.uploaded_floats / floats_per_row) as u32;
         let mut rows = Vec::from(&self.data[start_row as usize * floats_per_row..]);
-        rows.resize((total_rows - start_row) as usize * floats_per_row, 0.0);
+        rows.resize(
+            (total_rows - start_row) as usize * floats_per_row,
+            f16::ZERO,
+        );
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -559,7 +662,7 @@ impl CurveStore {
             bytemuck::cast_slice(&rows),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(self.width * 16),
+                bytes_per_row: Some(self.width * BYTES_PER_TEXEL as u32),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
@@ -622,8 +725,11 @@ fn warn_incompatible_masters(font_id: fontdb::ID) {
     });
 }
 
-/// Flatten one master's path into padded quadratic records, with its bbox.
-fn flatten(commands: &[Command]) -> (Vec<f32>, [f32; 4]) {
+/// Flatten one master's path into padded quadratic records, with the curve
+/// count of each contour (in emission order) and the bbox. The contours are
+/// what endpoint sharing packs against: within one, the next record's p0 *is*
+/// this record's p2.
+fn flatten(commands: &[Command]) -> (Vec<f32>, Vec<u32>, [f32; 4]) {
     let mut records = Vec::new();
     let mut flat = Flattener::new(&mut records);
     for command in commands {
@@ -637,7 +743,13 @@ fn flatten(commands: &[Command]) -> (Vec<f32>, [f32; 4]) {
     }
     flat.close();
     let bbox = flat.bbox;
-    (records, bbox)
+    let contours = flat.contours;
+    debug_assert_eq!(
+        contours.iter().sum::<u32>() as usize,
+        records.len() / FLOATS_PER_CURVE,
+        "every curve belongs to exactly one contour"
+    );
+    (records, contours, bbox)
 }
 
 fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
@@ -651,7 +763,11 @@ fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Textu
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        // RGBA16F, not RGBA32F: half the bytes and half the fetch bandwidth,
+        // and the *better* supported of the two on WebGL2 — wgpu's GLES
+        // backend gives Rgba16Float TEXTURE_BINDING plus filtering with no
+        // extension at all, where Rgba32Float is sampled-but-unfilterable.
+        format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
@@ -664,6 +780,115 @@ fn control_span(record: &[f32], axis: usize) -> (f32, f32) {
         coords.iter().copied().fold(f32::INFINITY, f32::min),
         coords.iter().copied().fold(f32::NEG_INFINITY, f32::max),
     )
+}
+
+/// The furthest one quadratic reaches along `n`, exactly.
+///
+/// `dot(B(t), n)` is a scalar quadratic in t, so its maximum over [0, 1] is
+/// either an endpoint or — when the parabola opens downward — its vertex. The
+/// control point itself is deliberately *not* consulted: a quarter circle's
+/// middle control point sits exactly on the corner of its bounding box, so
+/// bounding by the control hull would leave every round glyph ('O', 'c', 'e',
+/// the bowl of a 'Q') with no clippable corner at all, while the curve itself
+/// stays 0.29 of a radius away from it. Bounding the curve is just as safe: the
+/// curve's own convex hull is the intersection of its support half-planes, and
+/// it is the curve, not the hull, that the fragment shader tests against.
+fn curve_support(record: &[f32], n: [f32; 2]) -> f32 {
+    let a0 = n[0] * record[0] + n[1] * record[1];
+    let a1 = n[0] * record[2] + n[1] * record[3];
+    let a2 = n[0] * record[4] + n[1] * record[5];
+    let ends = a0.max(a2);
+    // f(t) = a0 + 2(a1 - a0)t + (a0 - 2a1 + a2)t², vertex at (a0 - a1)/d.
+    // Lines flatten to a control point at the midpoint, which makes d exactly
+    // 0 and leaves the endpoints answering.
+    let d = a0 - 2.0 * a1 + a2;
+    if d >= 0.0 {
+        return ends;
+    }
+    let t = (a0 - a1) / d;
+    if t <= 0.0 || t >= 1.0 {
+        return ends;
+    }
+    let s = 1.0 - t;
+    ends.max(s * s * a0 + 2.0 * s * t * a1 + t * t * a2)
+}
+
+/// How deep each bbox corner can be cut away without the cut reaching ink —
+/// the support-plane clip of Lengyel 2017 §3, in em, one leg per corner.
+///
+/// For corner `i` with outward normal `n` (see [`CLIP_NORMALS`]), the support
+/// value `h = max over the outline of dot(p, n)` is the furthest the glyph
+/// reaches along `n`; the plane `dot(p, n) = h` therefore has the whole outline
+/// on one side of it, and so does any plane beyond it. The leg returned is
+/// `dot(corner, n) - h`, which is where that support plane cuts the two edges
+/// meeting at the corner. That makes the clip safe by construction rather than
+/// by tuning: nothing of the outline is inside the removed triangle, a point
+/// outside a closed outline's convex hull has winding number zero, and a sample
+/// beyond a separating plane is at least the plane distance away from every
+/// point of the curve — so the antialiasing window finds nothing either.
+///
+/// The maximum spans **both masters**, and that one number covers every blend
+/// between them: a Bézier is linear in its control points, so the blended curve
+/// is the pointwise blend of the two masters' curves, and
+/// `dot(mix(A(u), B(u), t), n) <= max(h_a, h_b)` for every u and every t.
+///
+/// A corner whose triangle would be under [`CLIP_MIN_AREA`] of the bbox is left
+/// square: the octagon costs four more triangles a glyph, and Lengyel's own
+/// caveat is that tiny triangles cost more than the fragments they save.
+///
+/// The renderer applies these legs at the corners of the quad, which is the
+/// bbox *padded* by 1.5 px for the antialiasing falloff, so the plane the
+/// geometry actually cuts along sits a further `pad * sqrt(2)` px outside the
+/// hull — more than the half pixel the coverage window can reach.
+fn corner_clips(records: &[f32], b_records: Option<&[f32]>, bbox: [f32; 4]) -> [f32; 4] {
+    let (width, height) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    if width <= 0.0 || height <= 0.0 {
+        return [0.0; 4];
+    }
+    // Triangle area is leg²/2, so the area threshold is a leg threshold.
+    let min_leg = (2.0 * CLIP_MIN_AREA * width * height).sqrt();
+    let mut clips = [0.0; 4];
+    for (clip, n) in clips.iter_mut().zip(CLIP_NORMALS) {
+        let corner = [
+            if n[0] > 0.0 { bbox[2] } else { bbox[0] },
+            if n[1] > 0.0 { bbox[3] } else { bbox[1] },
+        ];
+        let mut support = f32::NEG_INFINITY;
+        for region in [Some(records), b_records].into_iter().flatten() {
+            for record in region.chunks_exact(FLOATS_PER_CURVE) {
+                support = support.max(curve_support(record, n));
+            }
+        }
+        // The bbox is tight, so some control point sits on each edge and the
+        // leg can never exceed the shorter side; the clamp is against fp
+        // noise, and clipping less is always safe.
+        let leg = (n[0] * corner[0] + n[1] * corner[1] - support).clamp(0.0, width.min(height));
+        if leg >= min_leg {
+            *clip = leg;
+        }
+    }
+    clips
+}
+
+/// Every curve's control-point range along one axis, spanning both masters.
+///
+/// A blended control point is a lerp of the two masters' and so never leaves
+/// their per-coordinate hull: one span bounds the glyph at every `weight_t`.
+/// Both band membership and the early-out sort keys ride on that.
+fn spans(records: &[f32], b_records: Option<&[f32]>, axis: usize) -> Vec<(f32, f32)> {
+    records
+        .chunks_exact(FLOATS_PER_CURVE)
+        .enumerate()
+        .map(|(index, record)| {
+            let (mut lo, mut hi) = control_span(record, axis);
+            if let Some(b) = b_records {
+                let (b_lo, b_hi) = control_span(&b[index * FLOATS_PER_CURVE..], axis);
+                lo = lo.min(b_lo);
+                hi = hi.max(b_hi);
+            }
+            (lo, hi)
+        })
+        .collect()
 }
 
 /// Curve indices per band along one axis of `[min, max]` (`axis` 0 = x,
@@ -688,13 +913,7 @@ fn band_lists(
     let eps = height * BAND_EPSILON;
     let last_band = (BANDS - 1) as f32;
     let mut lists = vec![Vec::new(); BANDS];
-    for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
-        let (mut lo, mut hi) = control_span(record, axis);
-        if let Some(b) = b_records {
-            let (b_lo, b_hi) = control_span(&b[index * FLOATS_PER_CURVE..], axis);
-            lo = lo.min(b_lo);
-            hi = hi.max(b_hi);
-        }
+    for (index, (lo, hi)) in spans(records, b_records, axis).into_iter().enumerate() {
         let first = (((lo - eps - min) / height).floor()).clamp(0.0, last_band) as usize;
         let last = (((hi + eps - min) / height).floor()).clamp(0.0, last_band) as usize;
         for list in &mut lists[first..=last] {
@@ -704,52 +923,214 @@ fn band_lists(
     lists
 }
 
-/// Lay out a banded block: header, index lists, then master A's curve records
-/// and master B's parallel copy. See the record-layout comment at the top of
-/// this file.
-fn banded_block(records: &[f32], b_records: Option<&[f32]>, bbox: [f32; 4]) -> Vec<f32> {
-    let mut lists = band_lists(records, b_records, 1, bbox[1], bbox[3]);
-    lists.extend(band_lists(records, b_records, 0, bbox[0], bbox[2]));
+/// One band's membership, ordered for both ray directions, plus the
+/// coordinate that decides which direction a sample fires in.
+struct Band {
+    /// Members ordered by *decreasing* maximum coordinate along the ray axis.
+    /// A ray fired in the +axis direction meets them far end first, so the
+    /// first curve whose maximum has dropped behind the sample's antialiasing
+    /// window ends the loop: every curve after it is further behind still.
+    descending: Vec<u32>,
+    /// The same members ordered by *increasing* minimum coordinate, for the
+    /// rays the median split fires in the -axis direction.
+    ascending: Vec<u32>,
+    /// Median of the members' ray-axis midpoints; samples past it fire
+    /// backwards.
+    split: f32,
+}
 
-    // Lists start on texel boundaries (the shader walks them four at a time)
-    // and the region as a whole is padded to an even texel count, which keeps
-    // the records that follow two-texel aligned.
-    let list_texels: usize = lists
+/// The bands along one axis of `[min, max]`, with each band's list sorted for
+/// the shader's early-out and its median split computed.
+///
+/// The sort keys span both masters (see [`spans`]), which is what keeps the
+/// early-out conservative at every `weight_t`: the shader compares the same
+/// two-master extreme, and the blended outline can only sit inside it. Sorting
+/// on master A alone would let a blend toward B put a curve that still crosses
+/// the ray behind the curve that ends the loop.
+fn bands(records: &[f32], b_records: Option<&[f32]>, axis: usize, min: f32, max: f32) -> Vec<Band> {
+    // Rays run across the banding axis: y-bands are crossed by horizontal
+    // rays, x-bands by vertical ones.
+    let spans = spans(records, b_records, 1 - axis);
+    band_lists(records, b_records, axis, min, max)
+        .into_iter()
+        .map(|members| {
+            let mut descending = members.clone();
+            descending.sort_by(|a, b| spans[*b as usize].1.total_cmp(&spans[*a as usize].1));
+            let mut ascending = members;
+            ascending.sort_by(|a, b| spans[*a as usize].0.total_cmp(&spans[*b as usize].0));
+            Band {
+                split: median_split(&ascending, &spans),
+                descending,
+                ascending,
+            }
+        })
+        .collect()
+}
+
+/// Where to split a band: the median of its members' ray-axis midpoints. A
+/// sample sitting there has about half the band's curves ahead of it and half
+/// behind, so the early-out fires after a similar number of fetches whichever
+/// way the ray goes. An empty band never reaches the shader, and 0.0 is as
+/// good a coordinate as any for it.
+fn median_split(members: &[u32], spans: &[(f32, f32)]) -> f32 {
+    if members.is_empty() {
+        return 0.0;
+    }
+    let mut mids: Vec<f32> = members
         .iter()
-        .map(|list| list.len().div_ceil(FLOATS_PER_TEXEL))
-        .sum::<usize>()
-        .next_multiple_of(TEXELS_PER_CURVE);
-    let records_offset = HEADER_TEXELS + list_texels;
+        .map(|&i| (spans[i as usize].0 + spans[i as usize].1) * 0.5)
+        .collect();
+    mids.sort_by(f32::total_cmp);
+    // Rounded here rather than on the way into the texture, so the coordinate
+    // the shader compares a sample against is the one this file reasoned
+    // about. Rounding is monotone, so a split inside its band's extremes —
+    // themselves already f16 — stays inside them.
+    quantize(mids[mids.len() / 2])
+}
 
-    let mut block = Vec::with_capacity(records_offset * FLOATS_PER_TEXEL + records.len());
-    let mut offset = HEADER_TEXELS;
-    for list in &lists {
-        block.push(offset as f32);
-        block.push(list.len() as f32);
-        offset += list.len().div_ceil(FLOATS_PER_TEXEL);
-    }
-    debug_assert_eq!(block.len(), HEADER_TEXELS * FLOATS_PER_TEXEL);
-    for list in &lists {
-        for &index in list {
-            block.push((records_offset + index as usize * TEXELS_PER_CURVE) as f32);
-        }
-        block.resize(block.len().next_multiple_of(FLOATS_PER_TEXEL), 0.0);
-    }
-    block.resize(records_offset * FLOATS_PER_TEXEL, 0.0);
-    block.extend_from_slice(records);
+/// A coordinate as the texture will hold it. Everything downstream of the
+/// flattener works in these, so band membership, the early-out sort keys and
+/// the shader all see one set of numbers.
+fn quantize(v: f32) -> f32 {
+    f16::from_f32(v).to_f32()
+}
+
+/// Texels one master's records occupy in a banded block: one per curve, one
+/// per contour terminator, rounded up so the region — and therefore the block
+/// and the next master's region — stays even.
+fn shared_texels(count: usize, contours: usize) -> u32 {
+    (count + contours).next_multiple_of(TEXELS_PER_CURVE) as u32
+}
+
+/// Master A's records followed by master B's, unshared: two texels a curve,
+/// which is what the flat path's `i * TEXELS_PER_CURVE` addressing wants.
+fn flat_block(records: &[f32], b_records: Option<&[f32]>) -> Vec<f32> {
+    let mut block = records.to_vec();
     if let Some(b) = b_records {
         block.extend_from_slice(b);
     }
     block
 }
 
-/// Flattens a zeno path into padded quadratic records, tracking the bbox.
+/// One master's records with shared endpoints: a contour of n curves becomes
+/// n + 1 texels, [p0.xy p1.xy] per curve plus a terminator holding the last
+/// curve's p2. Returns the lanes (padded to [`shared_texels`]) and each
+/// curve's texel offset within the region.
+///
+/// The next curve's texel already holds this curve's p2 in its first two
+/// lanes, which is what makes the shader's unchanged two-texel fetch land on
+/// the right point.
+fn shared_records(records: &[f32], contours: &[u32]) -> (Vec<f32>, Vec<u32>) {
+    let count = records.len() / FLOATS_PER_CURVE;
+    let mut lanes = Vec::with_capacity((count + contours.len()) * FLOATS_PER_TEXEL);
+    let mut texel_of = Vec::with_capacity(count);
+    let mut curve = 0;
+    for &n in contours {
+        let n = n as usize;
+        debug_assert!(n > 0, "the flattener never emits an empty contour");
+        for j in 0..n {
+            let record = &records[(curve + j) * FLOATS_PER_CURVE..];
+            debug_assert!(
+                j == 0 || record[..2] == records[(curve + j - 1) * FLOATS_PER_CURVE + 4..][..2],
+                "endpoint sharing needs p2 of a curve to be p0 of the next"
+            );
+            texel_of.push((lanes.len() / FLOATS_PER_TEXEL) as u32);
+            lanes.extend_from_slice(&record[..FLOATS_PER_TEXEL]);
+        }
+        // The terminator: the contour's last p2, which endpoint sharing has
+        // nowhere else to put (and which is the contour's first point again —
+        // contours close).
+        let last = &records[(curve + n - 1) * FLOATS_PER_CURVE..];
+        lanes.extend_from_slice(&[last[4], last[5], 0.0, 0.0]);
+        curve += n;
+    }
+    lanes.resize(
+        shared_texels(count, contours.len()) as usize * FLOATS_PER_TEXEL,
+        0.0,
+    );
+    (lanes, texel_of)
+}
+
+/// Lay out a banded block: header, index lists, then master A's shared-endpoint
+/// curve texels and master B's parallel copy. See the record-layout comment at
+/// the top of this file.
+///
+/// `None` when the block would encode a texel offset past [`F16_EXACT_INT`],
+/// where an f16 lane stops holding integers exactly — the caller falls back to
+/// the flat layout, which stores no integers at all. A curve costs ~1.1 texels
+/// of records and ~2.5 of index lists, so it takes on the order of 550 curves
+/// in a single glyph to get there.
+fn banded_block(
+    records: &[f32],
+    b_records: Option<&[f32]>,
+    contours: &[u32],
+    bbox: [f32; 4],
+) -> Option<Vec<f32>> {
+    let mut table = bands(records, b_records, 1, bbox[1], bbox[3]);
+    table.extend(bands(records, b_records, 0, bbox[0], bbox[2]));
+
+    // Two lists per band — same members, opposite orders. Each starts on a
+    // texel boundary (the shader walks them four at a time) and the region as
+    // a whole is padded to an even texel count, which keeps the records that
+    // follow two-texel aligned.
+    let list_texels: usize = table
+        .iter()
+        .map(|band| 2 * band.descending.len().div_ceil(FLOATS_PER_TEXEL))
+        .sum::<usize>()
+        .next_multiple_of(TEXELS_PER_CURVE);
+    let records_offset = HEADER_TEXELS + list_texels;
+
+    let (a_lanes, texel_of) = shared_records(records, contours);
+    // The largest integer any lane of this block would hold: the offset of the
+    // last curve texel in master A's region. Everything else — header offsets,
+    // band member counts, the other list entries — is smaller.
+    if records_offset + a_lanes.len() / FLOATS_PER_TEXEL > F16_EXACT_INT {
+        return None;
+    }
+
+    let mut block = Vec::with_capacity(records_offset * FLOATS_PER_TEXEL + a_lanes.len());
+    let mut offset = HEADER_TEXELS;
+    for band in &table {
+        let texels = band.descending.len().div_ceil(FLOATS_PER_TEXEL);
+        block.push(offset as f32);
+        block.push(band.descending.len() as f32);
+        block.push(band.split);
+        block.push((offset + texels) as f32);
+        offset += 2 * texels;
+    }
+    debug_assert_eq!(block.len(), HEADER_TEXELS * FLOATS_PER_TEXEL);
+    for band in &table {
+        for list in [&band.descending, &band.ascending] {
+            for &index in list {
+                block.push((records_offset + texel_of[index as usize] as usize) as f32);
+            }
+            block.resize(block.len().next_multiple_of(FLOATS_PER_TEXEL), 0.0);
+        }
+    }
+    block.resize(records_offset * FLOATS_PER_TEXEL, 0.0);
+    block.extend_from_slice(&a_lanes);
+    if let Some(b) = b_records {
+        // Same commands, so the same contours: master B packs to the same
+        // texels, which is what keeps the A→B stride a single constant.
+        let (b_lanes, b_texel_of) = shared_records(b, contours);
+        debug_assert_eq!(b_texel_of, texel_of);
+        block.extend_from_slice(&b_lanes);
+    }
+    Some(block)
+}
+
+/// Flattens a zeno path into padded quadratic records, tracking the bbox and
+/// the curve count of each contour.
 struct Flattener<'a> {
     out: &'a mut Vec<f32>,
     start: [f32; 2],
     current: [f32; 2],
     open: bool,
     bbox: [f32; 4],
+    /// Curves per contour, in emission order.
+    contours: Vec<u32>,
+    /// Curves pushed since the last contour ended.
+    in_contour: u32,
 }
 
 impl<'a> Flattener<'a> {
@@ -760,18 +1141,28 @@ impl<'a> Flattener<'a> {
             current: [0.0; 2],
             open: false,
             bbox: [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+            contours: Vec::new(),
+            in_contour: 0,
         }
     }
 
+    /// Control points are rounded to f16 here — the one place a coordinate
+    /// enters the pipeline — so the bbox, band membership, the sort keys and
+    /// the texture all describe the same outline. Rounding is a function of the
+    /// value, so a point carried from one record's p2 to the next record's p0
+    /// rounds to the same number in both, and endpoint sharing stays exact.
     fn push(&mut self, p0: [f32; 2], p1: [f32; 2], p2: [f32; 2]) {
-        for p in [p0, p1, p2] {
+        let points = [p0, p1, p2].map(|p| [quantize(p[0]), quantize(p[1])]);
+        for p in points {
             self.bbox[0] = self.bbox[0].min(p[0]);
             self.bbox[1] = self.bbox[1].min(p[1]);
             self.bbox[2] = self.bbox[2].max(p[0]);
             self.bbox[3] = self.bbox[3].max(p[1]);
         }
+        let [p0, p1, p2] = points;
         self.out
             .extend_from_slice(&[p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], 0.0, 0.0]);
+        self.in_contour += 1;
     }
 
     fn move_to(&mut self, p: [f32; 2]) {
@@ -818,6 +1209,10 @@ impl<'a> Flattener<'a> {
             self.line_to(self.start);
         }
         self.open = false;
+        if self.in_contour > 0 {
+            self.contours.push(self.in_contour);
+            self.in_contour = 0;
+        }
     }
 }
 
@@ -899,11 +1294,12 @@ mod tests {
         }
     }
 
-    /// The glyph's whole block — band tables included.
+    /// The glyph's whole block — band tables included — decoded back to f32,
+    /// which is what the shader's `textureLoad` hands its own math.
     fn slice_of(store: &CurveStore, curves: &GlyphCurves) -> Vec<f32> {
         let start = curves.first as usize * FLOATS_PER_TEXEL;
         let end = start + curves.texels as usize * FLOATS_PER_TEXEL;
-        store.data[start..end].to_vec()
+        store.data[start..end].iter().map(|v| v.to_f32()).collect()
     }
 
     #[test]
@@ -1132,15 +1528,43 @@ mod tests {
         }
     }
 
+    /// One band as the shader reads it back out of a block.
+    struct DecodedBand {
+        /// Members in the order the forward ray walks them.
+        descending: Vec<u32>,
+        /// Members in the order the backward ray walks them.
+        ascending: Vec<u32>,
+        split: f32,
+    }
+
+    /// A banded block, decoded.
+    struct DecodedBlock {
+        bands: Vec<DecodedBand>,
+        /// Curve index → texel offset of its first texel in the block.
+        texel_of: Vec<u32>,
+        /// First texel of master A's records.
+        records_offset: usize,
+    }
+
     /// Decode a banded block the way the shader does: header entry per band,
-    /// index list, curve records. Returns each band's resolved curve indices.
-    fn decode_bands(block: &[f32], count: u32, bbox: [f32; 4]) -> Vec<Vec<u32>> {
-        let records_offset = block.len() / FLOATS_PER_TEXEL - count as usize * TEXELS_PER_CURVE;
+    /// its two index lists, curve texels.
+    ///
+    /// Endpoint sharing makes a curve's texel offset depend on how many
+    /// contours came before it, so curve *indices* are recovered from the
+    /// lists themselves: every curve overlaps at least one band, and the
+    /// records are packed in curve order, so sorting the union of every list
+    /// numbers the curves.
+    fn decode_bands(block: &[f32], curves: &GlyphCurves) -> DecodedBlock {
+        let masters = if curves.dual_master { 2 } else { 1 };
+        let records_offset =
+            block.len() / FLOATS_PER_TEXEL - masters * curves.record_texels as usize;
+        let bbox = curves.bbox;
+
         let mut decoded = Vec::new();
+        let mut texels = Vec::new();
         for slot in 0..2 * BANDS {
-            let list = block[slot * 2] as usize;
-            let len = block[slot * 2 + 1] as usize;
-            assert!(list >= HEADER_TEXELS && list + len.div_ceil(4) <= records_offset);
+            let entry = &block[slot * FLOATS_PER_TEXEL..][..FLOATS_PER_TEXEL];
+            let len = entry[1] as usize;
             let axis = if slot < BANDS { 1 } else { 0 };
             let band = slot % BANDS;
             let height = (bbox[axis + 2] - bbox[axis]) / BANDS as f32;
@@ -1150,25 +1574,82 @@ mod tests {
             );
             let eps = height * BAND_EPSILON;
 
-            let mut indices = Vec::new();
-            for i in 0..len {
-                let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
-                assert!(texel >= records_offset, "list entry points into the header");
-                assert_eq!((texel - records_offset) % TEXELS_PER_CURVE, 0);
-                let start = texel * FLOATS_PER_TEXEL;
-                let record = &block[start..start + FLOATS_PER_CURVE];
-                let coords = [record[axis], record[2 + axis], record[4 + axis]];
-                let curve_lo = coords.iter().copied().fold(f32::INFINITY, f32::min);
-                let curve_hi = coords.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                assert!(
-                    curve_hi >= lo - eps && curve_lo <= hi + eps,
-                    "band {slot} lists a curve it does not overlap"
-                );
-                indices.push(((texel - records_offset) / TEXELS_PER_CURVE) as u32);
+            let mut lists = Vec::new();
+            for list in [entry[0] as usize, entry[3] as usize] {
+                assert!(list >= HEADER_TEXELS && list + len.div_ceil(4) <= records_offset);
+                let mut entries = Vec::new();
+                for i in 0..len {
+                    let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
+                    assert!(texel >= records_offset, "list entry points into the header");
+                    assert!(
+                        texel + 1 < records_offset + curves.record_texels as usize,
+                        "a curve's second texel must stay inside master A"
+                    );
+                    // Membership spans both masters, so a curve master A puts
+                    // outside the band can still be listed — a blend toward B
+                    // may pull it in.
+                    let (mut curve_lo, mut curve_hi) = span_at(block, texel, axis);
+                    if curves.dual_master {
+                        let twin = span_at(block, texel + curves.record_texels as usize, axis);
+                        curve_lo = curve_lo.min(twin.0);
+                        curve_hi = curve_hi.max(twin.1);
+                    }
+                    assert!(
+                        curve_hi >= lo - eps && curve_lo <= hi + eps,
+                        "band {slot} lists a curve it does not overlap"
+                    );
+                    entries.push(texel as u32);
+                    texels.push(texel as u32);
+                }
+                lists.push(entries);
             }
-            decoded.push(indices);
+            decoded.push((lists, entry[2]));
         }
-        decoded
+
+        texels.sort_unstable();
+        texels.dedup();
+        assert_eq!(
+            texels.len(),
+            curves.count as usize,
+            "every curve should appear in some band"
+        );
+        let index_of = |texel: u32| texels.binary_search(&texel).unwrap() as u32;
+        let bands = decoded
+            .into_iter()
+            .map(|(lists, split)| DecodedBand {
+                descending: lists[0].iter().map(|&t| index_of(t)).collect(),
+                ascending: lists[1].iter().map(|&t| index_of(t)).collect(),
+                split,
+            })
+            .collect();
+        DecodedBlock {
+            bands,
+            texel_of: texels.iter().map(|t| t - records_offset as u32).collect(),
+            records_offset,
+        }
+    }
+
+    /// The unshared 8-lane records a region packs, in curve order — the three
+    /// points the shader reads for each curve, which is what the layout
+    /// helpers in this file take.
+    fn records_at(block: &[f32], base: usize, texel_of: &[u32]) -> Vec<f32> {
+        let mut records = Vec::with_capacity(texel_of.len() * FLOATS_PER_CURVE);
+        for &texel in texel_of {
+            let start = (base + texel as usize) * FLOATS_PER_TEXEL;
+            records.extend_from_slice(&block[start..start + 6]);
+            records.extend_from_slice(&[0.0, 0.0]);
+        }
+        records
+    }
+
+    /// A curve's control-point span along `axis`, read at a block texel.
+    fn span_at(block: &[f32], texel: usize, axis: usize) -> (f32, f32) {
+        control_span(&block[texel * FLOATS_PER_TEXEL..], axis)
+    }
+
+    /// A curve's control-point span along `axis`, straight out of a record.
+    fn record_span(records: &[f32], index: u32, axis: usize) -> (f32, f32) {
+        control_span(&records[index as usize * FLOATS_PER_CURVE..], axis)
     }
 
     #[test]
@@ -1206,36 +1687,598 @@ mod tests {
         assert_eq!(
             flat.texels as usize,
             flat.count as usize * TEXELS_PER_CURVE,
-            "a flat block is nothing but records"
+            "a flat block is nothing but unshared records"
         );
 
         assert!(banded.count > BAND_MIN_CURVES);
         assert_eq!(banded.instance_count(), banded.count | BANDED_FLAG);
         assert_eq!(banded.first % 2, 0, "records must not straddle a row");
         assert_eq!(banded.texels % 2, 0);
+        assert!(
+            banded.record_texels < banded.count * TEXELS_PER_CURVE as u32,
+            "endpoint sharing must beat the unshared record"
+        );
 
         // Every band resolves to curves it overlaps (checked in decode_bands),
-        // and no curve that overlaps a band is missing from it.
+        // and no curve that overlaps a band is missing from either of its two
+        // lists.
         let block = slice_of(&store, &banded);
-        let decoded = decode_bands(&block, banded.count, banded.bbox);
-        let records = &block[block.len() - banded.count as usize * FLOATS_PER_CURVE..];
-        for (slot, indices) in decoded.iter().enumerate() {
+        let decoded = decode_bands(&block, &banded);
+        let records = records_at(&block, decoded.records_offset, &decoded.texel_of);
+        for (slot, band) in decoded.bands.iter().enumerate() {
             let axis = if slot < BANDS { 1 } else { 0 };
             let expected = &band_lists(
-                records,
+                &records,
                 None,
                 axis,
                 banded.bbox[axis],
                 banded.bbox[axis + 2],
             )[slot % BANDS];
-            assert_eq!(indices, expected, "band {slot} lost curves");
+            for list in [&band.descending, &band.ascending] {
+                let mut sorted = list.clone();
+                sorted.sort_unstable();
+                assert_eq!(&sorted, expected, "band {slot} lost curves");
+            }
         }
         assert!(
             decoded
+                .bands
                 .iter()
-                .any(|band| band.len() < banded.count as usize),
+                .any(|band| band.descending.len() < banded.count as usize),
             "banding should cut some band's loop below the full curve set"
         );
+    }
+
+    /// The property the shader's early-out rests on: walking a band's list
+    /// forwards, a curve's maximum along the ray axis never rises again, so
+    /// the first curve whose maximum has fallen behind the sample proves every
+    /// curve after it has too (and the mirror image for the backward ray).
+    #[test]
+    fn band_lists_are_sorted_by_the_ray_axis_extremes_the_shader_breaks_on() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let banded = (36..200)
+            .filter_map(|glyph_id| get(&mut store, &mut font_system, font_id, glyph_id))
+            .find(|c| c.banded)
+            .expect("some glyph exceeds the banding threshold");
+        let block = slice_of(&store, &banded);
+        let decoded = decode_bands(&block, &banded);
+        let records = records_at(&block, decoded.records_offset, &decoded.texel_of);
+
+        let mut split_inside = 0;
+        for (slot, band) in decoded.bands.iter().enumerate() {
+            // Rays run across the banding axis: y-bands are crossed by
+            // horizontal rays, x-bands by vertical ones.
+            let ray = if slot < BANDS { 0 } else { 1 };
+            for pair in band.descending.windows(2) {
+                let (a, b) = (
+                    record_span(&records, pair[0], ray).1,
+                    record_span(&records, pair[1], ray).1,
+                );
+                assert!(a >= b, "band {slot} is not descending by maximum");
+            }
+            for pair in band.ascending.windows(2) {
+                let (a, b) = (
+                    record_span(&records, pair[0], ray).0,
+                    record_span(&records, pair[1], ray).0,
+                );
+                assert!(a <= b, "band {slot} is not ascending by minimum");
+            }
+            // The split is a coordinate the band's own curves reach, and it
+            // leaves work on both sides: neither direction is a no-op.
+            if let (Some(&first), Some(&last)) = (band.ascending.first(), band.descending.first()) {
+                let lo = record_span(&records, first, ray).0;
+                let hi = record_span(&records, last, ray).1;
+                assert!(
+                    band.split >= lo && band.split <= hi,
+                    "band {slot} split {} is outside [{lo}, {hi}]",
+                    band.split
+                );
+                split_inside += 1;
+            }
+        }
+        assert!(split_inside > 0, "the glyph should have populated bands");
+    }
+
+    /// Endpoint sharing is what makes a curve one texel instead of two, and
+    /// the shader only reads a curve's p2 out of the *next* texel, so the
+    /// packing has to put it there: consecutive curves of a contour are
+    /// consecutive texels, and the texel after a contour's last curve repeats
+    /// the point that contour started from.
+    #[test]
+    fn shared_curve_texels_hand_p2_to_the_next_texel_and_close_each_contour() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let mut multi_contour = 0;
+        let mut banded_glyphs = 0;
+        for glyph_id in 36..200 {
+            let Some(banded) = get(&mut store, &mut font_system, font_id, glyph_id) else {
+                continue;
+            };
+            if !banded.banded {
+                continue;
+            }
+            banded_glyphs += 1;
+            let block = slice_of(&store, &banded);
+            let decoded = decode_bands(&block, &banded);
+            let contours = check_shared_region(&block, &banded, &decoded);
+            if contours > 1 {
+                multi_contour += 1;
+            }
+        }
+        assert!(
+            banded_glyphs > 0,
+            "some glyph exceeds the banding threshold"
+        );
+        assert!(
+            multi_contour > 0,
+            "some glyph has a counter to share around"
+        );
+    }
+
+    /// The whole shared-endpoint invariant for one glyph, returning its contour
+    /// count.
+    fn check_shared_region(block: &[f32], banded: &GlyphCurves, decoded: &DecodedBlock) -> usize {
+        let point = |texel: u32| {
+            let start = (decoded.records_offset + texel as usize) * FLOATS_PER_TEXEL;
+            [block[start], block[start + 1]]
+        };
+        let p2_of = |texel: u32| {
+            let start = (decoded.records_offset + texel as usize) * FLOATS_PER_TEXEL;
+            [block[start + 4], block[start + 5]]
+        };
+
+        let mut contours = 1;
+        let mut contour_start = decoded.texel_of[0];
+        assert_eq!(contour_start, 0, "the first contour starts the region");
+        for pair in decoded.texel_of.windows(2) {
+            let (here, next) = (pair[0], pair[1]);
+            assert_eq!(
+                p2_of(here),
+                point(here + 1),
+                "curve {here}'s p2 must be the texel the shader reads next"
+            );
+            match next - here {
+                // Same contour: the next curve *is* this curve's p2 texel.
+                1 => {}
+                // A terminator sits between them, holding the closing point.
+                2 => {
+                    assert_eq!(
+                        point(here + 1),
+                        point(contour_start),
+                        "a contour's terminator repeats its first point"
+                    );
+                    contours += 1;
+                    contour_start = next;
+                }
+                gap => panic!("curves are one or two texels apart, not {gap}"),
+            }
+        }
+        let last = *decoded.texel_of.last().unwrap();
+        assert_eq!(
+            p2_of(last),
+            point(contour_start),
+            "the last contour closes too"
+        );
+        assert_eq!(
+            banded.record_texels,
+            shared_texels(banded.count as usize, contours),
+            "a texel per curve, a texel per contour"
+        );
+        contours
+    }
+
+    /// Every integer a banded block puts in a texel — list offsets, member
+    /// counts, curve texel offsets — has to survive f16, which stops counting
+    /// exactly at 2048. Real fonts are nowhere near it; the assertion is what
+    /// keeps the fallback in `banded_block` honest.
+    #[test]
+    fn banded_blocks_only_encode_integers_f16_holds_exactly() {
+        let (device, _) = testing::gpu();
+        let mut biggest = 0.0f32;
+        for (mut font_system, family) in [
+            (testing::font_system(), testing::STATIC_FAMILY),
+            (testing::variable_font_system(), testing::VARIABLE_FAMILY),
+        ] {
+            let font_id = testing::font_id_of(&font_system, family);
+            let mut store = CurveStore::new(device);
+            store.begin_frame(1);
+            for glyph_id in 1..400 {
+                let Some(curves) = get(&mut store, &mut font_system, font_id, glyph_id) else {
+                    continue;
+                };
+                if !curves.banded {
+                    continue;
+                }
+                let block = slice_of(&store, &curves);
+                let decoded = decode_bands(&block, &curves);
+                let mut integers: Vec<f32> = Vec::new();
+                for slot in 0..2 * BANDS {
+                    let entry = &block[slot * FLOATS_PER_TEXEL..][..FLOATS_PER_TEXEL];
+                    integers.extend([entry[0], entry[1], entry[3]]);
+                }
+                integers.extend(
+                    decoded
+                        .texel_of
+                        .iter()
+                        .map(|t| (decoded.records_offset + *t as usize) as f32),
+                );
+                for value in integers {
+                    assert_eq!(
+                        value,
+                        f16::from_f32(value).to_f32(),
+                        "{value} does not survive the texture"
+                    );
+                    assert!(value <= F16_EXACT_INT as f32);
+                    biggest = biggest.max(value);
+                }
+            }
+        }
+        println!("largest integer encoded in a block: {biggest}");
+        assert!(biggest > 0.0, "some glyph should have been banded");
+    }
+
+    /// The escape hatch: a glyph with more curves than f16 can address falls
+    /// back to the flat layout rather than encoding an offset it cannot hold.
+    #[test]
+    fn a_glyph_too_big_to_address_in_f16_gives_up_its_band_tables() {
+        // Curves strung along the diagonal, each in its own contour, so every
+        // one lands in a single band on both axes and the block grows with the
+        // record region rather than with the lists.
+        let ranges: Vec<([f32; 2], [f32; 2])> = (0..2100)
+            .map(|i| {
+                let t = i as f32 / 2100.0;
+                ([t, t + 0.001], [t, t + 0.001])
+            })
+            .collect();
+        let all = records_spanning(&ranges);
+        let contours = vec![1u32; ranges.len()];
+
+        let fits = ranges.len() / 4;
+        assert!(
+            banded_block(
+                &all[..fits * FLOATS_PER_CURVE],
+                None,
+                &contours[..fits],
+                [0.0, 0.0, 1.0, 1.0]
+            )
+            .is_some(),
+            "a few hundred curves address fine"
+        );
+        assert!(
+            banded_block(&all, None, &contours, [0.0, 0.0, 1.0, 1.0]).is_none(),
+            "past 2048 texels the block cannot be banded"
+        );
+    }
+
+    /// Control points are rounded to f16 by the flattener, not on the way to
+    /// the GPU, so what the CPU bands and sorts is what the shader reads — and
+    /// rounding a point that two records share leaves it shared.
+    #[test]
+    fn flattened_control_points_are_already_f16_and_stay_shared() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id(&font_system);
+        let mut store = CurveStore::new(device);
+
+        let mut checked = 0;
+        for glyph_id in 36..200 {
+            let Some(commands) = store.outline(
+                &mut font_system,
+                font_id,
+                glyph_id,
+                fontdb::Weight::NORMAL,
+                CacheKeyFlags::empty(),
+            ) else {
+                continue;
+            };
+            let (records, contours, bbox) = flatten(&commands);
+            for value in records.iter().chain(bbox.iter()) {
+                assert_eq!(*value, f16::from_f32(*value).to_f32(), "not an f16 value");
+            }
+            let mut curve = 0;
+            for n in contours {
+                for j in 1..n as usize {
+                    let previous = &records[(curve + j - 1) * FLOATS_PER_CURVE..];
+                    let next = &records[(curve + j) * FLOATS_PER_CURVE..];
+                    assert_eq!(
+                        previous[4..6],
+                        next[0..2],
+                        "p2 of a curve is p0 of the next"
+                    );
+                    checked += 1;
+                }
+                curve += n as usize;
+            }
+        }
+        assert!(checked > 100, "the font should have supplied contours");
+    }
+
+    // ---- Corner clips (#14) ----
+
+    /// A curve record through three explicit control points.
+    fn record_through(points: [[f32; 2]; 3]) -> Vec<f32> {
+        let [p0, p1, p2] = points;
+        vec![p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], 0.0, 0.0]
+    }
+
+    /// A closed polygon as records, each edge a line — control point at the
+    /// midpoint, which is exactly what the flattener emits for a straight
+    /// segment, so the curve through them is the segment itself.
+    fn polygon(points: &[[f32; 2]]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (i, p0) in points.iter().enumerate() {
+            let p2 = points[(i + 1) % points.len()];
+            let mid = [(p0[0] + p2[0]) * 0.5, (p0[1] + p2[1]) * 0.5];
+            out.extend(record_through([*p0, mid, p2]));
+        }
+        out
+    }
+
+    /// Points *on* the outline: every curve sampled along its length, and at
+    /// several blends when there is a second master. Sampled rather than
+    /// re-derived, so the check does not just repeat `corner_clips`'s own
+    /// arithmetic back at it.
+    fn outline_points(records: &[f32], b_records: Option<&[f32]>) -> Vec<[f32; 2]> {
+        const STEPS: usize = 64;
+        let mut points = Vec::new();
+        for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
+            let twin = b_records.map(|b| &b[index * FLOATS_PER_CURVE..]);
+            for blend in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let mut p = [[0.0; 2]; 3];
+                for (k, point) in p.iter_mut().enumerate() {
+                    for axis in 0..2 {
+                        let a = record[k * 2 + axis];
+                        let b = twin.map_or(a, |t| t[k * 2 + axis]);
+                        point[axis] = a + (b - a) * blend;
+                    }
+                }
+                for step in 0..=STEPS {
+                    let t = step as f32 / STEPS as f32;
+                    let s = 1.0 - t;
+                    points.push([
+                        s * s * p[0][0] + 2.0 * s * t * p[1][0] + t * t * p[2][0],
+                        s * s * p[0][1] + 2.0 * s * t * p[1][1] + t * t * p[2][1],
+                    ]);
+                }
+                if twin.is_none() {
+                    break;
+                }
+            }
+        }
+        points
+    }
+
+    /// The invariant the whole feature rests on: no point of the outline — at
+    /// any blend — lies inside a clipped corner triangle.
+    fn assert_clips_miss_the_ink(clips: [f32; 4], bbox: [f32; 4], points: &[[f32; 2]], what: &str) {
+        for (i, n) in CLIP_NORMALS.iter().enumerate() {
+            if clips[i] == 0.0 {
+                continue;
+            }
+            let corner = [
+                if n[0] > 0.0 { bbox[2] } else { bbox[0] },
+                if n[1] > 0.0 { bbox[3] } else { bbox[1] },
+            ];
+            let plane = n[0] * corner[0] + n[1] * corner[1] - clips[i];
+            for p in points {
+                assert!(
+                    n[0] * p[0] + n[1] * p[1] <= plane,
+                    "{what}: corner {i} clip {} cuts the outline at {p:?}",
+                    clips[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn support_planes_clip_exactly_the_empty_corners_of_a_point_set() {
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        // A triangle pointing up: the two top corners are empty by half a unit
+        // each, the two bottom ones are full.
+        let up = polygon(&[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]);
+        let clips = corner_clips(&up, None, unit);
+        assert_eq!(
+            clips,
+            [0.5, 0.5, 0.0, 0.0],
+            "the support planes of an upward triangle cut its top corners"
+        );
+        assert_clips_miss_the_ink(clips, unit, &outline_points(&up, None), "triangle");
+
+        // Upside down: the bottom corners are the empty ones now.
+        let down = polygon(&[[0.0, 1.0], [1.0, 1.0], [0.5, 0.0]]);
+        assert_eq!(corner_clips(&down, None, unit), [0.0, 0.0, 0.5, 0.5]);
+
+        // A shape that reaches every corner keeps its quad.
+        let square = polygon(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        assert_eq!(corner_clips(&square, None, unit), [0.0; 4]);
+
+        // A tall bbox: the legs are em distances, the same on both axes, which
+        // is what makes the cut 45° in em space however narrow the glyph.
+        let bbox = [0.0, 0.0, 0.5, 2.0];
+        let tall = polygon(&[[0.0, 0.0], [0.5, 0.0], [0.5, 2.0]]);
+        let clips = corner_clips(&tall, None, bbox);
+        assert_eq!(clips, [0.5, 0.0, 0.0, 0.0], "only the top-left is empty");
+        assert_clips_miss_the_ink(clips, bbox, &outline_points(&tall, None), "tall");
+    }
+
+    /// The support plane bounds the *curve*, not its control hull, and that is
+    /// the difference between clipping a round glyph and not: the middle
+    /// control point of a quarter circle sits exactly on the bbox corner, while
+    /// the arc itself stays 1 - sqrt(2)/2 of the box away from it.
+    #[test]
+    fn a_round_corner_is_clipped_even_though_a_control_point_sits_in_it() {
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        let arc = record_through([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]);
+        assert_eq!(
+            curve_support(&arc, [1.0, 1.0]),
+            1.5,
+            "the arc's furthest point along the diagonal is its midpoint"
+        );
+        let clips = corner_clips(&arc, None, unit);
+        assert!(
+            (clips[1] - 0.5).abs() < 1e-6,
+            "the top-right corner clips by half the box: {clips:?}"
+        );
+        assert_clips_miss_the_ink(clips, unit, &outline_points(&arc, None), "arc");
+        // A straight line between the same endpoints has no bulge, so the
+        // support plane sits further in still.
+        let chord = polygon(&[[0.0, 1.0], [1.0, 0.0]]);
+        assert!(corner_clips(&chord, None, unit)[1] > clips[1]);
+    }
+
+    #[test]
+    fn a_corner_triangle_under_the_area_threshold_is_not_worth_clipping() {
+        // Legs of `leg` remove leg²/2 of a unit box, so the 4% area threshold
+        // is a leg threshold of sqrt(0.08).
+        let cutoff = (2.0 * CLIP_MIN_AREA).sqrt();
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        for (leg, expected) in [(cutoff + 1e-3, cutoff + 1e-3), (cutoff - 1e-3, 0.0)] {
+            // The unit box with exactly that triangle taken off its top-right.
+            let records = polygon(&[
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 1.0 - leg],
+                [1.0 - leg, 1.0],
+                [0.0, 1.0],
+            ]);
+            let clips = corner_clips(&records, None, unit);
+            assert!(
+                (clips[1] - expected).abs() < 1e-5,
+                "leg {leg} gave {clips:?}"
+            );
+            assert_eq!(
+                [clips[0], clips[2], clips[3]],
+                [0.0; 3],
+                "the other three corners are full"
+            );
+        }
+    }
+
+    #[test]
+    fn clips_are_conservative_over_both_masters() {
+        // Master A leaves the top-left corner empty; master B fills it. The
+        // clip has to answer to both, or a blend toward B would lose ink.
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        let a = polygon(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
+        let b = polygon(&[[0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]);
+        assert!(
+            corner_clips(&a, None, unit)[0] > 0.0,
+            "master A alone would clip the top-left corner"
+        );
+        assert_eq!(
+            corner_clips(&a, Some(&b), unit)[0],
+            0.0,
+            "master B's ink must veto the clip"
+        );
+
+        // The real variable face: every glyph, both masters, blends between.
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::variable_font_system();
+        let font_id = testing::font_id_of(&font_system, testing::VARIABLE_FAMILY);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+        let flags = CacheKeyFlags::empty();
+        let mut clipped_glyphs = 0;
+        for glyph_id in 1..200 {
+            let Some(curves) = get(&mut store, &mut font_system, font_id, glyph_id) else {
+                continue;
+            };
+            if curves.count == 0 {
+                continue;
+            }
+            let outlines: Vec<Vec<f32>> = [AXIS.0, AXIS.1]
+                .iter()
+                .filter_map(|axis| {
+                    store.outline(
+                        &mut font_system,
+                        font_id,
+                        glyph_id,
+                        axis_weight(*axis),
+                        flags,
+                    )
+                })
+                .map(|commands| flatten(&commands).0)
+                .collect();
+            assert_eq!(outlines.len(), 2, "a variable face has two masters");
+            assert_clips_miss_the_ink(
+                curves.clips,
+                curves.bbox,
+                &outline_points(&outlines[0], Some(&outlines[1])),
+                &format!("Manrope glyph {glyph_id}"),
+            );
+            clipped_glyphs += usize::from(curves.clips.iter().any(|c| *c > 0.0));
+        }
+        assert!(
+            clipped_glyphs > 0,
+            "some Manrope glyph should clip a corner"
+        );
+    }
+
+    #[test]
+    fn real_glyphs_clip_the_corners_a_reader_would_expect() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id_of(&font_system, testing::STATIC_FAMILY);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let clips_of = |store: &mut CurveStore, font_system: &mut FontSystem, ch: char| {
+            let glyph_id = font_system
+                .get_font(font_id, fontdb::Weight::NORMAL)
+                .expect("face")
+                .as_swash()
+                .charmap()
+                .map(ch);
+            let curves = get(store, font_system, font_id, glyph_id).expect("outline");
+            let commands = store
+                .outline(
+                    font_system,
+                    font_id,
+                    glyph_id,
+                    fontdb::Weight::NORMAL,
+                    CacheKeyFlags::empty(),
+                )
+                .expect("outline commands");
+            let (records, _, _) = flatten(&commands);
+            assert_clips_miss_the_ink(
+                curves.clips,
+                curves.bbox,
+                &outline_points(&records, None),
+                &format!("'{ch}'"),
+            );
+            curves.clips
+        };
+
+        // 'A' is the paper's own example: both top corners are empty triangles.
+        let a = clips_of(&mut store, &mut font_system, 'A');
+        assert!(a[0] > 0.0 && a[1] > 0.0, "'A' clips its top corners: {a:?}");
+        assert_eq!([a[2], a[3]], [0.0, 0.0], "…and keeps its feet");
+        // '7' is the mirror case: a full top bar, and a diagonal that leaves
+        // the bottom *right* corner empty.
+        let seven = clips_of(&mut store, &mut font_system, '7');
+        assert!(
+            seven[2] > 0.0,
+            "'7' clips its bottom-right corner: {seven:?}"
+        );
+        assert_eq!([seven[0], seven[1]], [0.0, 0.0], "…and keeps its bar");
+        // A round glyph clips at all only because the bound is the curve's
+        // own, not its control hull's — the arc test above is the isolated
+        // demonstration. DejaVu's 'o' clears the area threshold on the corners
+        // its slightly flattened sides leave emptiest.
+        let o = clips_of(&mut store, &mut font_system, 'o');
+        assert!(o.iter().any(|c| *c > 0.0), "'o' clips a corner: {o:?}");
+        // A bar fills its box; nothing to spare.
+        let bar = clips_of(&mut store, &mut font_system, '|');
+        assert_eq!(bar, [0.0; 4], "a rectangle has no corner to spare");
     }
 
     #[test]
@@ -1244,6 +2287,7 @@ mod tests {
         for expected in [
             format!("const CURVE_TEX_WIDTH: u32 = {CURVE_TEX_WIDTH}u;"),
             format!("const BANDS: u32 = {BANDS}u;"),
+            format!("const BAND_ENTRY_TEXELS: u32 = {BAND_ENTRY_TEXELS}u;"),
             format!("const BANDED_FLAG: u32 = 0x{BANDED_FLAG:08X}u;"),
         ] {
             assert!(
@@ -1318,18 +2362,31 @@ mod tests {
     /// Manrope's axis, the one the variable-font tests interpolate over.
     const AXIS: (f32, f32) = (200.0, 800.0);
 
-    /// A glyph's block split into (band tables, master A records, master B
-    /// records). B is empty for a single-master glyph.
+    /// A glyph's block split into (band tables, master A's records region,
+    /// master B's). B is empty for a single-master glyph. The regions are raw
+    /// lanes — unshared 8-lane records in a flat block, shared curve texels in
+    /// a banded one.
     fn masters(store: &CurveStore, curves: &GlyphCurves) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let block = slice_of(store, curves);
-        let records = curves.count as usize * FLOATS_PER_CURVE;
-        let masters = if curves.b_offset == 0 { 1 } else { 2 };
-        let head = block.len() - masters * records;
+        let region = curves.record_texels as usize * FLOATS_PER_TEXEL;
+        let masters = if curves.dual_master { 2 } else { 1 };
+        let head = block.len() - masters * region;
         (
             block[..head].to_vec(),
-            block[head..head + records].to_vec(),
-            block[head + records..].to_vec(),
+            block[head..head + region].to_vec(),
+            block[head + region..].to_vec(),
         )
+    }
+
+    /// Every control point a records region holds. Lanes come in (x, y) pairs;
+    /// a record's padding and a contour terminator's second pair are zeros,
+    /// and a genuine control point at the origin costs nothing to skip.
+    fn points_in(region: &[f32]) -> Vec<[f32; 2]> {
+        region
+            .chunks_exact(2)
+            .map(|p| [p[0], p[1]])
+            .filter(|p| *p != [0.0, 0.0])
+            .collect()
     }
 
     #[test]
@@ -1358,12 +2415,12 @@ mod tests {
         store.begin_frame(1);
 
         let curves = get(&mut store, &mut font_system, font_id, 36).expect("'A' has an outline");
-        assert_eq!(curves.b_offset, 0);
+        assert!(!curves.dual_master);
         assert_eq!(curves.b_first(), 0, "the shader must skip the second fetch");
         assert_eq!(curves.weight_t, 0.0);
         let (_, a, b) = masters(&store, &curves);
         assert!(b.is_empty(), "no second master to store");
-        assert_eq!(a.len(), curves.count as usize * FLOATS_PER_CURVE);
+        assert_eq!(a.len(), curves.record_texels as usize * FLOATS_PER_TEXEL);
     }
 
     #[test]
@@ -1387,9 +2444,22 @@ mod tests {
             seen_banded |= curves.banded;
 
             // B's records sit exactly one A-region past A's, so a single
-            // constant offset takes the shader from any record to its twin.
-            assert_eq!(curves.b_offset, curves.count * TEXELS_PER_CURVE as u32);
-            assert_eq!(curves.b_first(), curves.first + curves.b_offset);
+            // constant offset takes the shader from any record to its twin —
+            // whether that region is unshared records or shared curve texels.
+            assert!(curves.dual_master);
+            if curves.banded {
+                assert!(
+                    (curves.count + 1..=curves.count * TEXELS_PER_CURVE as u32)
+                        .contains(&curves.record_texels),
+                    "a shared region is a texel per curve plus one per contour"
+                );
+            } else {
+                assert_eq!(
+                    curves.record_texels as usize,
+                    curves.count as usize * TEXELS_PER_CURVE
+                );
+            }
+            assert_eq!(curves.b_first(), curves.first + curves.record_texels);
             assert_eq!(curves.first % 2, 0, "records must not straddle a row");
             assert_eq!(curves.texels % 2, 0);
             assert!(
@@ -1402,13 +2472,9 @@ mod tests {
             assert_ne!(a, b, "the axis ends are different shapes");
             // The bbox is the union: every control point of either master is
             // inside it, so the padded quad covers the whole blend range.
-            let records = a.chunks_exact(FLOATS_PER_CURVE);
-            for record in records.chain(b.chunks_exact(FLOATS_PER_CURVE)) {
-                // The trailing two floats of a record are padding, not a point.
-                for point in record[..6].chunks_exact(2) {
-                    assert!(point[0] >= curves.bbox[0] && point[0] <= curves.bbox[2]);
-                    assert!(point[1] >= curves.bbox[1] && point[1] <= curves.bbox[3]);
-                }
+            for point in points_in(&a).into_iter().chain(points_in(&b)) {
+                assert!(point[0] >= curves.bbox[0] && point[0] <= curves.bbox[2]);
+                assert!(point[1] >= curves.bbox[1] && point[1] <= curves.bbox[3]);
             }
         }
         assert!(seen_flat && seen_banded, "both block shapes should appear");
@@ -1428,19 +2494,25 @@ mod tests {
             .expect("some Manrope glyph exceeds the banding threshold");
 
         let block = slice_of(&store, &banded);
-        let (head, a, b) = masters(&store, &banded);
-        let records_offset = head.len() / FLOATS_PER_TEXEL;
-        let a_texels = banded.count as usize * TEXELS_PER_CURVE;
+        let decoded = decode_bands(&block, &banded);
+        let records_offset = decoded.records_offset;
+        let a_texels = banded.record_texels as usize;
+        // The two masters, unpacked back into the three-point records the
+        // layout helpers reason about.
+        let a = records_at(&block, records_offset, &decoded.texel_of);
+        let b = records_at(&block, records_offset + a_texels, &decoded.texel_of);
 
         for slot in 0..2 * BANDS {
-            let list = block[slot * 2] as usize;
-            let len = block[slot * 2 + 1] as usize;
-            for i in 0..len {
-                let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
-                assert!(
-                    (records_offset..records_offset + a_texels).contains(&texel),
-                    "band {slot} points outside master A's records"
-                );
+            let entry = &block[slot * FLOATS_PER_TEXEL..][..FLOATS_PER_TEXEL];
+            let len = entry[1] as usize;
+            for list in [entry[0] as usize, entry[3] as usize] {
+                for i in 0..len {
+                    let texel = block[list * FLOATS_PER_TEXEL + i] as usize;
+                    assert!(
+                        (records_offset..records_offset + a_texels).contains(&texel),
+                        "band {slot} points outside master A's records"
+                    );
+                }
             }
         }
         // Membership is decided over both masters, so a blended curve can
@@ -1449,8 +2521,31 @@ mod tests {
             .iter()
             .enumerate()
         {
-            let expected = block[slot * 2 + 1] as usize;
+            let expected = block[slot * FLOATS_PER_TEXEL + 1] as usize;
             assert_eq!(list.len(), expected, "y-band {slot} lost curves");
+        }
+
+        // …and the sort keys span both masters too. The shader's early-out
+        // compares the same two-master extreme, so a list ordered by master A
+        // alone could break off in front of a curve that a blend toward B has
+        // pushed back across the ray.
+        let ray_spans = spans(&a, Some(&b), 0);
+        for (slot, band) in bands(&a, Some(&b), 1, banded.bbox[1], banded.bbox[3])
+            .iter()
+            .enumerate()
+        {
+            for pair in band.descending.windows(2) {
+                assert!(
+                    ray_spans[pair[0] as usize].1 >= ray_spans[pair[1] as usize].1,
+                    "y-band {slot} is not descending by the two-master maximum"
+                );
+            }
+            for pair in band.ascending.windows(2) {
+                assert!(
+                    ray_spans[pair[0] as usize].0 <= ray_spans[pair[1] as usize].0,
+                    "y-band {slot} is not ascending by the two-master minimum"
+                );
+            }
         }
     }
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0 — 2026-08-14
+
+- Band lists are sorted so each ray stops at the first curve past its
+  antialiasing window, and bands split at the median of their curves with rays
+  on each side firing toward the near edge. The Lengyel-2017 benchmark drops
+  from 0.64 to 0.54 ms/frame at 32 px/em with output byte-identical; small
+  sizes keep the previous path via the existing size gate.
+
+- Corner-clipped glyph geometry above 48 px/em: each corner of a glyph's quad
+  is cut back to the outline's own support plane along the diagonal, turning
+  the quad into an octagon built in the vertex shader from four numbers on the
+  instance. Fragment invocations drop 5% on a 64 px/em page and 11% on
+  large-glyph content; smaller text keeps the plain quad draw untouched.
+
+- COLR/CPAL v0 color glyphs render on the vector path: a color emoji is a stack
+  of ordinary outlines, so each layer extracts into the curve store and draws as
+  one instanced quad in its palette color, crisp at any size and costing no
+  atlas space. COLRv1, CBDT, sbix and SVG color fonts still take the bitmap
+  atlas. Adds `FONT_TWEMOJI_COLR`, a 2 KB four-emoji COLRv0 test font.
+
+- Curve storage moved from RGBA32F to RGBA16F with contour-aware endpoint
+  sharing: a banded glyph costs one texel per curve plus one per contour, and
+  the offscreen scene's curve data went from 281 KB to 107 KB. Coordinates are
+  rounded to f16 as they are flattened, so band tables and the shader agree on
+  the outline to the bit.
+
 ## 0.1.0 — 2026-08-13
 
 First release.

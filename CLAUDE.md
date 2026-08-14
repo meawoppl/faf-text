@@ -17,8 +17,24 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   faf-text` renders every feature to `offscreen.png` (works headless — this
   box has an RTX 3070; wgpu picks Vulkan). `examples/panes3d` does the same for
   3D panes (`panes3d.png`). The offscreen scene is a **regression baseline**:
-  its md5 is `beec6786631dd25e4fcad2c801839244` and any change to placement
-  math has to keep it.
+  its md5 is `4f37b594d6e3f1526fe418781131d273` (it was
+  `729ddb4ccb578c75ebceb95a8bf8249c` before #14's corner clipping re-triangulated
+  the two glyphs over its 48 px/em gate, and
+  `beec6786631dd25e4fcad2c801839244` before the RGBA16F curve storage of #13
+  requantized the outlines) and any change to placement math has to keep it.
+
+  its md5 is `293e8f38a905c6731ca9ebb7c251ba6b` (it was
+  `729ddb4ccb578c75ebceb95a8bf8249c` before #15 grew the canvas 600 → 880 px
+  for the COLR strip, and `beec6786631dd25e4fcad2c801839244` before the RGBA16F
+  curve storage of #13 requantized the outlines) and any change to placement
+  math has to keep it. The strip was *added below* the old scene on purpose:
+  the top 600 rows of the new PNG are still byte-identical to the old one, so
+  "did this move any existing pixel" is answerable even across a resize (build
+  the pre-change tree in a throwaway `git worktree` with its own
+  `CARGO_TARGET_DIR` and diff the crops).
+  `panes3d.png` is `80928801bd41af0a08cacf96772270c1` and f16 did *not* move
+  it: at 3D-pane sizes the quantization stays under half a level of 8-bit
+  coverage.
 - Wasm build: `~/.cargo/bin/wasm-pack build crates/faf-text-web --target web
   --out-dir ../../web/pkg --release` (wasm-pack is in ~/.cargo/bin, which is
   NOT on PATH). Release builds spend minutes in wasm-opt; run in background.
@@ -122,6 +138,45 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   entries, index-list entries) is an offset from it, so compaction relocates a
   glyph by memcpy + rewriting `first`. Blocks are always an even number of
   texels so a two-texel curve record never straddles a row.
+- The curve texture is **RGBA16F** (#13). Three things fall out of that and all
+  three are load-bearing:
+  - **Quantize in the flattener, not on upload.** `Flattener::push` rounds
+    every control point to f16, so the bbox, band membership, the early-out
+    sort keys and the shader all describe one outline. Rounding later would let
+    the CPU sort by numbers the GPU does not have.
+  - **f16 holds integers exactly only to 2048**, and band headers/index lists
+    are integers in texels. `banded_block` returns `None` past that and the
+    glyph keeps the flat layout (which addresses records with u32 arithmetic
+    and stores no integers at all). DejaVu Sans and Manrope top out at 254, so
+    it takes a ~550-curve glyph to trip.
+  - **Endpoint sharing only in banded blocks.** p2 of a curve is p0 of the
+    next within a contour (the flattener carries the point, so they are the
+    same float), so a curve is one texel plus one terminator per contour and
+    `fetch_pair`'s two-texel read is unchanged. The flat loop walks records by
+    arithmetic (`i * 2`), which sharing would break — stepping over contour
+    terminators needs an index list or a per-texel branch, and a branch in that
+    loop has measured 25% here. Flat blocks are ≤16 curves, so it costs ~130
+    bytes a glyph and keeps both paths bit-identical
+    (`band_tables_do_not_move_a_single_pixel` still passes exactly).
+- f16 quantization is worth **≤4.9e-4 em** (2^-11 near 1.0), but the *pixel*
+  effect is not that number times px/em: the offscreen scene moved 2882 px of
+  576000, 83% of them by ≤2/255, with a tail to **45/255** on near-tangent
+  edges where a crossing position is ill-conditioned. Proven to be quantization
+  and nothing else by rendering the same shared-endpoint layout through an
+  RGBA32F texture: unquantized it is **byte-identical** to the pre-#13 scene,
+  quantized it reproduces the RGBA16F render exactly. If a scene ever needs
+  more precision than this, the move is per-glyph fixed point (Rgba16Unorm over
+  the bbox, ~1e-5 em), not a wider float.
+- Halving the curve-fetch bytes did **not** move frame time on the 3070 (bench
+  0.549 → 0.545 ms/frame, stress 1.90 → 1.86 inside its ±0.2 noise). The whole
+  offscreen curve set is ~107 KB and already sat in L2, and #12 had already cut
+  the fetch *count*; #13 buys memory (2.6×) and bandwidth headroom for WebGL2
+  and mobile, not frames here.
+- RGBA16F is *better* supported than RGBA32F on WebGL2, not worse: wgpu's GLES
+  backend gives it `TEXTURE_BINDING | FILTERABLE | STORAGE` with no extension,
+  where `Rgba32Float` is sampled-but-unfilterable. A `Float { filterable:
+  false }` bind-group layout accepts it (wgpu only rejects the other
+  direction), so the curve binding did not change.
 - Band tables (>16 curves) split the glyph's **em bbox**, not the instance
   quad: the quad's 1.5px pad is a size-dependent number of em, and bands are
   baked once per glyph. The renderer passes `band_scale`/`band_bias` to map the
@@ -129,6 +184,67 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   range overlaps it ±5% of a band height — leave a curve out and its winding
   contribution is exactly 0.0, which is why banding is bit-for-bit
   pixel-identical to the flat loop (assert this with the offscreen example).
+- Sorted band lists + early-out + median split (#12) keep that bit-identity:
+  every skipped curve contributes exactly 0.0, and reordering the adds turns
+  out not to matter because a band+ray almost never has more than two *nonzero*
+  terms (addition of two floats is commutative to the bit). `offscreen.png` and
+  `panes3d.png` md5s are unchanged, and so is `band_tables_do_not_move_a_single_pixel`,
+  which now also renders at 40px so the backward-ray path is covered.
+- **The backward ray fires toward the *near* edge of the glyph, not the far
+  one.** A forward (+axis) ray counts crossings *ahead* of the sample and stops
+  at the first curve behind it, so it is cheap on the high side of a band and
+  dear on the low side; samples below the median split must therefore fire
+  backwards. Getting that comparison inverted still renders correctly (the two
+  directions are mathematically equal) and cost 45% — `bench` went 0.63 → 0.85
+  instead of → 0.59. Correct-but-slow is the failure mode to watch for here.
+- Backward rays need no branch in `curve_winding`: pass a **negative**
+  `inv_diameter` (which turns saturate(0.5 + m·Cx) into saturate(0.5 − m·Cx))
+  and negate the band's sum (which undoes the crossing-sign swap). The identity
+  saturate(0.5 − x) = 1 − saturate(0.5 + x) plus "signed crossings over a whole
+  line sum to zero" makes the two directions agree exactly.
+- Corner clipping (#14) is **geometry, and only geometry**: the vertex shader
+  turns the quad into an octagon from a `vec4` of per-instance clip legs, the
+  curve texture is untouched, and the four clips live on `GlyphCurves` (CPU
+  side). Things that turned out to matter:
+  - **Bound the curve, not the control hull.** A quarter circle's middle
+    control point sits *exactly* on the corner of its bounding box, so
+    control-point support planes clip no round glyph at all (DejaVu's 'O', 'e',
+    'c', the bowl of a 'Q' — nothing). `dot(B(t), n)` is a scalar quadratic;
+    its max over [0,1] is an endpoint or the vertex, three lines of code, and
+    just as conservative — the fragment shader tests the curve, not the hull.
+  - Blend masters for free: a Bézier is linear in its control points, so the
+    blended curve is the pointwise blend and `max(h_a, h_b)` bounds every
+    `weight_t`.
+  - **A differently-triangulated quad is not byte-identical.** The rasterizer
+    builds attribute gradients from the actual vertices, so re-splitting the
+    same rectangle along the other diagonal moves interpolated varyings by an
+    ulp and `fwidth` by ~1e-4 relative — 88 pixels of the offscreen scene, up
+    to 98/255, when the *whole* scene switches. Hence the fan is ordered so the
+    unclipped case emits `quad_corner`'s exact six vertices in its exact order,
+    and blocks with nothing clipped still `draw(0..6)`. With clipping on, the
+    two glyphs past the gate move 72 pixels by at most 1/255 (total ink
+    75624048 → 75624055): that is the interpolation wobble, not lost ink, and
+    it is why the offscreen md5 changed.
+  - Savings are real but modest and *scene-dependent*: ~5% of a glyph's bbox on
+    average over ASCII in DejaVu Sans (the 4%-of-bbox threshold rejects the
+    marginal corners), 5.3% of fragment invocations on a 64 px/em bench page,
+    11% on a large-glyph sample, 1.2% on the whole offscreen scene (where only
+    a 64 px title and a 300 px "Qg" clear the 48 px/em gate).
+- Pick the ray direction with `select`, never with an `if` around two copies of
+  the loop: neighbouring fragments land on opposite sides of a split constantly,
+  and a warp executing both copies eats the whole win.
+- The early-out's *granularity* is size-dependent and that is worth 7%: testing
+  the break after every curve makes each fetch wait on the previous compare,
+  which is a loss at 11px (`stress` 1.87 → 2.0) and a win at 32px (`bench` 0.59
+  → 0.54). Below the size gate the break is tested once per index texel, on the
+  last of the four — the list is sorted, so that curve's bound is the smallest
+  of the group and the test is just as conservative.
+- A sorted list's key must bound **both** masters (max over A's and B's control
+  points), and the shader's early-out has to compare that same two-master
+  number — not the blended outline's max, which is smaller and would break the
+  loop in front of a curve that still crosses the ray. `fetch_pair` keeps the
+  masters apart for exactly that; `fetch_curve` is `blend_pair(fetch_pair(…))`
+  so the flat path is unchanged.
 - Variable weight: a `wght` face is extracted at both axis ends and master B's
   records go in a parallel region after A's, so one constant (`b_offset =
   count * 2` texels) reaches any twin and band lists keep indexing A. Band
@@ -242,6 +358,30 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   in `upload_uniforms` where the composed matrix already exists, and cached on
   the block so `render(&self)` can pick a pipeline per block.
 
+- COLR/CPAL (`colr.rs`, #15): a COLRv0 color glyph is a *stack of ordinary
+  glyphs*, so the whole feature is a cache plus a loop in `push_color_layers` —
+  the layers extract through `CurveStore::get_or_insert` untouched and the
+  renderer emits one vector instance each, in COLR order (instances draw in
+  queue order, which *is* the painter's algorithm the format asks for).
+  Palette 0, and the run color's alpha multiplies the palette alpha; palette
+  index 0xFFFF means "the text color" and takes the run's color whole.
+- ttf-parser 0.25 is already in the tree via fontdb, but cosmic-text does not
+  re-export it, so `cargo add ttf-parser` (same version, one copy in the lock).
+  It parses the sfnt/collection table directory and CPAL (BGRA behind a
+  per-palette index array); the COLRv0 base-glyph/layer arrays are read by hand
+  because ttf-parser only exposes them through a v1-shaped `Painter` trait,
+  which never says *which* layer asked for 0xFFFF. Font bytes come from
+  `FontSystem::get_font(id, weight).data()` plus `db().face(id).index`.
+- `ColrCache` caches two things and the coarse one is load-bearing: a per-font
+  "has usable COLRv0" bool, so an ordinary text run does not leave a "not a
+  color glyph" entry per letter. COLRv1 → the whole font is marked unusable and
+  goes to the bitmap atlas (gradients/transforms/composites have no expression
+  in the winding shader), which is also where CBDT (NotoColorEmoji), sbix and
+  SVG stay.
+- A color glyph is all-or-nothing per frame: if the curve store overflows
+  partway through a layer stack, `push_color_layers` truncates the instances it
+  pushed and returns false so the glyph falls back to the atlas whole. Half a
+  rocket is worse than a soft one.
 - Terminal grid (`grid.rs`): char → glyph id is
   `font.as_swash().charmap().map(ch)` (0 = miss), and the advance is
   `font.as_swash().glyph_metrics(&[]).scale(px).advance_width(id)`. Both are

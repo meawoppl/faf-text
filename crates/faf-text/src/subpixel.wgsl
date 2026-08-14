@@ -46,20 +46,24 @@ fn vector_subpixel_fs(in: VectorOutput) -> SubpixelOutput {
     var wind_x = array<f32, 3>(0.0, 0.0, 0.0);
     var wind_y = array<f32, 3>(0.0, 0.0, 0.0);
     if (in.count & BANDED_FLAG) != 0u {
+        let big = max(fw.x, fw.y) * SPLIT_MIN_PX_PER_EM < 1.0;
         // All three stripes cast along the fragment's own y, so they share one
         // band header entry — the offset that separates them is along the ray.
+        // It also puts them a third of a pixel apart across the band's split,
+        // which the direction choice ignores: both lists hold the same curves,
+        // so picking the "wrong" one for a stripe costs a fetch, not a pixel.
         let y_entry = band_entry(in.first, band_of(in.fraction.y));
         for (var stripe = 0u; stripe < 3u; stripe += 1u) {
             let os = vec2<f32>(stripe_offset(stripe) * fw.x, 0.0);
-            wind_x[stripe] = band_winding(
-                block, y_entry, in.em, os, inv_diameter.x, false);
+            wind_x[stripe] = band_rays(
+                block, y_entry, in.em, os, inv_diameter.x, false, big);
         }
         for (var tap = 0u; tap < taps; tap += 1u) {
             let off = (f32(tap) + 0.5) / f32(taps) - 0.5;
             let ox = vec2<f32>(0.0, off * fw.x);
             let x_band = band_of(in.fraction.x + off * fw.x * in.frac_per_em.x);
-            wind_y[tap] = band_winding(
-                block, band_entry(in.first, BANDS + x_band), in.em, ox, inv_diameter.y, true);
+            wind_y[tap] = band_rays(
+                block, band_entry(in.first, BANDS + x_band), in.em, ox, inv_diameter.y, true, big);
         }
     } else {
         for (var i = 0u; i < in.count; i += 1u) {

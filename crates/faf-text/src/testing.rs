@@ -7,7 +7,9 @@ use std::sync::OnceLock;
 use cosmic_text::fontdb;
 
 use crate::renderer::TextRenderer;
-use crate::{FONT_DEJAVU_SANS, FONT_MANROPE_VARIABLE, FontSystem, font_system_from_fonts};
+use crate::{
+    FONT_DEJAVU_SANS, FONT_MANROPE_VARIABLE, FONT_TWEMOJI_COLR, FontSystem, font_system_from_fonts,
+};
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -65,6 +67,120 @@ pub fn dual_source_gpu() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
     .as_ref()
 }
 
+/// A headless device with `PIPELINE_STATISTICS_QUERY`, or `None` where the
+/// adapter has no such feature. Only the fill-rate measurements need it, and
+/// they skip themselves without it.
+pub fn stats_gpu() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
+    static GPU: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
+    GPU.get_or_init(|| {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .expect("no GPU adapter available");
+            if !adapter
+                .features()
+                .contains(wgpu::Features::PIPELINE_STATISTICS_QUERY)
+            {
+                return None;
+            }
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::PIPELINE_STATISTICS_QUERY,
+                    ..Default::default()
+                })
+                .await
+                .ok()
+        })
+    })
+    .as_ref()
+}
+
+/// Fragment-shader invocations one frame of `renderer` costs, counted by the
+/// hardware — the number corner clipping (#14) is out to reduce. Includes the
+/// helper invocations `fwidth` forces, since those are real work; what it
+/// measures is what the GPU actually ran.
+pub fn fragment_invocations(
+    (device, queue): &(wgpu::Device, wgpu::Queue),
+    renderer: &mut TextRenderer,
+    width: u32,
+    height: u32,
+) -> u64 {
+    renderer.finish(device, queue, [width as f32, height as f32]);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fill-count target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("fragment invocations"),
+        ty: wgpu::QueryType::PipelineStatistics(
+            wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+        ),
+        count: 1,
+    });
+    // One u64 per statistic asked for.
+    let resolved = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("query resolve"),
+        size: 8,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("query readback"),
+        size: 8,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("fill-count pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.begin_pipeline_statistics_query(&queries, 0);
+        renderer.render(&mut pass);
+        pass.end_pipeline_statistics_query();
+    }
+    encoder.resolve_query_set(&queries, 0..1, &resolved, 0);
+    encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, 8);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let data = slice.get_mapped_range().unwrap();
+    u64::from_le_bytes(data[..8].try_into().unwrap())
+}
+
 /// A font system holding just DejaVu Sans, so glyph ids are stable.
 pub fn font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_DEJAVU_SANS])
@@ -76,11 +192,44 @@ pub fn variable_font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_MANROPE_VARIABLE])
 }
 
+/// A font system with the vendored COLRv0 emoji subset in it, whose glyphs are
+/// stacks of palette-colored outlines rather than bitmaps.
+pub fn color_font_system() -> FontSystem {
+    font_system_from_fonts(&[FONT_DEJAVU_SANS, FONT_TWEMOJI_COLR])
+}
+
 /// Family name of the static face the tests fall back on.
 pub const STATIC_FAMILY: &str = "DejaVu Sans";
 
 /// Family name of the face [`variable_font_system`] is loaded for.
 pub const VARIABLE_FAMILY: &str = "Manrope";
+
+/// Family name of the face [`color_font_system`] adds.
+pub const COLOR_FAMILY: &str = "Twemoji Mozilla";
+
+/// Where this box keeps a CBDT (bitmap) color font — the negative case for the
+/// COLR path, which has to leave it on the atlas. Tests using it skip
+/// themselves when it is missing.
+pub const CBDT_FONT_PATH: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+/// A font system holding the CBDT color font above, or `None` where this box
+/// does not have it.
+pub fn bitmap_color_font_system() -> Option<FontSystem> {
+    let data = std::fs::read(CBDT_FONT_PATH).ok()?;
+    Some(FontSystem::new_with_fonts([fontdb::Source::Binary(
+        std::sync::Arc::new(data),
+    )]))
+}
+
+/// The glyph id `ch` maps to in a face, or `None` when the face has no glyph
+/// for it (swash reports a miss as glyph 0).
+pub fn glyph_id_of(font_system: &mut FontSystem, id: fontdb::ID, ch: char) -> Option<u16> {
+    let font = font_system.get_font(id, fontdb::Weight::NORMAL)?;
+    match font.as_swash().charmap().map(ch) {
+        0 => None,
+        glyph_id => Some(glyph_id),
+    }
+}
 
 /// The id of the first face in `font_system`.
 pub fn font_id(font_system: &FontSystem) -> fontdb::ID {

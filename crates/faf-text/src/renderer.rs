@@ -6,6 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::Color;
 use crate::arena::{Arena, REPACK_FRAGMENTATION, Span};
 use crate::atlas::Atlas;
+use crate::colr::ColrCache;
 use crate::curves::{CurveStore, GlyphKey};
 use crate::math;
 use crate::view::Rect;
@@ -152,6 +153,21 @@ const BLOCK_SNAP: u32 = 1;
 /// came out of a matrix product.
 const AXIS_EPSILON: f32 = 1e-6;
 
+/// Pixels per em below which a glyph keeps the plain quad instead of the
+/// corner-clipped octagon. Lengyel 2017 §3 gates the clip on size for occupancy
+/// — at 11 px/em a corner triangle is a handful of pixels and the four extra
+/// primitives cost more than the fill they save — and the threshold is the
+/// paper's own ~48 px/em.
+const CLIP_MIN_PX_PER_EM: f32 = 48.0;
+
+/// Vertices a vector-glyph draw emits when the block has a clipped glyph in it:
+/// the octagon of `octagon_corner` in shaders.wgsl — its inner quad, then one
+/// triangle per corner. Blocks with nothing clipped draw [`QUAD_VERTICES`],
+/// which are that inner quad and nothing else.
+const OCTAGON_VERTICES: u32 = 18;
+/// Vertices every other draw emits: two triangles of a unit quad.
+const QUAD_VERTICES: u32 = 6;
+
 /// Stride between per-block uniforms. The real stride is this raised to the
 /// device's `min_uniform_buffer_offset_alignment`; 256 is that alignment's
 /// worst case (and what WebGL2 reports), so blocks cost the same everywhere.
@@ -201,6 +217,11 @@ struct VectorGlyphInstance {
     /// Base texel of the master-B records, 0 for a single-master glyph — the
     /// fast path every static font takes.
     b_first: u32,
+    /// How deep the vertex shader may cut each corner of the quad off, in em:
+    /// [`crate::curves::GlyphCurves::clips`] when this glyph is big enough on
+    /// screen to be worth an octagon, all zeros when it is not. See
+    /// `octagon_corner` in shaders.wgsl.
+    clip: [f32; 4],
 }
 
 /// Build the quad for one outline glyph: the em bbox padded by 1.5 px for the
@@ -213,6 +234,7 @@ fn vector_instance(
     font_size: f32,
     color: [f32; 4],
     weight_t: f32,
+    clip_min_px_per_em: f32,
 ) -> VectorGlyphInstance {
     let pad = 1.5 / font_size;
     let min_x = gc.bbox[0] - pad;
@@ -238,7 +260,36 @@ fn vector_instance(
         band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
         weight_t,
         b_first: gc.b_first(),
+        // The size gate, decided here because the px size is a CPU number and
+        // the clip legs are not: below it a glyph's corner triangles are a few
+        // pixels each, and Lengyel's caveat — tiny triangles cost more
+        // occupancy than they save fill — bites.
+        clip: if font_size >= clip_min_px_per_em {
+            gc.clips
+        } else {
+            [0.0; 4]
+        },
     }
+}
+
+/// One glyph resolved to "what to draw and where", as the COLR path needs it.
+/// Both queueing paths reach it with the same eight numbers — `push_text` from
+/// a shaped run, `push_glyphs` from a [`GlyphSpec`] — and bundling them keeps
+/// the two call sites honest about the order.
+struct GlyphDraw {
+    font_id: fontdb::ID,
+    glyph_id: u16,
+    weight: fontdb::Weight,
+    flags: CacheKeyFlags,
+    /// Unsnapped pen position of the glyph's origin, in block pixels.
+    pos: [f32; 2],
+    font_size: f32,
+    /// The run's color, *before* [`TextRenderer::shade`]: a layer's palette
+    /// color is multiplied by this one's alpha, and a layer that asks for the
+    /// text color takes it whole.
+    color: Color,
+    /// Master blend override, or `None` to use each glyph's shaped weight.
+    weight_t: Option<f32>,
 }
 
 /// A decoration's shape. Every kind draws from one pipeline, so a block's
@@ -482,6 +533,11 @@ struct Block {
     /// lose it draw their glyphs with the grayscale pipelines; picking a
     /// pipeline is per-block-per-layer anyway, so this costs nothing.
     subpixel_ok: bool,
+    /// Whether any vector glyph in this block passed the size gate and carries
+    /// corner clips. Only those blocks draw the 18-vertex octagon; everything
+    /// else keeps the six-vertex quad draw it always had, so small text pays
+    /// nothing at all — not even the degenerate triangles.
+    clipped: bool,
     content_dirty: bool,
     uniform_dirty: bool,
     /// The content was built while a glyph store was out of room, or a glyph
@@ -503,6 +559,7 @@ impl Block {
             visible: true,
             slot,
             subpixel_ok: true,
+            clipped: false,
             content_dirty: false,
             // The buffer's contents are undefined until written.
             uniform_dirty: true,
@@ -535,6 +592,9 @@ struct Scratch {
     /// pay a hash insert per glyph for one.
     collect_keys: bool,
     stale: bool,
+    /// Whether any queued vector glyph carries corner clips, which is what
+    /// decides between the quad draw and the octagon one.
+    clipped: bool,
 }
 
 impl Scratch {
@@ -550,6 +610,7 @@ impl Scratch {
         self.atlas_keys.clear();
         self.collect_keys = false;
         self.stale = false;
+        self.clipped = false;
     }
 
     fn counts(&self) -> [u32; LAYERS] {
@@ -643,6 +704,9 @@ pub struct TextRenderer {
     /// this is a per-draw choice rather than a swap.
     subpixel_pipelines: Option<[wgpu::RenderPipeline; 2]>,
     options: RendererOptions,
+    /// Size gate for corner clipping, [`CLIP_MIN_PX_PER_EM`] in production.
+    /// Tests move it to render the same glyph both ways.
+    pub(crate) clip_min_px_per_em: f32,
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -670,6 +734,10 @@ pub struct TextRenderer {
 
     atlas: Atlas,
     curves: CurveStore,
+    /// COLRv0 layer lists per (font, glyph). Holds no GPU data — the layers
+    /// themselves are ordinary glyphs in `curves` — so it never takes part in
+    /// eviction.
+    colr: ColrCache,
     /// Curve-store generations the bind group and the retained instances were
     /// built against.
     curves_generation: u64,
@@ -982,7 +1050,8 @@ impl TextRenderer {
         let vector_attrs = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
             3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32,
-            7 => Float32x2, 8 => Float32x2, 9 => Float32, 10 => Uint32
+            7 => Float32x2, 8 => Float32x2, 9 => Float32, 10 => Uint32,
+            11 => Float32x4
         ];
         let vector_pipeline = make_pipeline(
             "faf-text vector glyphs",
@@ -1051,6 +1120,7 @@ impl TextRenderer {
             blend_pipeline,
             subpixel_pipelines,
             options,
+            clip_min_px_per_em: CLIP_MIN_PX_PER_EM,
             bind_group,
             bind_group_layout,
             sampler,
@@ -1072,6 +1142,7 @@ impl TextRenderer {
             frame: 0,
             atlas,
             curves,
+            colr: ColrCache::default(),
             arenas: [
                 Arena::new("faf-text under rects", rect_stride),
                 Arena::new("faf-text chips", deco_stride),
@@ -1338,6 +1409,27 @@ impl TextRenderer {
         self.options
     }
 
+    /// Colors of the vector instances queued so far this frame, in queue order
+    /// — which is draw order, and so the order a color glyph's layers stack in.
+    #[cfg(test)]
+    pub(crate) fn pending_vector_colors(&self) -> Vec<[f32; 4]> {
+        self.scratch.vector.iter().map(|inst| inst.color).collect()
+    }
+
+    /// How many bitmap-atlas quads are queued so far this frame.
+    #[cfg(test)]
+    pub(crate) fn pending_atlas_glyphs(&self) -> usize {
+        self.scratch.atlas.len()
+    }
+
+    /// Curve-texture memory: (bytes of packed curve data, bytes the texture
+    /// itself occupies). The first number is what the glyphs extracted so far
+    /// actually cost; the second is the allocation they live in, which only
+    /// grows by doubling.
+    pub fn curve_memory(&self) -> (usize, usize) {
+        self.curves.memory()
+    }
+
     /// An instance color in the space the pipelines blend in. Under the
     /// default (gamma) blend this is the identity, and instance data is
     /// bit-for-bit what it always was.
@@ -1584,12 +1676,19 @@ impl TextRenderer {
                 let Some(buffer) = self.arenas[layer].buffer() else {
                     continue;
                 };
+                // Glyph layers of a block with corner-clipped glyphs in it draw
+                // the octagon; every other draw is the plain quad, which is the
+                // octagon's first six vertices anyway.
+                let vertices = match layer {
+                    VECTOR | BLEND if block.clipped => OCTAGON_VERTICES,
+                    _ => QUAD_VERTICES,
+                };
                 // The span is addressed by offsetting the vertex buffer, not by
                 // a first-instance draw: base-instance draws are not a WebGL2
                 // feature, buffer offsets are.
                 pass.set_pipeline(pipelines[layer]);
                 pass.set_vertex_buffer(0, buffer.slice(self.arenas[layer].byte_offset(span)..));
-                pass.draw(0..6, 0..span.len);
+                pass.draw(0..vertices, 0..span.len);
             }
         }
     }
@@ -1630,13 +1729,34 @@ impl TextRenderer {
             let baseline_y = pos[1] + run.line_y;
             self.push_run_decorations(&run, pos, default_color);
             for glyph in run.glyphs.iter() {
-                let color = self.shade(
-                    glyph
-                        .color_opt
-                        .map(Color::from_cosmic)
-                        .unwrap_or(default_color),
-                );
+                let run_color = glyph
+                    .color_opt
+                    .map(Color::from_cosmic)
+                    .unwrap_or(default_color);
+                let color = self.shade(run_color);
                 let font_size = glyph.font_size;
+                // Unsnapped glyph origin: the analytic coverage handles
+                // fractional positions exactly.
+                let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
+                let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
+
+                // A COLRv0 glyph is a stack of ordinary outlines: one vector
+                // instance per layer, in palette color, and no atlas at all.
+                if self.push_color_layers(
+                    font_system,
+                    &GlyphDraw {
+                        font_id: glyph.font_id,
+                        glyph_id: glyph.glyph_id,
+                        weight: glyph.font_weight,
+                        flags: glyph.cache_key_flags,
+                        pos: [origin_x, origin_y],
+                        font_size,
+                        color: run_color,
+                        weight_t,
+                    },
+                ) {
+                    continue;
+                }
 
                 if let Some(gc) = self.curves.get_or_insert(
                     font_system,
@@ -1656,25 +1776,14 @@ impl TextRenderer {
                             glyph.cache_key_flags,
                         ));
                     }
-                    // Unsnapped glyph origin: the analytic coverage handles
-                    // fractional positions exactly.
-                    let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
-                    let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
-
-                    let instance = vector_instance(
+                    self.push_vector(vector_instance(
                         &gc,
                         [origin_x, origin_y],
                         font_size,
                         color,
                         weight_t.unwrap_or(gc.weight_t),
-                    );
-                    // Two masters means the blending pipeline; everything else
-                    // draws with a shader that never looks for one.
-                    if instance.b_first == 0 {
-                        self.scratch.vector.push(instance);
-                    } else {
-                        self.scratch.blend.push(instance);
-                    }
+                        self.clip_min_px_per_em,
+                    ));
                     continue;
                 }
 
@@ -1706,6 +1815,21 @@ impl TextRenderer {
     ) {
         for spec in glyphs {
             let flags = CacheKeyFlags::empty();
+            if self.push_color_layers(
+                font_system,
+                &GlyphDraw {
+                    font_id: spec.font_id,
+                    glyph_id: spec.glyph_id,
+                    weight: spec.weight,
+                    flags,
+                    pos: spec.pos,
+                    font_size: spec.font_size,
+                    color: spec.color,
+                    weight_t,
+                },
+            ) {
+                continue;
+            }
             if let Some(gc) = self.curves.get_or_insert(
                 font_system,
                 spec.font_id,
@@ -1724,18 +1848,14 @@ impl TextRenderer {
                         flags,
                     ));
                 }
-                let instance = vector_instance(
+                self.push_vector(vector_instance(
                     &gc,
                     spec.pos,
                     spec.font_size,
                     self.shade(spec.color),
                     weight_t.unwrap_or(gc.weight_t),
-                );
-                if instance.b_first == 0 {
-                    self.scratch.vector.push(instance);
-                } else {
-                    self.scratch.blend.push(instance);
-                }
+                    self.clip_min_px_per_em,
+                ));
                 continue;
             }
             self.scratch.stale |= self.curves.overflowed();
@@ -1750,6 +1870,94 @@ impl TextRenderer {
             let color = self.shade(spec.color);
             self.push_atlas_glyph(queue, font_system, cache_key, [x, y], color);
         }
+    }
+
+    /// Queue one outline glyph. Two masters means the blending pipeline;
+    /// everything else draws with a shader that never looks for one. A glyph
+    /// that came back with corner clips also puts the whole block on the
+    /// octagon draw.
+    fn push_vector(&mut self, instance: VectorGlyphInstance) {
+        self.scratch.clipped |= instance.clip != [0.0; 4];
+        if instance.b_first == 0 {
+            self.scratch.vector.push(instance);
+        } else {
+            self.scratch.blend.push(instance);
+        }
+    }
+
+    /// Queue a COLRv0 color glyph as one vector instance per layer, bottom to
+    /// top, and say whether it did. `false` means "not a color glyph, or not
+    /// one this frame" and the caller carries on with the ordinary outline →
+    /// atlas ladder.
+    ///
+    /// The layers are ordinary glyphs of the same face, so they extract through
+    /// [`CurveStore::get_or_insert`] with every piece of machinery it has —
+    /// band tables, masters, LRU eviction — and cost the color glyph nothing
+    /// beyond one instance each. Instances draw in queue order, so pushing them
+    /// in COLR order *is* the painter's algorithm the format asks for.
+    fn push_color_layers(&mut self, font_system: &mut FontSystem, draw: &GlyphDraw) -> bool {
+        // With the store already in fallback for the frame, a missing layer
+        // would be indistinguishable from a layer with no outline. Take the
+        // atlas for this glyph and try again after the next compaction.
+        if self.curves.overflowed() {
+            return false;
+        }
+        let Some(layers) = self
+            .colr
+            .layers(font_system, draw.font_id, draw.glyph_id, draw.weight)
+        else {
+            return false;
+        };
+
+        let (vector_len, blend_len) = (self.scratch.vector.len(), self.scratch.blend.len());
+        for layer in layers.iter() {
+            let Some(gc) = self.curves.get_or_insert(
+                font_system,
+                draw.font_id,
+                layer.glyph_id,
+                draw.weight,
+                draw.flags,
+            ) else {
+                if self.curves.overflowed() {
+                    // Half a color glyph is worse than a bitmap one: unwind
+                    // and let the caller fall back.
+                    self.scratch.vector.truncate(vector_len);
+                    self.scratch.blend.truncate(blend_len);
+                    return false;
+                }
+                continue; // A layer with no outline paints nothing.
+            };
+            if gc.count == 0 {
+                continue;
+            }
+            if self.scratch.collect_keys {
+                self.scratch.curve_keys.insert(GlyphKey::new(
+                    draw.font_id,
+                    layer.glyph_id,
+                    draw.weight,
+                    draw.flags,
+                ));
+            }
+            // The run's alpha scales the palette's, so fading text out fades
+            // its color glyphs with it; a layer that asked for the text color
+            // (palette index 0xFFFF) takes the run's color whole.
+            let color = match layer.color {
+                Some(c) => Color([c[0], c[1], c[2], c[3] * draw.color.0[3]]),
+                None => draw.color,
+            };
+            self.push_vector(vector_instance(
+                &gc,
+                draw.pos,
+                draw.font_size,
+                self.shade(color),
+                draw.weight_t.unwrap_or(gc.weight_t),
+                self.clip_min_px_per_em,
+            ));
+        }
+        // Every layer blank (or the glyph's layer list empty) still counts as
+        // handled: the base glyph of a color glyph has no outline of its own,
+        // so falling through would only rasterize a blank into the atlas.
+        true
     }
 
     /// Rasterize a glyph into the bitmap atlas and queue its quad. `pos` is the
@@ -1891,6 +2099,7 @@ impl TextRenderer {
             arenas[OVER].write(block.spans[OVER], &scratch.over);
             block.content_dirty = true;
             block.stale = scratch.stale;
+            block.clipped = scratch.clipped;
             if scratch.collect_keys {
                 block.curve_keys.clear();
                 block.curve_keys.extend(scratch.curve_keys.iter().copied());
@@ -2357,8 +2566,12 @@ mod tests {
         let mut font_system = testing::font_system();
         // Every one of these glyphs clears the 16-curve banding threshold. 11px
         // takes the three-tap path, where a tap's ray offset can land in
-        // another band; 30px takes the single-ray one.
-        for size in [11.0, 30.0] {
+        // another band; 30px takes the single-ray one; 40px additionally clears
+        // SPLIT_MIN_PX_PER_EM, so half its samples fire their rays *backwards*
+        // off the band's second list — the same coverage by a different route
+        // (saturate(0.5 - m*Cx) = 1 - saturate(0.5 + m*Cx), crossing signs
+        // swapped), and this asserts it lands on the same bytes.
+        for size in [11.0, 30.0, 40.0] {
             let sample = view(&mut font_system, "Q@g&%8", size, [6.0, 6.0]);
             let mut with_bands = renderer(2048, 2048);
             let banded = frame(&mut with_bands, &mut font_system, &sample, None);
@@ -3272,6 +3485,410 @@ mod tests {
             0,
             "a pane with no stripe axis must draw grayscale"
         );
+    }
+
+    // ---- Corner clipping (#14) ----
+
+    /// Big enough to hold a 300 px/em glyph with room to spare.
+    const BIG: u32 = 512;
+
+    /// The fan `octagon_corner` in shaders.wgsl walks: the inner quad in the
+    /// vertex order the plain quad used, then one triangle per corner.
+    const OCTAGON_FAN: [usize; 18] = [0, 2, 6, 6, 2, 4, 0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 0];
+
+    /// The eight polygon points that shader builds, mirrored so the geometry
+    /// can be asserted on from Rust.
+    /// `the_shader_builds_the_octagon_these_tests_mirror` keeps the two in step.
+    fn octagon_polygon(clip: [f32; 4], em_size: [f32; 2]) -> [[f32; 2]; 8] {
+        let u = clip.map(|c| c / em_size[0].abs());
+        let v = clip.map(|c| c / em_size[1].abs());
+        [
+            [u[0], 0.0],
+            [1.0 - u[1], 0.0],
+            [1.0, v[1]],
+            [1.0, 1.0 - v[2]],
+            [1.0 - u[2], 1.0],
+            [u[3], 1.0],
+            [0.0, 1.0 - v[3]],
+            [0.0, v[0]],
+        ]
+    }
+
+    /// Twice the signed area of a triangle: positive one way round, negative
+    /// the other, zero when it is degenerate.
+    fn cross(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    }
+
+    /// The triangles the fan emits, as unit-quad coordinates.
+    fn octagon_triangles(clip: [f32; 4], em_size: [f32; 2]) -> Vec<[[f32; 2]; 3]> {
+        let poly = octagon_polygon(clip, em_size);
+        OCTAGON_FAN
+            .chunks_exact(3)
+            .map(|t| [poly[t[0]], poly[t[1]], poly[t[2]]])
+            .collect()
+    }
+
+    #[test]
+    fn an_unclipped_octagon_is_the_quad_it_replaces_vertex_for_vertex() {
+        let em_size = [0.6, -0.75];
+        let poly = octagon_polygon([0.0; 4], em_size);
+        let quad: Vec<[f32; 2]> = OCTAGON_FAN[..6].iter().map(|&i| poly[i]).collect();
+        assert_eq!(
+            quad,
+            vec![
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0]
+            ],
+            "an unclipped glyph must emit `quad_corner`'s own six vertices, in \
+             its own order — a differently split quad interpolates the varyings \
+             to different last bits and moves pixels"
+        );
+        for triangle in &octagon_triangles([0.0; 4], em_size)[2..] {
+            assert_eq!(
+                cross(triangle[0], triangle[1], triangle[2]),
+                0.0,
+                "an unclipped corner's triangle must be degenerate: {triangle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipped_octagon_tiles_itself_exactly_once() {
+        // Legs in em, and a quad that is neither square nor y-up: the clip is
+        // 45° in em space, so the two axes divide by different numbers.
+        let clip = [0.05, 0.12, 0.2, 0.09];
+        let em_size = [0.6, -0.75];
+        let poly = octagon_polygon(clip, em_size);
+        let triangles = octagon_triangles(clip, em_size);
+
+        for p in poly {
+            assert!(
+                (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1]),
+                "the octagon never leaves the quad: {p:?}"
+            );
+        }
+        // Shoelace over the eight points, against the sum of the fan's own
+        // triangles: equal means the fan covers the polygon once, with no gap
+        // and no overlap.
+        let polygon_area: f32 = (0..8)
+            .map(|i| cross(poly[0], poly[i], poly[(i + 1) % 8]))
+            .sum::<f32>()
+            * 0.5;
+        let fan_area: f32 = triangles
+            .iter()
+            .map(|t| cross(t[0], t[1], t[2]) * 0.5)
+            .sum();
+        assert!(
+            (polygon_area - fan_area).abs() < 1e-6,
+            "{polygon_area} vs {fan_area}"
+        );
+        // …and the polygon is the quad minus the four corner triangles.
+        let removed: f32 = (0..4)
+            .map(|i| clip[i] * clip[i] * 0.5 / (em_size[0].abs() * em_size[1].abs()))
+            .sum();
+        assert!(
+            (polygon_area.abs() - (1.0 - removed)).abs() < 1e-6,
+            "area {polygon_area} removed {removed}"
+        );
+        for t in &triangles {
+            assert!(
+                cross(t[0], t[1], t[2]) * fan_area >= 0.0,
+                "every triangle winds the same way: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shader_builds_the_octagon_these_tests_mirror() {
+        let src = include_str!("shaders.wgsl");
+        let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let table = OCTAGON_FAN
+            .iter()
+            .map(|i| format!("{i}u,"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&table),
+            "shaders.wgsl no longer emits the fan `{table}`"
+        );
+        assert!(
+            src.contains(&format!("array<u32, {}>", OCTAGON_FAN.len())),
+            "the fan table changed length"
+        );
+    }
+
+    /// Draw one view into a `BIG`-square target.
+    fn big_frame(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        sample: &TextView,
+    ) -> Vec<u8> {
+        let (_, queue) = testing::gpu();
+        renderer.begin();
+        renderer.text(queue, font_system, &sample.buffer, sample.pos, Color::WHITE);
+        testing::render_pixels(renderer, BIG, BIG)
+    }
+
+    /// The correctness invariant: a support plane never cuts ink. Checked
+    /// against the bytes — every pixel the octagon drops has to be a pixel the
+    /// plain quad left black — and then the two renders are compared outright.
+    #[test]
+    fn corner_clipping_drops_no_pixel_that_carried_ink() {
+        let mut font_system = testing::font_system();
+        // One glyph, so a dropped pixel cannot be another glyph's business, at
+        // a size well past the gate. 'A' clips both top corners.
+        let sample = view(&mut font_system, "A", 300.0, [40.0, 40.0]);
+
+        let mut clipped = renderer(2048, 2048);
+        let clipped_px = big_frame(&mut clipped, &mut font_system, &sample);
+        let mut plain = renderer(2048, 2048);
+        plain.clip_min_px_per_em = f32::INFINITY;
+        let plain_px = big_frame(&mut plain, &mut font_system, &sample);
+        assert!(drew(&clipped_px) && drew(&plain_px));
+
+        let instances = &clipped.scratch.vector;
+        assert_eq!(instances.len(), 1);
+        let glyph = instances[0];
+        assert_ne!(glyph.clip, [0.0; 4], "the sample must actually clip");
+        assert!(
+            plain.scratch.vector.iter().all(|g| g.clip == [0.0; 4]),
+            "the reference render must be unclipped"
+        );
+
+        // The octagon in screen px. The block is at the origin and untilted, so
+        // a unit-quad corner is `pos + corner * size`.
+        let poly = octagon_polygon(glyph.clip, glyph.em_size).map(|c| {
+            [
+                glyph.pos[0] + c[0] * glyph.size[0],
+                glyph.pos[1] + c[1] * glyph.size[1],
+            ]
+        });
+        // Convex and consistently wound, so "inside" is "on the polygon's own
+        // side of all eight edges". The half-pixel slack keeps a fragment whose
+        // center sits on an edge — where the fill rule, not this test, decides
+        // — out of the "was dropped" set.
+        let winding = (0..8)
+            .map(|i| cross(poly[0], poly[i], poly[(i + 1) % 8]))
+            .sum::<f32>()
+            .signum();
+        let inside = |p: [f32; 2]| {
+            (0..8).all(|i| {
+                let (a, b) = (poly[i], poly[(i + 1) % 8]);
+                cross(a, b, p) * winding >= -0.5
+            })
+        };
+
+        let mut dropped = 0;
+        for y in 0..BIG {
+            for x in 0..BIG {
+                let center = [x as f32 + 0.5, y as f32 + 0.5];
+                if inside(center) {
+                    continue;
+                }
+                // Outside the octagon: the clipped render never rasterized
+                // this pixel, so the unclipped one had better be black there.
+                let i = ((y * BIG + x) * 4) as usize;
+                assert_eq!(
+                    &plain_px[i..i + 3],
+                    &[0, 0, 0],
+                    "clipping dropped a pixel with ink at ({x}, {y})"
+                );
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0, "the octagon has to drop something");
+
+        // And where both renders do draw, they agree: the octagon's inner quad
+        // has different vertices from the plain quad's, so the rasterizer
+        // interpolates the varyings to slightly different last bits — a
+        // difference of one 255th on a handful of pixels, never a shape change.
+        let differing = clipped_px
+            .iter()
+            .zip(&plain_px)
+            .filter(|(a, b)| a != b)
+            .inspect(|(a, b)| {
+                assert!(
+                    a.abs_diff(**b) <= 1,
+                    "coverage moved by more than a rounding step: {a} vs {b}"
+                )
+            })
+            .count();
+        assert!(
+            differing * 200 < clipped_px.len(),
+            "{differing} bytes moved; clipping should only be a rounding wobble"
+        );
+    }
+
+    /// The point of the exercise: fewer fragment invocations, counted by the
+    /// hardware. Needs `PIPELINE_STATISTICS_QUERY`, and skips itself where the
+    /// adapter has none.
+    #[test]
+    fn corner_clipping_cuts_fragment_invocations() {
+        let Some(gpu) = testing::stats_gpu() else {
+            eprintln!("no PIPELINE_STATISTICS_QUERY: skipping the fill measurement");
+            return;
+        };
+        let (device, queue) = gpu;
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Ayvor", 64.0, [10.0, 100.0]);
+
+        let mut counts = [0u64; 2];
+        for (i, gate) in [CLIP_MIN_PX_PER_EM, f32::INFINITY].iter().enumerate() {
+            let mut renderer = TextRenderer::new(device, testing::FORMAT);
+            renderer.clip_min_px_per_em = *gate;
+            renderer.begin();
+            renderer.text(
+                queue,
+                &mut font_system,
+                &sample.buffer,
+                sample.pos,
+                Color::WHITE,
+            );
+            counts[i] = testing::fragment_invocations(gpu, &mut renderer, BIG, BIG);
+        }
+        let [clipped, plain] = counts;
+        let saved = 100.0 * (1.0 - clipped as f64 / plain as f64);
+        println!("fragment invocations: {plain} -> {clipped} ({saved:.1}% saved)");
+        assert!(plain > 0 && clipped < plain, "{plain} -> {clipped}");
+    }
+
+    // ---- COLRv0 color glyphs ----
+
+    /// Palette 0 of the vendored Twemoji subset, in 🚀's paint order.
+    const ROCKET_LAYERS: [u32; 6] = [0xA0041E, 0xFFAC33, 0xFFCC4D, 0x55ACEE, 0x000000, 0xA0041E];
+
+    fn rgba(hex: u32, alpha: f32) -> [f32; 4] {
+        [
+            ((hex >> 16) & 0xff) as f32 / 255.0,
+            ((hex >> 8) & 0xff) as f32 / 255.0,
+            (hex & 0xff) as f32 / 255.0,
+            alpha,
+        ]
+    }
+
+    /// One color glyph, queued through the shaping-free path so the test names
+    /// the face and the glyph itself.
+    fn queue_color_glyph(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        family: &str,
+        size: f32,
+        color: Color,
+    ) {
+        let (_, queue) = testing::gpu();
+        let font_id = testing::font_id_of(font_system, family);
+        let glyph_id = testing::glyph_id_of(font_system, font_id, '🚀').expect("the face has 🚀");
+        renderer.begin();
+        renderer.glyphs(
+            queue,
+            font_system,
+            &[GlyphSpec {
+                font_id,
+                glyph_id,
+                font_size: size,
+                pos: [20.0, 150.0],
+                color,
+                weight: fontdb::Weight::NORMAL,
+            }],
+        );
+    }
+
+    /// The whole point of #15: a COLRv0 glyph becomes one *vector* instance per
+    /// layer — no atlas quad at all — and they are queued bottom to top in the
+    /// font's own order, which is the order they draw in.
+    #[test]
+    fn a_color_glyph_queues_one_vector_instance_per_layer_in_paint_order() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            40.0,
+            Color::WHITE,
+        );
+
+        let expected: Vec<[f32; 4]> = ROCKET_LAYERS.iter().map(|&c| rgba(c, 1.0)).collect();
+        assert_eq!(renderer.pending_vector_colors(), expected);
+        assert_eq!(renderer.pending_atlas_glyphs(), 0, "nothing rasterized");
+    }
+
+    /// A layer's palette color is the font's, but its *alpha* is the run's:
+    /// fading text out has to fade its color glyphs with it.
+    #[test]
+    fn the_run_alpha_multiplies_into_every_layer_color() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            40.0,
+            Color::rgba(0.0, 1.0, 0.0, 0.25),
+        );
+
+        let expected: Vec<[f32; 4]> = ROCKET_LAYERS.iter().map(|&c| rgba(c, 0.25)).collect();
+        assert_eq!(renderer.pending_vector_colors(), expected);
+    }
+
+    /// The negative case: NotoColorEmoji is CBDT: bitmaps, no outlines, no COLR
+    /// table. It has to keep taking the atlas path exactly as before.
+    #[test]
+    fn a_cbdt_emoji_still_rides_the_bitmap_atlas() {
+        let Some(mut font_system) = testing::bitmap_color_font_system() else {
+            eprintln!("no {} — skipping", testing::CBDT_FONT_PATH);
+            return;
+        };
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            "Noto Color Emoji",
+            40.0,
+            Color::WHITE,
+        );
+
+        assert!(
+            renderer.pending_vector_colors().is_empty(),
+            "a bitmap emoji has no outlines to vectorize"
+        );
+        assert_eq!(renderer.pending_atlas_glyphs(), 1);
+    }
+
+    /// End to end on the GPU: the layers really do come out of the winding
+    /// shader in their palette colors. Every layer is opaque over a black
+    /// clear, so a covered pixel *is* the palette color.
+    #[test]
+    fn color_glyph_layers_render_in_their_palette_colors() {
+        let mut font_system = testing::color_font_system();
+        let mut renderer = renderer(2048, 2048);
+        queue_color_glyph(
+            &mut renderer,
+            &mut font_system,
+            testing::COLOR_FAMILY,
+            120.0,
+            Color::WHITE,
+        );
+        let pixels = testing::render_pixels(&mut renderer, W, H);
+        assert!(drew(&pixels), "the color glyph drew something");
+
+        // The nose cone's red and the window's blue are two different layers,
+        // so finding both proves the stack — not just one outline — reached
+        // the screen.
+        for hex in [0xA0041E, 0x55ACEE] {
+            let want = [
+                (hex >> 16) as u8,
+                ((hex >> 8) & 0xff) as u8,
+                (hex & 0xff) as u8,
+            ];
+            let hits = pixels.chunks_exact(4).filter(|px| px[..3] == want).count();
+            assert!(hits > 20, "expected a patch of {hex:06X}, found {hits} px");
+        }
     }
 
     #[test]
