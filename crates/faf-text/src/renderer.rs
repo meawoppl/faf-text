@@ -152,6 +152,21 @@ const BLOCK_SNAP: u32 = 1;
 /// came out of a matrix product.
 const AXIS_EPSILON: f32 = 1e-6;
 
+/// Pixels per em below which a glyph keeps the plain quad instead of the
+/// corner-clipped octagon. Lengyel 2017 §3 gates the clip on size for occupancy
+/// — at 11 px/em a corner triangle is a handful of pixels and the four extra
+/// primitives cost more than the fill they save — and the threshold is the
+/// paper's own ~48 px/em.
+const CLIP_MIN_PX_PER_EM: f32 = 48.0;
+
+/// Vertices a vector-glyph draw emits when the block has a clipped glyph in it:
+/// the octagon of `octagon_corner` in shaders.wgsl — its inner quad, then one
+/// triangle per corner. Blocks with nothing clipped draw [`QUAD_VERTICES`],
+/// which are that inner quad and nothing else.
+const OCTAGON_VERTICES: u32 = 18;
+/// Vertices every other draw emits: two triangles of a unit quad.
+const QUAD_VERTICES: u32 = 6;
+
 /// Stride between per-block uniforms. The real stride is this raised to the
 /// device's `min_uniform_buffer_offset_alignment`; 256 is that alignment's
 /// worst case (and what WebGL2 reports), so blocks cost the same everywhere.
@@ -201,6 +216,11 @@ struct VectorGlyphInstance {
     /// Base texel of the master-B records, 0 for a single-master glyph — the
     /// fast path every static font takes.
     b_first: u32,
+    /// How deep the vertex shader may cut each corner of the quad off, in em:
+    /// [`crate::curves::GlyphCurves::clips`] when this glyph is big enough on
+    /// screen to be worth an octagon, all zeros when it is not. See
+    /// `octagon_corner` in shaders.wgsl.
+    clip: [f32; 4],
 }
 
 /// Build the quad for one outline glyph: the em bbox padded by 1.5 px for the
@@ -213,6 +233,7 @@ fn vector_instance(
     font_size: f32,
     color: [f32; 4],
     weight_t: f32,
+    clip_min_px_per_em: f32,
 ) -> VectorGlyphInstance {
     let pad = 1.5 / font_size;
     let min_x = gc.bbox[0] - pad;
@@ -238,6 +259,15 @@ fn vector_instance(
         band_bias: [(min_x - gc.bbox[0]) / band_w, (max_y - gc.bbox[1]) / band_h],
         weight_t,
         b_first: gc.b_first(),
+        // The size gate, decided here because the px size is a CPU number and
+        // the clip legs are not: below it a glyph's corner triangles are a few
+        // pixels each, and Lengyel's caveat — tiny triangles cost more
+        // occupancy than they save fill — bites.
+        clip: if font_size >= clip_min_px_per_em {
+            gc.clips
+        } else {
+            [0.0; 4]
+        },
     }
 }
 
@@ -482,6 +512,11 @@ struct Block {
     /// lose it draw their glyphs with the grayscale pipelines; picking a
     /// pipeline is per-block-per-layer anyway, so this costs nothing.
     subpixel_ok: bool,
+    /// Whether any vector glyph in this block passed the size gate and carries
+    /// corner clips. Only those blocks draw the 18-vertex octagon; everything
+    /// else keeps the six-vertex quad draw it always had, so small text pays
+    /// nothing at all — not even the degenerate triangles.
+    clipped: bool,
     content_dirty: bool,
     uniform_dirty: bool,
     /// The content was built while a glyph store was out of room, or a glyph
@@ -503,6 +538,7 @@ impl Block {
             visible: true,
             slot,
             subpixel_ok: true,
+            clipped: false,
             content_dirty: false,
             // The buffer's contents are undefined until written.
             uniform_dirty: true,
@@ -535,6 +571,9 @@ struct Scratch {
     /// pay a hash insert per glyph for one.
     collect_keys: bool,
     stale: bool,
+    /// Whether any queued vector glyph carries corner clips, which is what
+    /// decides between the quad draw and the octagon one.
+    clipped: bool,
 }
 
 impl Scratch {
@@ -550,6 +589,7 @@ impl Scratch {
         self.atlas_keys.clear();
         self.collect_keys = false;
         self.stale = false;
+        self.clipped = false;
     }
 
     fn counts(&self) -> [u32; LAYERS] {
@@ -643,6 +683,9 @@ pub struct TextRenderer {
     /// this is a per-draw choice rather than a swap.
     subpixel_pipelines: Option<[wgpu::RenderPipeline; 2]>,
     options: RendererOptions,
+    /// Size gate for corner clipping, [`CLIP_MIN_PX_PER_EM`] in production.
+    /// Tests move it to render the same glyph both ways.
+    pub(crate) clip_min_px_per_em: f32,
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -982,7 +1025,8 @@ impl TextRenderer {
         let vector_attrs = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x2,
             3 => Float32x2, 4 => Float32x4, 5 => Uint32, 6 => Uint32,
-            7 => Float32x2, 8 => Float32x2, 9 => Float32, 10 => Uint32
+            7 => Float32x2, 8 => Float32x2, 9 => Float32, 10 => Uint32,
+            11 => Float32x4
         ];
         let vector_pipeline = make_pipeline(
             "faf-text vector glyphs",
@@ -1051,6 +1095,7 @@ impl TextRenderer {
             blend_pipeline,
             subpixel_pipelines,
             options,
+            clip_min_px_per_em: CLIP_MIN_PX_PER_EM,
             bind_group,
             bind_group_layout,
             sampler,
@@ -1592,12 +1637,19 @@ impl TextRenderer {
                 let Some(buffer) = self.arenas[layer].buffer() else {
                     continue;
                 };
+                // Glyph layers of a block with corner-clipped glyphs in it draw
+                // the octagon; every other draw is the plain quad, which is the
+                // octagon's first six vertices anyway.
+                let vertices = match layer {
+                    VECTOR | BLEND if block.clipped => OCTAGON_VERTICES,
+                    _ => QUAD_VERTICES,
+                };
                 // The span is addressed by offsetting the vertex buffer, not by
                 // a first-instance draw: base-instance draws are not a WebGL2
                 // feature, buffer offsets are.
                 pass.set_pipeline(pipelines[layer]);
                 pass.set_vertex_buffer(0, buffer.slice(self.arenas[layer].byte_offset(span)..));
-                pass.draw(0..6, 0..span.len);
+                pass.draw(0..vertices, 0..span.len);
             }
         }
     }
@@ -1669,20 +1721,14 @@ impl TextRenderer {
                     let origin_x = pos[0] + glyph.x + glyph.x_offset * font_size;
                     let origin_y = baseline_y + glyph.y - glyph.y_offset * font_size;
 
-                    let instance = vector_instance(
+                    self.push_vector(vector_instance(
                         &gc,
                         [origin_x, origin_y],
                         font_size,
                         color,
                         weight_t.unwrap_or(gc.weight_t),
-                    );
-                    // Two masters means the blending pipeline; everything else
-                    // draws with a shader that never looks for one.
-                    if instance.b_first == 0 {
-                        self.scratch.vector.push(instance);
-                    } else {
-                        self.scratch.blend.push(instance);
-                    }
+                        self.clip_min_px_per_em,
+                    ));
                     continue;
                 }
 
@@ -1732,18 +1778,14 @@ impl TextRenderer {
                         flags,
                     ));
                 }
-                let instance = vector_instance(
+                self.push_vector(vector_instance(
                     &gc,
                     spec.pos,
                     spec.font_size,
                     self.shade(spec.color),
                     weight_t.unwrap_or(gc.weight_t),
-                );
-                if instance.b_first == 0 {
-                    self.scratch.vector.push(instance);
-                } else {
-                    self.scratch.blend.push(instance);
-                }
+                    self.clip_min_px_per_em,
+                ));
                 continue;
             }
             self.scratch.stale |= self.curves.overflowed();
@@ -1757,6 +1799,19 @@ impl TextRenderer {
             );
             let color = self.shade(spec.color);
             self.push_atlas_glyph(queue, font_system, cache_key, [x, y], color);
+        }
+    }
+
+    /// Queue one outline glyph. Two masters means the blending pipeline;
+    /// everything else draws with a shader that never looks for one. A glyph
+    /// that came back with corner clips also puts the whole block on the
+    /// octagon draw.
+    fn push_vector(&mut self, instance: VectorGlyphInstance) {
+        self.scratch.clipped |= instance.clip != [0.0; 4];
+        if instance.b_first == 0 {
+            self.scratch.vector.push(instance);
+        } else {
+            self.scratch.blend.push(instance);
         }
     }
 
@@ -1899,6 +1954,7 @@ impl TextRenderer {
             arenas[OVER].write(block.spans[OVER], &scratch.over);
             block.content_dirty = true;
             block.stale = scratch.stale;
+            block.clipped = scratch.clipped;
             if scratch.collect_keys {
                 block.curve_keys.clear();
                 block.curve_keys.extend(scratch.curve_keys.iter().copied());
@@ -3284,6 +3340,276 @@ mod tests {
             0,
             "a pane with no stripe axis must draw grayscale"
         );
+    }
+
+    // ---- Corner clipping (#14) ----
+
+    /// Big enough to hold a 300 px/em glyph with room to spare.
+    const BIG: u32 = 512;
+
+    /// The fan `octagon_corner` in shaders.wgsl walks: the inner quad in the
+    /// vertex order the plain quad used, then one triangle per corner.
+    const OCTAGON_FAN: [usize; 18] = [0, 2, 6, 6, 2, 4, 0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7, 0];
+
+    /// The eight polygon points that shader builds, mirrored so the geometry
+    /// can be asserted on from Rust.
+    /// `the_shader_builds_the_octagon_these_tests_mirror` keeps the two in step.
+    fn octagon_polygon(clip: [f32; 4], em_size: [f32; 2]) -> [[f32; 2]; 8] {
+        let u = clip.map(|c| c / em_size[0].abs());
+        let v = clip.map(|c| c / em_size[1].abs());
+        [
+            [u[0], 0.0],
+            [1.0 - u[1], 0.0],
+            [1.0, v[1]],
+            [1.0, 1.0 - v[2]],
+            [1.0 - u[2], 1.0],
+            [u[3], 1.0],
+            [0.0, 1.0 - v[3]],
+            [0.0, v[0]],
+        ]
+    }
+
+    /// Twice the signed area of a triangle: positive one way round, negative
+    /// the other, zero when it is degenerate.
+    fn cross(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    }
+
+    /// The triangles the fan emits, as unit-quad coordinates.
+    fn octagon_triangles(clip: [f32; 4], em_size: [f32; 2]) -> Vec<[[f32; 2]; 3]> {
+        let poly = octagon_polygon(clip, em_size);
+        OCTAGON_FAN
+            .chunks_exact(3)
+            .map(|t| [poly[t[0]], poly[t[1]], poly[t[2]]])
+            .collect()
+    }
+
+    #[test]
+    fn an_unclipped_octagon_is_the_quad_it_replaces_vertex_for_vertex() {
+        let em_size = [0.6, -0.75];
+        let poly = octagon_polygon([0.0; 4], em_size);
+        let quad: Vec<[f32; 2]> = OCTAGON_FAN[..6].iter().map(|&i| poly[i]).collect();
+        assert_eq!(
+            quad,
+            vec![
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0]
+            ],
+            "an unclipped glyph must emit `quad_corner`'s own six vertices, in \
+             its own order — a differently split quad interpolates the varyings \
+             to different last bits and moves pixels"
+        );
+        for triangle in &octagon_triangles([0.0; 4], em_size)[2..] {
+            assert_eq!(
+                cross(triangle[0], triangle[1], triangle[2]),
+                0.0,
+                "an unclipped corner's triangle must be degenerate: {triangle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipped_octagon_tiles_itself_exactly_once() {
+        // Legs in em, and a quad that is neither square nor y-up: the clip is
+        // 45° in em space, so the two axes divide by different numbers.
+        let clip = [0.05, 0.12, 0.2, 0.09];
+        let em_size = [0.6, -0.75];
+        let poly = octagon_polygon(clip, em_size);
+        let triangles = octagon_triangles(clip, em_size);
+
+        for p in poly {
+            assert!(
+                (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1]),
+                "the octagon never leaves the quad: {p:?}"
+            );
+        }
+        // Shoelace over the eight points, against the sum of the fan's own
+        // triangles: equal means the fan covers the polygon once, with no gap
+        // and no overlap.
+        let polygon_area: f32 = (0..8)
+            .map(|i| cross(poly[0], poly[i], poly[(i + 1) % 8]))
+            .sum::<f32>()
+            * 0.5;
+        let fan_area: f32 = triangles
+            .iter()
+            .map(|t| cross(t[0], t[1], t[2]) * 0.5)
+            .sum();
+        assert!(
+            (polygon_area - fan_area).abs() < 1e-6,
+            "{polygon_area} vs {fan_area}"
+        );
+        // …and the polygon is the quad minus the four corner triangles.
+        let removed: f32 = (0..4)
+            .map(|i| clip[i] * clip[i] * 0.5 / (em_size[0].abs() * em_size[1].abs()))
+            .sum();
+        assert!(
+            (polygon_area.abs() - (1.0 - removed)).abs() < 1e-6,
+            "area {polygon_area} removed {removed}"
+        );
+        for t in &triangles {
+            assert!(
+                cross(t[0], t[1], t[2]) * fan_area >= 0.0,
+                "every triangle winds the same way: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shader_builds_the_octagon_these_tests_mirror() {
+        let src = include_str!("shaders.wgsl");
+        let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+        let table = OCTAGON_FAN
+            .iter()
+            .map(|i| format!("{i}u,"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(&table),
+            "shaders.wgsl no longer emits the fan `{table}`"
+        );
+        assert!(
+            src.contains(&format!("array<u32, {}>", OCTAGON_FAN.len())),
+            "the fan table changed length"
+        );
+    }
+
+    /// Draw one view into a `BIG`-square target.
+    fn big_frame(
+        renderer: &mut TextRenderer,
+        font_system: &mut FontSystem,
+        sample: &TextView,
+    ) -> Vec<u8> {
+        let (_, queue) = testing::gpu();
+        renderer.begin();
+        renderer.text(queue, font_system, &sample.buffer, sample.pos, Color::WHITE);
+        testing::render_pixels(renderer, BIG, BIG)
+    }
+
+    /// The correctness invariant: a support plane never cuts ink. Checked
+    /// against the bytes — every pixel the octagon drops has to be a pixel the
+    /// plain quad left black — and then the two renders are compared outright.
+    #[test]
+    fn corner_clipping_drops_no_pixel_that_carried_ink() {
+        let mut font_system = testing::font_system();
+        // One glyph, so a dropped pixel cannot be another glyph's business, at
+        // a size well past the gate. 'A' clips both top corners.
+        let sample = view(&mut font_system, "A", 300.0, [40.0, 40.0]);
+
+        let mut clipped = renderer(2048, 2048);
+        let clipped_px = big_frame(&mut clipped, &mut font_system, &sample);
+        let mut plain = renderer(2048, 2048);
+        plain.clip_min_px_per_em = f32::INFINITY;
+        let plain_px = big_frame(&mut plain, &mut font_system, &sample);
+        assert!(drew(&clipped_px) && drew(&plain_px));
+
+        let instances = &clipped.scratch.vector;
+        assert_eq!(instances.len(), 1);
+        let glyph = instances[0];
+        assert_ne!(glyph.clip, [0.0; 4], "the sample must actually clip");
+        assert!(
+            plain.scratch.vector.iter().all(|g| g.clip == [0.0; 4]),
+            "the reference render must be unclipped"
+        );
+
+        // The octagon in screen px. The block is at the origin and untilted, so
+        // a unit-quad corner is `pos + corner * size`.
+        let poly = octagon_polygon(glyph.clip, glyph.em_size).map(|c| {
+            [
+                glyph.pos[0] + c[0] * glyph.size[0],
+                glyph.pos[1] + c[1] * glyph.size[1],
+            ]
+        });
+        // Convex and consistently wound, so "inside" is "on the polygon's own
+        // side of all eight edges". The half-pixel slack keeps a fragment whose
+        // center sits on an edge — where the fill rule, not this test, decides
+        // — out of the "was dropped" set.
+        let winding = (0..8)
+            .map(|i| cross(poly[0], poly[i], poly[(i + 1) % 8]))
+            .sum::<f32>()
+            .signum();
+        let inside = |p: [f32; 2]| {
+            (0..8).all(|i| {
+                let (a, b) = (poly[i], poly[(i + 1) % 8]);
+                cross(a, b, p) * winding >= -0.5
+            })
+        };
+
+        let mut dropped = 0;
+        for y in 0..BIG {
+            for x in 0..BIG {
+                let center = [x as f32 + 0.5, y as f32 + 0.5];
+                if inside(center) {
+                    continue;
+                }
+                // Outside the octagon: the clipped render never rasterized
+                // this pixel, so the unclipped one had better be black there.
+                let i = ((y * BIG + x) * 4) as usize;
+                assert_eq!(
+                    &plain_px[i..i + 3],
+                    &[0, 0, 0],
+                    "clipping dropped a pixel with ink at ({x}, {y})"
+                );
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0, "the octagon has to drop something");
+
+        // And where both renders do draw, they agree: the octagon's inner quad
+        // has different vertices from the plain quad's, so the rasterizer
+        // interpolates the varyings to slightly different last bits — a
+        // difference of one 255th on a handful of pixels, never a shape change.
+        let differing = clipped_px
+            .iter()
+            .zip(&plain_px)
+            .filter(|(a, b)| a != b)
+            .inspect(|(a, b)| {
+                assert!(
+                    a.abs_diff(**b) <= 1,
+                    "coverage moved by more than a rounding step: {a} vs {b}"
+                )
+            })
+            .count();
+        assert!(
+            differing * 200 < clipped_px.len(),
+            "{differing} bytes moved; clipping should only be a rounding wobble"
+        );
+    }
+
+    /// The point of the exercise: fewer fragment invocations, counted by the
+    /// hardware. Needs `PIPELINE_STATISTICS_QUERY`, and skips itself where the
+    /// adapter has none.
+    #[test]
+    fn corner_clipping_cuts_fragment_invocations() {
+        let Some(gpu) = testing::stats_gpu() else {
+            eprintln!("no PIPELINE_STATISTICS_QUERY: skipping the fill measurement");
+            return;
+        };
+        let (device, queue) = gpu;
+        let mut font_system = testing::font_system();
+        let sample = view(&mut font_system, "Ayvor", 64.0, [10.0, 100.0]);
+
+        let mut counts = [0u64; 2];
+        for (i, gate) in [CLIP_MIN_PX_PER_EM, f32::INFINITY].iter().enumerate() {
+            let mut renderer = TextRenderer::new(device, testing::FORMAT);
+            renderer.clip_min_px_per_em = *gate;
+            renderer.begin();
+            renderer.text(
+                queue,
+                &mut font_system,
+                &sample.buffer,
+                sample.pos,
+                Color::WHITE,
+            );
+            counts[i] = testing::fragment_invocations(gpu, &mut renderer, BIG, BIG);
+        }
+        let [clipped, plain] = counts;
+        let saved = 100.0 * (1.0 - clipped as f64 / plain as f64);
+        println!("fragment invocations: {plain} -> {clipped} ({saved:.1}% saved)");
+        assert!(plain > 0 && clipped < plain, "{plain} -> {clipped}");
     }
 
     #[test]

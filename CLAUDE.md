@@ -17,7 +17,9 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   faf-text` renders every feature to `offscreen.png` (works headless — this
   box has an RTX 3070; wgpu picks Vulkan). `examples/panes3d` does the same for
   3D panes (`panes3d.png`). The offscreen scene is a **regression baseline**:
-  its md5 is `729ddb4ccb578c75ebceb95a8bf8249c` (it was
+  its md5 is `4f37b594d6e3f1526fe418781131d273` (it was
+  `729ddb4ccb578c75ebceb95a8bf8249c` before #14's corner clipping re-triangulated
+  the two glyphs over its 48 px/em gate, and
   `beec6786631dd25e4fcad2c801839244` before the RGBA16F curve storage of #13
   requantized the outlines) and any change to placement math has to keep it.
   `panes3d.png` is `80928801bd41af0a08cacf96772270c1` and f16 did *not* move
@@ -190,6 +192,34 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   and negate the band's sum (which undoes the crossing-sign swap). The identity
   saturate(0.5 − x) = 1 − saturate(0.5 + x) plus "signed crossings over a whole
   line sum to zero" makes the two directions agree exactly.
+- Corner clipping (#14) is **geometry, and only geometry**: the vertex shader
+  turns the quad into an octagon from a `vec4` of per-instance clip legs, the
+  curve texture is untouched, and the four clips live on `GlyphCurves` (CPU
+  side). Things that turned out to matter:
+  - **Bound the curve, not the control hull.** A quarter circle's middle
+    control point sits *exactly* on the corner of its bounding box, so
+    control-point support planes clip no round glyph at all (DejaVu's 'O', 'e',
+    'c', the bowl of a 'Q' — nothing). `dot(B(t), n)` is a scalar quadratic;
+    its max over [0,1] is an endpoint or the vertex, three lines of code, and
+    just as conservative — the fragment shader tests the curve, not the hull.
+  - Blend masters for free: a Bézier is linear in its control points, so the
+    blended curve is the pointwise blend and `max(h_a, h_b)` bounds every
+    `weight_t`.
+  - **A differently-triangulated quad is not byte-identical.** The rasterizer
+    builds attribute gradients from the actual vertices, so re-splitting the
+    same rectangle along the other diagonal moves interpolated varyings by an
+    ulp and `fwidth` by ~1e-4 relative — 88 pixels of the offscreen scene, up
+    to 98/255, when the *whole* scene switches. Hence the fan is ordered so the
+    unclipped case emits `quad_corner`'s exact six vertices in its exact order,
+    and blocks with nothing clipped still `draw(0..6)`. With clipping on, the
+    two glyphs past the gate move 72 pixels by at most 1/255 (total ink
+    75624048 → 75624055): that is the interpolation wobble, not lost ink, and
+    it is why the offscreen md5 changed.
+  - Savings are real but modest and *scene-dependent*: ~5% of a glyph's bbox on
+    average over ASCII in DejaVu Sans (the 4%-of-bbox threshold rejects the
+    marginal corners), 5.3% of fragment invocations on a 64 px/em bench page,
+    11% on a large-glyph sample, 1.2% on the whole offscreen scene (where only
+    a 64 px title and a 300 px "Qg" clear the 48 px/em gate).
 - Pick the ray direction with `select`, never with an `if` around two copies of
   the loop: neighbouring fragments land on opposite sides of a split constantly,
   and a warp executing both copies eats the whole win.

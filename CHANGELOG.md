@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Corner-clipped glyph geometry above 48 px/em: each corner of a glyph's quad
+  is cut back to the outline's own support plane along the diagonal, turning
+  the quad into an octagon built in the vertex shader from four numbers on the
+  instance. Fragment invocations drop 5% on a 64 px/em page and 11% on
+  large-glyph content; smaller text keeps the plain quad draw untouched.
+
 - Curve storage moved from RGBA32F to RGBA16F with contour-aware endpoint
   sharing: a banded glyph costs one texel per curve plus one per contour, and
   the offscreen scene's curve data went from 281 KB to 107 KB. Coordinates are

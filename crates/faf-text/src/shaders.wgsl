@@ -350,6 +350,7 @@ struct VectorInstance {
     @location(8) band_bias: vec2<f32>,  // the bbox; the quad's pad falls outside)
     @location(9) weight_t: f32,       // 0 = wght axis min, 1 = axis max
     @location(10) b_first: u32,       // master-B base texel, 0 = single master
+    @location(11) clip: vec4<f32>,    // corner clip legs in em, all zero = quad
 };
 
 struct VectorOutput {
@@ -372,9 +373,59 @@ struct Block {
     weight_t: f32,
 };
 
+// Corner-clipped glyph geometry (Lengyel 2017 §3, Figure 4): most glyphs leave
+// their bbox corners empty, and a fragment out there computes a coverage of
+// exactly 0. `inst.clip` carries how deep each corner may be cut without the
+// cut reaching ink — one leg in em per corner, in the order (0,0), (1,0),
+// (1,1), (0,1) of the unit quad — and this turns the quad into the octagon
+//
+//     P7 ---- P0 P1 ---- P2          P0 = (u.x, 0)      P4 = (1 - u.z, 1)
+//      |                  |          P1 = (1 - u.y, 0)  P5 = (u.w, 1)
+//     P6                  P3         P2 = (1, v.y)      P6 = (0, 1 - v.w)
+//      |                  |          P3 = (1, 1 - v.z)  P7 = (0, v.x)
+//     P5 ---- P4  (u, v down-right)
+//
+// where u/v are the legs as fractions of the quad's own extent — the clip is
+// 45° in em space and the quad is not square, so the two axes divide by
+// different numbers, both of which the instance already carries in `em_size`.
+//
+// Eighteen vertices: four corner triangles plus the quad P0 P2 P4 P6. When a
+// corner is unclipped its two polygon points coincide, so its triangle has zero
+// area and rasterizes nothing. When *nothing* is clipped the first six vertices
+// are (0,0) (1,0) (0,1) (0,1) (1,0) (1,1) — the exact floats, in the exact
+// order, that `quad_corner` produced before this existed, which is why an
+// unclipped glyph is still byte-identical. (The renderer also drops back to a
+// six-vertex draw for blocks with no clipped glyph in them at all.)
+//
+// Every varying is affine in `corner` (em, fraction and the clip position are
+// all `a + corner * b`), and an affine function is reproduced exactly by
+// perspective-correct interpolation over any triangulation of the region it is
+// defined on — barycentric weights sum to one, so interpolating an affine
+// function at a point gives that function's value at the point, whichever
+// triangle covered it. Cutting the quad into an octagon therefore cannot move
+// `em`, `fraction` or the band mapping a fragment sees: only the set of
+// fragments changes, and the ones dropped are the ones whose coverage was 0.
+fn octagon_corner(vi: u32, clip: vec4<f32>, em_size: vec2<f32>) -> vec2<f32> {
+    let u = clip / abs(em_size.x);
+    let v = clip / abs(em_size.y);
+    var poly = array<vec2<f32>, 8>(
+        vec2<f32>(u.x, 0.0), vec2<f32>(1.0 - u.y, 0.0),
+        vec2<f32>(1.0, v.y), vec2<f32>(1.0, 1.0 - v.z),
+        vec2<f32>(1.0 - u.z, 1.0), vec2<f32>(u.w, 1.0),
+        vec2<f32>(0.0, 1.0 - v.w), vec2<f32>(0.0, v.x),
+    );
+    // The inner quad first, in the winding and vertex order the plain quad
+    // used, then the four corner triangles.
+    var fan = array<u32, 18>(
+        0u, 2u, 6u,  6u, 2u, 4u,
+        0u, 1u, 2u,  2u, 3u, 4u,  4u, 5u, 6u,  6u, 7u, 0u,
+    );
+    return poly[fan[vi]];
+}
+
 @vertex
 fn vector_vs(@builtin(vertex_index) vi: u32, inst: VectorInstance) -> VectorOutput {
-    let corner = quad_corner(vi);
+    let corner = octagon_corner(vi, inst.clip, inst.em_size);
     var out: VectorOutput;
     out.clip = to_clip(inst.pos + corner * inst.size);
     out.em = inst.em_pos + corner * inst.em_size;

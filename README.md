@@ -52,6 +52,15 @@ one instanced quad; the fragment shader decides inside/outside per pixel:
   sorted the other way, so no sample walks the curves on the far side of the
   glyph from it. Coverage is unchanged to the bit — a curve a band leaves out,
   or the early-out skips, contributes exactly zero.
+- Above 48 px/em the quad becomes an **octagon**. Most glyphs leave the corners
+  of their bounding box empty, and a fragment out there pays a full winding
+  test to arrive at zero, so each corner is cut back to the outline's own
+  support plane along the diagonal — computed once per glyph, over both
+  variable-font masters, and applied by the vertex shader from four numbers on
+  the instance. The empty corners of an `A`, a `T` or a `y` are simply never
+  rasterized, and the cut is conservative by construction: it stops at a plane
+  the whole outline lies behind, so only fragments whose coverage was exactly
+  zero disappear.
 
 Because coverage is analytic, glyphs get **true subpixel positioning** (no
 snapping, no subpixel atlas bins) and **free scaling** — zooming re-rasterizes

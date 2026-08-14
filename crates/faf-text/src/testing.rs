@@ -65,6 +65,120 @@ pub fn dual_source_gpu() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
     .as_ref()
 }
 
+/// A headless device with `PIPELINE_STATISTICS_QUERY`, or `None` where the
+/// adapter has no such feature. Only the fill-rate measurements need it, and
+/// they skip themselves without it.
+pub fn stats_gpu() -> Option<&'static (wgpu::Device, wgpu::Queue)> {
+    static GPU: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
+    GPU.get_or_init(|| {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .expect("no GPU adapter available");
+            if !adapter
+                .features()
+                .contains(wgpu::Features::PIPELINE_STATISTICS_QUERY)
+            {
+                return None;
+            }
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::PIPELINE_STATISTICS_QUERY,
+                    ..Default::default()
+                })
+                .await
+                .ok()
+        })
+    })
+    .as_ref()
+}
+
+/// Fragment-shader invocations one frame of `renderer` costs, counted by the
+/// hardware — the number corner clipping (#14) is out to reduce. Includes the
+/// helper invocations `fwidth` forces, since those are real work; what it
+/// measures is what the GPU actually ran.
+pub fn fragment_invocations(
+    (device, queue): &(wgpu::Device, wgpu::Queue),
+    renderer: &mut TextRenderer,
+    width: u32,
+    height: u32,
+) -> u64 {
+    renderer.finish(device, queue, [width as f32, height as f32]);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fill-count target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("fragment invocations"),
+        ty: wgpu::QueryType::PipelineStatistics(
+            wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+        ),
+        count: 1,
+    });
+    // One u64 per statistic asked for.
+    let resolved = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("query resolve"),
+        size: 8,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("query readback"),
+        size: 8,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("fill-count pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.begin_pipeline_statistics_query(&queries, 0);
+        renderer.render(&mut pass);
+        pass.end_pipeline_statistics_query();
+    }
+    encoder.resolve_query_set(&queries, 0..1, &resolved, 0);
+    encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, 8);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let data = slice.get_mapped_range().unwrap();
+    u64::from_le_bytes(data[..8].try_into().unwrap())
+}
+
 /// A font system holding just DejaVu Sans, so glyph ids are stable.
 pub fn font_system() -> FontSystem {
     font_system_from_fonts(&[FONT_DEJAVU_SANS])

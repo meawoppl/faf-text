@@ -119,6 +119,21 @@ const BAND_EPSILON: f32 = 0.05;
 /// Set in the vector instance's `count` field when the glyph's block is
 /// banded. Must match `BANDED_FLAG` in `shaders.wgsl`.
 pub const BANDED_FLAG: u32 = 0x8000_0000;
+/// Smallest triangle a corner clip may remove, as a fraction of the em bbox's
+/// area. Below this the four extra triangles the octagon costs are not worth
+/// the fragments they save (Lengyel 2017 §3 uses the same shape of test).
+const CLIP_MIN_AREA: f32 = 0.04;
+/// Outward normals of the four bbox corners, in the order
+/// [`GlyphCurves::clips`] lists them: the unit quad's (0,0), (1,0), (1,1),
+/// (0,1), which in em space (y-up) is (min_x, max_y), (max_x, max_y),
+/// (max_x, min_y), (min_x, min_y).
+///
+/// 45° only. Lengyel tests a couple of candidate normals per corner and keeps
+/// the best; a non-45° plane cuts a scalene triangle, which needs two legs per
+/// corner (eight instance floats) instead of one. The diagonal is the workhorse
+/// — it is the normal that sees the empty corner of an `A`, a `T` or a `7` —
+/// so one vec4 buys nearly all of the win at half the instance cost.
+const CLIP_NORMALS: [[f32; 2]; 4] = [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]];
 /// The variation axis a glyph's two masters are extracted at the ends of.
 const WGHT: swash::Tag = u32::from_be_bytes(*b"wght");
 
@@ -148,6 +163,16 @@ pub struct GlyphCurves {
     pub bbox: [f32; 4],
     /// Whether the block starts with band tables.
     pub banded: bool,
+    /// How deep each bbox corner may be cut away, in em, before the cut can
+    /// reach ink: the isoceles right triangle at corner `i` with legs
+    /// `clips[i]` holds no part of either master's outline. 0 where the corner
+    /// is not worth clipping (see [`corner_clips`]). Corner order is the unit
+    /// quad's (0,0), (1,0), (1,1), (0,1) — see [`CLIP_NORMALS`].
+    ///
+    /// CPU-side only: the renderer turns these into an instance attribute the
+    /// vertex shader builds an octagon from, so nothing about the texture
+    /// layout changes.
+    pub clips: [f32; 4],
     /// Whether a master-B region follows master A's. False for a static face,
     /// or for masters that do not interpolate.
     pub dual_master: bool,
@@ -467,6 +492,7 @@ impl CurveStore {
                 count: 0,
                 bbox: [0.0; 4],
                 banded: false,
+                clips: [0.0; 4],
                 dual_master: false,
                 weight_t: 0.0,
                 record_texels: 0,
@@ -514,6 +540,7 @@ impl CurveStore {
             count,
             bbox,
             banded,
+            clips: corner_clips(&records, b_records.as_deref(), bbox),
             dual_master,
             weight_t,
             record_texels,
@@ -753,6 +780,94 @@ fn control_span(record: &[f32], axis: usize) -> (f32, f32) {
         coords.iter().copied().fold(f32::INFINITY, f32::min),
         coords.iter().copied().fold(f32::NEG_INFINITY, f32::max),
     )
+}
+
+/// The furthest one quadratic reaches along `n`, exactly.
+///
+/// `dot(B(t), n)` is a scalar quadratic in t, so its maximum over [0, 1] is
+/// either an endpoint or — when the parabola opens downward — its vertex. The
+/// control point itself is deliberately *not* consulted: a quarter circle's
+/// middle control point sits exactly on the corner of its bounding box, so
+/// bounding by the control hull would leave every round glyph ('O', 'c', 'e',
+/// the bowl of a 'Q') with no clippable corner at all, while the curve itself
+/// stays 0.29 of a radius away from it. Bounding the curve is just as safe: the
+/// curve's own convex hull is the intersection of its support half-planes, and
+/// it is the curve, not the hull, that the fragment shader tests against.
+fn curve_support(record: &[f32], n: [f32; 2]) -> f32 {
+    let a0 = n[0] * record[0] + n[1] * record[1];
+    let a1 = n[0] * record[2] + n[1] * record[3];
+    let a2 = n[0] * record[4] + n[1] * record[5];
+    let ends = a0.max(a2);
+    // f(t) = a0 + 2(a1 - a0)t + (a0 - 2a1 + a2)t², vertex at (a0 - a1)/d.
+    // Lines flatten to a control point at the midpoint, which makes d exactly
+    // 0 and leaves the endpoints answering.
+    let d = a0 - 2.0 * a1 + a2;
+    if d >= 0.0 {
+        return ends;
+    }
+    let t = (a0 - a1) / d;
+    if t <= 0.0 || t >= 1.0 {
+        return ends;
+    }
+    let s = 1.0 - t;
+    ends.max(s * s * a0 + 2.0 * s * t * a1 + t * t * a2)
+}
+
+/// How deep each bbox corner can be cut away without the cut reaching ink —
+/// the support-plane clip of Lengyel 2017 §3, in em, one leg per corner.
+///
+/// For corner `i` with outward normal `n` (see [`CLIP_NORMALS`]), the support
+/// value `h = max over the outline of dot(p, n)` is the furthest the glyph
+/// reaches along `n`; the plane `dot(p, n) = h` therefore has the whole outline
+/// on one side of it, and so does any plane beyond it. The leg returned is
+/// `dot(corner, n) - h`, which is where that support plane cuts the two edges
+/// meeting at the corner. That makes the clip safe by construction rather than
+/// by tuning: nothing of the outline is inside the removed triangle, a point
+/// outside a closed outline's convex hull has winding number zero, and a sample
+/// beyond a separating plane is at least the plane distance away from every
+/// point of the curve — so the antialiasing window finds nothing either.
+///
+/// The maximum spans **both masters**, and that one number covers every blend
+/// between them: a Bézier is linear in its control points, so the blended curve
+/// is the pointwise blend of the two masters' curves, and
+/// `dot(mix(A(u), B(u), t), n) <= max(h_a, h_b)` for every u and every t.
+///
+/// A corner whose triangle would be under [`CLIP_MIN_AREA`] of the bbox is left
+/// square: the octagon costs four more triangles a glyph, and Lengyel's own
+/// caveat is that tiny triangles cost more than the fragments they save.
+///
+/// The renderer applies these legs at the corners of the quad, which is the
+/// bbox *padded* by 1.5 px for the antialiasing falloff, so the plane the
+/// geometry actually cuts along sits a further `pad * sqrt(2)` px outside the
+/// hull — more than the half pixel the coverage window can reach.
+fn corner_clips(records: &[f32], b_records: Option<&[f32]>, bbox: [f32; 4]) -> [f32; 4] {
+    let (width, height) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    if width <= 0.0 || height <= 0.0 {
+        return [0.0; 4];
+    }
+    // Triangle area is leg²/2, so the area threshold is a leg threshold.
+    let min_leg = (2.0 * CLIP_MIN_AREA * width * height).sqrt();
+    let mut clips = [0.0; 4];
+    for (clip, n) in clips.iter_mut().zip(CLIP_NORMALS) {
+        let corner = [
+            if n[0] > 0.0 { bbox[2] } else { bbox[0] },
+            if n[1] > 0.0 { bbox[3] } else { bbox[1] },
+        ];
+        let mut support = f32::NEG_INFINITY;
+        for region in [Some(records), b_records].into_iter().flatten() {
+            for record in region.chunks_exact(FLOATS_PER_CURVE) {
+                support = support.max(curve_support(record, n));
+            }
+        }
+        // The bbox is tight, so some control point sits on each edge and the
+        // leg can never exceed the shorter side; the clamp is against fp
+        // noise, and clipping less is always safe.
+        let leg = (n[0] * corner[0] + n[1] * corner[1] - support).clamp(0.0, width.min(height));
+        if leg >= min_leg {
+            *clip = leg;
+        }
+    }
+    clips
 }
 
 /// Every curve's control-point range along one axis, spanning both masters.
@@ -1885,6 +2000,285 @@ mod tests {
             }
         }
         assert!(checked > 100, "the font should have supplied contours");
+    }
+
+    // ---- Corner clips (#14) ----
+
+    /// A curve record through three explicit control points.
+    fn record_through(points: [[f32; 2]; 3]) -> Vec<f32> {
+        let [p0, p1, p2] = points;
+        vec![p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], 0.0, 0.0]
+    }
+
+    /// A closed polygon as records, each edge a line — control point at the
+    /// midpoint, which is exactly what the flattener emits for a straight
+    /// segment, so the curve through them is the segment itself.
+    fn polygon(points: &[[f32; 2]]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (i, p0) in points.iter().enumerate() {
+            let p2 = points[(i + 1) % points.len()];
+            let mid = [(p0[0] + p2[0]) * 0.5, (p0[1] + p2[1]) * 0.5];
+            out.extend(record_through([*p0, mid, p2]));
+        }
+        out
+    }
+
+    /// Points *on* the outline: every curve sampled along its length, and at
+    /// several blends when there is a second master. Sampled rather than
+    /// re-derived, so the check does not just repeat `corner_clips`'s own
+    /// arithmetic back at it.
+    fn outline_points(records: &[f32], b_records: Option<&[f32]>) -> Vec<[f32; 2]> {
+        const STEPS: usize = 64;
+        let mut points = Vec::new();
+        for (index, record) in records.chunks_exact(FLOATS_PER_CURVE).enumerate() {
+            let twin = b_records.map(|b| &b[index * FLOATS_PER_CURVE..]);
+            for blend in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let mut p = [[0.0; 2]; 3];
+                for (k, point) in p.iter_mut().enumerate() {
+                    for axis in 0..2 {
+                        let a = record[k * 2 + axis];
+                        let b = twin.map_or(a, |t| t[k * 2 + axis]);
+                        point[axis] = a + (b - a) * blend;
+                    }
+                }
+                for step in 0..=STEPS {
+                    let t = step as f32 / STEPS as f32;
+                    let s = 1.0 - t;
+                    points.push([
+                        s * s * p[0][0] + 2.0 * s * t * p[1][0] + t * t * p[2][0],
+                        s * s * p[0][1] + 2.0 * s * t * p[1][1] + t * t * p[2][1],
+                    ]);
+                }
+                if twin.is_none() {
+                    break;
+                }
+            }
+        }
+        points
+    }
+
+    /// The invariant the whole feature rests on: no point of the outline — at
+    /// any blend — lies inside a clipped corner triangle.
+    fn assert_clips_miss_the_ink(clips: [f32; 4], bbox: [f32; 4], points: &[[f32; 2]], what: &str) {
+        for (i, n) in CLIP_NORMALS.iter().enumerate() {
+            if clips[i] == 0.0 {
+                continue;
+            }
+            let corner = [
+                if n[0] > 0.0 { bbox[2] } else { bbox[0] },
+                if n[1] > 0.0 { bbox[3] } else { bbox[1] },
+            ];
+            let plane = n[0] * corner[0] + n[1] * corner[1] - clips[i];
+            for p in points {
+                assert!(
+                    n[0] * p[0] + n[1] * p[1] <= plane,
+                    "{what}: corner {i} clip {} cuts the outline at {p:?}",
+                    clips[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn support_planes_clip_exactly_the_empty_corners_of_a_point_set() {
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        // A triangle pointing up: the two top corners are empty by half a unit
+        // each, the two bottom ones are full.
+        let up = polygon(&[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]);
+        let clips = corner_clips(&up, None, unit);
+        assert_eq!(
+            clips,
+            [0.5, 0.5, 0.0, 0.0],
+            "the support planes of an upward triangle cut its top corners"
+        );
+        assert_clips_miss_the_ink(clips, unit, &outline_points(&up, None), "triangle");
+
+        // Upside down: the bottom corners are the empty ones now.
+        let down = polygon(&[[0.0, 1.0], [1.0, 1.0], [0.5, 0.0]]);
+        assert_eq!(corner_clips(&down, None, unit), [0.0, 0.0, 0.5, 0.5]);
+
+        // A shape that reaches every corner keeps its quad.
+        let square = polygon(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        assert_eq!(corner_clips(&square, None, unit), [0.0; 4]);
+
+        // A tall bbox: the legs are em distances, the same on both axes, which
+        // is what makes the cut 45° in em space however narrow the glyph.
+        let bbox = [0.0, 0.0, 0.5, 2.0];
+        let tall = polygon(&[[0.0, 0.0], [0.5, 0.0], [0.5, 2.0]]);
+        let clips = corner_clips(&tall, None, bbox);
+        assert_eq!(clips, [0.5, 0.0, 0.0, 0.0], "only the top-left is empty");
+        assert_clips_miss_the_ink(clips, bbox, &outline_points(&tall, None), "tall");
+    }
+
+    /// The support plane bounds the *curve*, not its control hull, and that is
+    /// the difference between clipping a round glyph and not: the middle
+    /// control point of a quarter circle sits exactly on the bbox corner, while
+    /// the arc itself stays 1 - sqrt(2)/2 of the box away from it.
+    #[test]
+    fn a_round_corner_is_clipped_even_though_a_control_point_sits_in_it() {
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        let arc = record_through([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]);
+        assert_eq!(
+            curve_support(&arc, [1.0, 1.0]),
+            1.5,
+            "the arc's furthest point along the diagonal is its midpoint"
+        );
+        let clips = corner_clips(&arc, None, unit);
+        assert!(
+            (clips[1] - 0.5).abs() < 1e-6,
+            "the top-right corner clips by half the box: {clips:?}"
+        );
+        assert_clips_miss_the_ink(clips, unit, &outline_points(&arc, None), "arc");
+        // A straight line between the same endpoints has no bulge, so the
+        // support plane sits further in still.
+        let chord = polygon(&[[0.0, 1.0], [1.0, 0.0]]);
+        assert!(corner_clips(&chord, None, unit)[1] > clips[1]);
+    }
+
+    #[test]
+    fn a_corner_triangle_under_the_area_threshold_is_not_worth_clipping() {
+        // Legs of `leg` remove leg²/2 of a unit box, so the 4% area threshold
+        // is a leg threshold of sqrt(0.08).
+        let cutoff = (2.0 * CLIP_MIN_AREA).sqrt();
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        for (leg, expected) in [(cutoff + 1e-3, cutoff + 1e-3), (cutoff - 1e-3, 0.0)] {
+            // The unit box with exactly that triangle taken off its top-right.
+            let records = polygon(&[
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 1.0 - leg],
+                [1.0 - leg, 1.0],
+                [0.0, 1.0],
+            ]);
+            let clips = corner_clips(&records, None, unit);
+            assert!(
+                (clips[1] - expected).abs() < 1e-5,
+                "leg {leg} gave {clips:?}"
+            );
+            assert_eq!(
+                [clips[0], clips[2], clips[3]],
+                [0.0; 3],
+                "the other three corners are full"
+            );
+        }
+    }
+
+    #[test]
+    fn clips_are_conservative_over_both_masters() {
+        // Master A leaves the top-left corner empty; master B fills it. The
+        // clip has to answer to both, or a blend toward B would lose ink.
+        let unit = [0.0, 0.0, 1.0, 1.0];
+        let a = polygon(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
+        let b = polygon(&[[0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]);
+        assert!(
+            corner_clips(&a, None, unit)[0] > 0.0,
+            "master A alone would clip the top-left corner"
+        );
+        assert_eq!(
+            corner_clips(&a, Some(&b), unit)[0],
+            0.0,
+            "master B's ink must veto the clip"
+        );
+
+        // The real variable face: every glyph, both masters, blends between.
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::variable_font_system();
+        let font_id = testing::font_id_of(&font_system, testing::VARIABLE_FAMILY);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+        let flags = CacheKeyFlags::empty();
+        let mut clipped_glyphs = 0;
+        for glyph_id in 1..200 {
+            let Some(curves) = get(&mut store, &mut font_system, font_id, glyph_id) else {
+                continue;
+            };
+            if curves.count == 0 {
+                continue;
+            }
+            let outlines: Vec<Vec<f32>> = [AXIS.0, AXIS.1]
+                .iter()
+                .filter_map(|axis| {
+                    store.outline(
+                        &mut font_system,
+                        font_id,
+                        glyph_id,
+                        axis_weight(*axis),
+                        flags,
+                    )
+                })
+                .map(|commands| flatten(&commands).0)
+                .collect();
+            assert_eq!(outlines.len(), 2, "a variable face has two masters");
+            assert_clips_miss_the_ink(
+                curves.clips,
+                curves.bbox,
+                &outline_points(&outlines[0], Some(&outlines[1])),
+                &format!("Manrope glyph {glyph_id}"),
+            );
+            clipped_glyphs += usize::from(curves.clips.iter().any(|c| *c > 0.0));
+        }
+        assert!(
+            clipped_glyphs > 0,
+            "some Manrope glyph should clip a corner"
+        );
+    }
+
+    #[test]
+    fn real_glyphs_clip_the_corners_a_reader_would_expect() {
+        let (device, _) = testing::gpu();
+        let mut font_system = testing::font_system();
+        let font_id = testing::font_id_of(&font_system, testing::STATIC_FAMILY);
+        let mut store = CurveStore::new(device);
+        store.begin_frame(1);
+
+        let clips_of = |store: &mut CurveStore, font_system: &mut FontSystem, ch: char| {
+            let glyph_id = font_system
+                .get_font(font_id, fontdb::Weight::NORMAL)
+                .expect("face")
+                .as_swash()
+                .charmap()
+                .map(ch);
+            let curves = get(store, font_system, font_id, glyph_id).expect("outline");
+            let commands = store
+                .outline(
+                    font_system,
+                    font_id,
+                    glyph_id,
+                    fontdb::Weight::NORMAL,
+                    CacheKeyFlags::empty(),
+                )
+                .expect("outline commands");
+            let (records, _, _) = flatten(&commands);
+            assert_clips_miss_the_ink(
+                curves.clips,
+                curves.bbox,
+                &outline_points(&records, None),
+                &format!("'{ch}'"),
+            );
+            curves.clips
+        };
+
+        // 'A' is the paper's own example: both top corners are empty triangles.
+        let a = clips_of(&mut store, &mut font_system, 'A');
+        assert!(a[0] > 0.0 && a[1] > 0.0, "'A' clips its top corners: {a:?}");
+        assert_eq!([a[2], a[3]], [0.0, 0.0], "…and keeps its feet");
+        // '7' is the mirror case: a full top bar, and a diagonal that leaves
+        // the bottom *right* corner empty.
+        let seven = clips_of(&mut store, &mut font_system, '7');
+        assert!(
+            seven[2] > 0.0,
+            "'7' clips its bottom-right corner: {seven:?}"
+        );
+        assert_eq!([seven[0], seven[1]], [0.0, 0.0], "…and keeps its bar");
+        // A round glyph clips at all only because the bound is the curve's
+        // own, not its control hull's — the arc test above is the isolated
+        // demonstration. DejaVu's 'o' clears the area threshold on the corners
+        // its slightly flattened sides leave emptiest.
+        let o = clips_of(&mut store, &mut font_system, 'o');
+        assert!(o.iter().any(|c| *c > 0.0), "'o' clips a corner: {o:?}");
+        // A bar fills its box; nothing to spare.
+        let bar = clips_of(&mut store, &mut font_system, '|');
+        assert_eq!(bar, [0.0; 4], "a rectangle has no corner to spare");
     }
 
     #[test]
