@@ -107,17 +107,16 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   mirrored-looking garbage until fixed). Hairline stems need the 3-tap path
   below ~24px.
 - Glyph outlines extracted at size 1.0 + DISABLE_HINTING = pure em units.
-- **Open bug — `CurveStore::flush` drops glyphs added inside an already-
-  uploaded row.** It early-returns on `total_rows <= uploaded_rows`, where
-  `total_rows = ceil(data.len() / floats_per_row)`. A glyph extracted *after*
-  a flush whose block fits in the current partial row therefore never reaches
-  the texture, and the shader draws it as nothing — permanently, not just for
-  one frame. Repro: draw `"11 px"` for two frames, then `"88 px"`; the `8`s
-  never appear (a whole row is 256 texels, so a handful of small glyphs stay
-  inside one). The fix is to track the uploaded *float* count instead of the
-  row count (or drop the guard and always re-upload from `uploaded_rows - 1`).
-  `examples/gallery` works around it with `warm_up`, which extracts a scene's
-  whole character set before the first `finish`.
+- **Fixed bug worth remembering** — `CurveStore::flush` used a row-granular
+  high-water mark (`total_rows <= uploaded_rows` early return), so a glyph
+  extracted after a flush whose block fit inside the current partial row
+  never reached the texture and drew as nothing, permanently. The fix tracks
+  uploaded *floats* (`uploaded_floats`) and re-uploads from the row holding
+  the first new float; regression test
+  `flush_uploads_glyphs_that_fit_inside_a_partial_row`. Moral: upload
+  high-water marks must use the finest granularity data grows by, not the
+  granularity the transport (rows) prefers. `examples/gallery`'s `warm_up`
+  predates the fix and is now just a determinism nicety.
 - Curve-texture addressing is by *texel*, not curve record: `GlyphCurves.first`
   is a glyph's base texel and everything stored in the block (band header
   entries, index-list entries) is an offset from it, so compaction relocates a
