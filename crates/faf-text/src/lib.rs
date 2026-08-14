@@ -27,10 +27,15 @@
 //! - **WebGL2 compatibility.** Curve data lives in a texture (`textureLoad`),
 //!   never a storage buffer, so the same shaders run on Vulkan, Metal, DX12,
 //!   GL, WebGPU and WebGL2.
+//! - **Color emoji as vectors.** A COLR/CPAL v0 glyph is a stack of ordinary
+//!   outlines in flat palette colors, so each layer goes through the same curve
+//!   store and draws as one more instanced quad, bottom to top — crisp at any
+//!   size, and no atlas space.
 //!
-//! Color emoji and any glyph without an extractable outline fall back to a
-//! shelf-packed bitmap atlas. Selection backgrounds, highlight overlays and
-//! carets are instanced rect layers below and above the glyphs; underline,
+//! CBDT/sbix/SVG color fonts, COLRv1, and any glyph without an extractable
+//! outline fall back to a shelf-packed bitmap atlas. Selection backgrounds,
+//! highlight overlays and carets are instanced rect layers below and above the
+//! glyphs; underline,
 //! strikethrough, squiggle and rounded chip are a third instanced pipeline
 //! whose fragment shader switches on a [`DecorationKind`].
 //!
@@ -143,10 +148,11 @@
 //! 1. **under-rects** — selection backgrounds ([`RectLayer::Under`]).
 //! 2. **chips** — rounded-rect backgrounds ([`DecorationKind::Chip`]): inline
 //!    code, pills, tags. Behind the text they sit behind.
-//! 3. **vector glyphs** — outlines evaluated in the fragment shader.
+//! 3. **vector glyphs** — outlines evaluated in the fragment shader, including
+//!    one instance per layer of every COLRv0 color glyph.
 //! 4. **weight-blended vector glyphs** — the same, for glyphs carrying a
 //!    second variable-font master.
-//! 5. **atlas glyphs** — color emoji and anything without an outline.
+//! 5. **atlas glyphs** — bitmap color emoji and anything without an outline.
 //! 6. **line decorations** — underline, strikethrough, squiggle. Over the
 //!    glyphs, so an underline crosses the descenders it passes through rather
 //!    than being hidden by them.
@@ -179,6 +185,7 @@
 
 mod arena;
 mod atlas;
+mod colr;
 mod curves;
 mod document;
 mod grid;
@@ -256,6 +263,12 @@ pub const FONT_DEJAVU_SANS_MONO: &[u8] = include_bytes!("../assets/DejaVuSansMon
 /// [`TextRenderer::text_with_weight`] can blend weight per frame for free.
 /// SIL Open Font License 1.1 — see `assets/Manrope-OFL.txt`.
 pub const FONT_MANROPE_VARIABLE: &[u8] = include_bytes!("../assets/Manrope-Variable.ttf");
+/// Twemoji Mozilla, subset to four emoji (❤ 🌈 🔥 🚀) — a **COLRv0** color
+/// font, whose glyphs are stacks of ordinary outlines painted in CPAL palette
+/// colors. Those take the vector path like any other outline, so they stay
+/// crisp at any size instead of riding the bitmap atlas. Apache-2.0 (build)
+/// and CC-BY 4.0 (artwork) — see `assets/Twemoji-LICENSE.txt`.
+pub const FONT_TWEMOJI_COLR: &[u8] = include_bytes!("../assets/TwemojiMozilla-COLR-subset.ttf");
 
 /// Build a [`FontSystem`] from font blobs alone — no system font scan, which
 /// keeps startup fast and is the only option on wasm.

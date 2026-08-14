@@ -1,6 +1,10 @@
 //! Headless smoke test: renders the full feature set (vector glyphs at many
 //! sizes, selection underlay, highlight overlay, decorations, emoji atlas
-//! fallback) to offscreen.png without a window.
+//! fallback, COLR/CPAL color glyphs on the vector path) to offscreen.png
+//! without a window.
+//!
+//! The scene above y = 600 is a regression baseline and has not moved since
+//! the renderer's first commit; the COLR strip below it was added by #15.
 
 use faf_text::{
     Attrs, Color, Cursor, DecorationKind, Family, Metrics, RectLayer, TextRenderer, TextView,
@@ -8,7 +12,10 @@ use faf_text::{
 };
 
 const WIDTH: u32 = 960;
-const HEIGHT: u32 = 600;
+const HEIGHT: u32 = 880;
+/// Top of the COLR comparison strip. Everything above it is the original
+/// scene, pixel for pixel.
+const COLR_STRIP_Y: f32 = 600.0;
 
 fn main() {
     pollster::block_on(run());
@@ -53,6 +60,10 @@ async fn run() {
         faf_text::FONT_DEJAVU_SANS,
         faf_text::FONT_DEJAVU_SANS_MONO,
         faf_text::FONT_MANROPE_VARIABLE,
+        // COLRv0 emoji, asked for by family name below. It never displaces the
+        // system emoji font in fallback — cosmic-text's fallback list names
+        // "Noto Color Emoji" — so the body text's emoji still go to the atlas.
+        faf_text::FONT_TWEMOJI_COLR,
     ]);
     font_system.db_mut().load_system_fonts();
 
@@ -138,6 +149,38 @@ async fn run() {
         &Attrs::new().family(Family::SansSerif),
     );
 
+    // COLR/CPAL. The same rocket twice: on the left out of the bitmap atlas
+    // (Noto Color Emoji is CBDT — bitmap strikes, rescaled per size), on the
+    // right as COLRv0 layered outlines (Twemoji), which go through the winding
+    // shader like any other glyph. Both at 22 px and at 200 px, and the 200 px
+    // pair is the point: the vector one is the *same curve data* as the 22 px
+    // one and stays exact, where the bitmap one is a 136 px strike blown up.
+    let bitmap_family = Family::Name("Noto Color Emoji");
+    let colr_family = Family::Name("Twemoji Mozilla");
+    let mut caption = |x: f32, text: &str| {
+        let mut view = TextView::new(&mut font_system, Metrics::new(15.0, 22.0));
+        view.pos = [x, COLR_STRIP_Y + 8.0];
+        view.set_text(
+            &mut font_system,
+            text,
+            &Attrs::new().family(Family::Monospace),
+        );
+        view
+    };
+    let atlas_caption = caption(40.0, "bitmap atlas · CBDT strikes");
+    let vector_caption = caption(500.0, "vector · COLR/CPAL layers");
+
+    let mut emoji = |x: f32, y: f32, px: f32, text: &str, family: Family| {
+        let mut view = TextView::new(&mut font_system, Metrics::new(px, px * 1.05));
+        view.pos = [x, y];
+        view.set_text(&mut font_system, text, &Attrs::new().family(family));
+        view
+    };
+    let atlas_small = emoji(40.0, COLR_STRIP_Y + 32.0, 22.0, "🚀🔥❤", bitmap_family);
+    let vector_small = emoji(500.0, COLR_STRIP_Y + 32.0, 22.0, "🚀🔥❤", colr_family);
+    let atlas_big = emoji(40.0, COLR_STRIP_Y + 66.0, 200.0, "🚀", bitmap_family);
+    let vector_big = emoji(500.0, COLR_STRIP_Y + 66.0, 200.0, "🚀", colr_family);
+
     renderer.begin();
 
     // Selection: from mid-word in the body text, spanning a couple of lines.
@@ -217,6 +260,13 @@ async fn run() {
         huge.pos,
         Color::rgba8(0xbb, 0x9a, 0xf7, 0xff),
     );
+    let muted = Color::rgba8(0x6a, 0x74, 0x9a, 0xff);
+    for view in [&atlas_caption, &vector_caption] {
+        renderer.text(&queue, &mut font_system, &view.buffer, view.pos, muted);
+    }
+    for view in [&atlas_small, &vector_small, &atlas_big, &vector_big] {
+        renderer.text(&queue, &mut font_system, &view.buffer, view.pos, fg);
+    }
     for step in 0..5 {
         renderer.text_with_weight(
             &queue,

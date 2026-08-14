@@ -1,0 +1,74 @@
+TwemojiMozilla-COLR-subset.ttf
+==============================
+
+Provenance
+----------
+
+Upstream:  Twemoji Mozilla v0.7.0 (Twemoji.Mozilla.ttf, 1474284 bytes,
+           md5 aac75d901445bc0419d56e56dbc18891)
+Source:    https://github.com/mozilla/twemoji-colr
+           https://github.com/mozilla/twemoji-colr/releases/download/v0.7.0/Twemoji.Mozilla.ttf
+
+Subset to four emoji (U+2764 heart, U+1F308 rainbow, U+1F525 fire,
+U+1F680 rocket) so the repository carries 2 KB instead of 1.4 MB, with
+fontTools 4.46.0:
+
+    python3 -m fontTools.subset Twemoji.Mozilla.ttf \
+        --unicodes=U+1F680,U+1F525,U+2764,U+1F308 \
+        --name-IDs='*' --drop-tables+=FFTM \
+        --output-file=TwemojiMozilla-COLR-subset.ttf
+
+Nothing else was changed: the family name is still "Twemoji Mozilla", the
+COLR table is still version 0 (20 glyphs, 4 base glyphs, 15 layers) and
+CPAL still holds one palette of 13 colors. It is here as the renderer's
+COLRv0 test font — layer enumeration, palette resolution and layer draw
+order are asserted against it — and as the vector color glyph in
+`examples/offscreen`.
+
+
+License
+-------
+
+The font build tooling is Apache-2.0, Copyright 2016-2018 Mozilla
+Foundation. The emoji artwork inside it comes from Twemoji
+(https://twemoji.twitter.com/) and is used and redistributed under
+CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/), which requires
+attribution:
+
+    Copyright 2019 Twitter, Inc and other contributors
+    Graphics licensed under CC-BY 4.0:
+    https://creativecommons.org/licenses/by/4.0/
+
+The upstream license text is reproduced below, from
+https://github.com/mozilla/twemoji-colr/blob/master/LICENSE.md.
+
+---------------------------------------------------------------------
+
+## License for the Code
+
+Copyright 2016-2018, Mozilla Foundation
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+
+## License for the Visual Design
+
+The Emoji art in the twe-svg.zip archive comes from Twemoji
+(https://twemoji.twitter.com/), and is used and redistributed under the
+CC-BY-4.0 license terms (https://github.com/twitter/twemoji#license)
+offered by the Twemoji project.
+
+### Creative Commons Attribution 4.0 International (CC BY 4.0)
+https://creativecommons.org/licenses/by/4.0/legalcode
+or for the human readable summary:
+https://creativecommons.org/licenses/by/4.0/
