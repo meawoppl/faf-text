@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-08-19
+
+- The live cells in the docs.rs pages now load their driver from gh-pages
+  instead of carrying it inline, so demo behaviour — such as the new frame-rate
+  overlay — updates without a release. The injected header keeps only the cell
+  styles and a stub that imports the driver, and still falls back to the static
+  gallery animations when the fetch fails. No library changes.
+
 ## 0.2.0 — 2026-08-14
 
 - Band lists are sorted so each ray stops at the first curve past its

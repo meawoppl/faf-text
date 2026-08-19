@@ -60,15 +60,37 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
 - Documentation assets: `cargo run --release --example gallery -p faf-text`
   renders `site/gallery/` (a 1200×630 `hero.png` plus `zoom`/`weight`/`tilt`/
   `terminal` as APNG + a single-frame PNG sibling). `site/` is gitignored;
-  `scripts/build-site.sh` assembles the gh-pages tree (landing page + `demo/`
-  from `web/` + `gallery/`) and never runs the release wasm build itself.
-- Live docs: `crates/faf-text/docs-header.html` is injected by
-  `[package.metadata.docs.rs] rustdoc-args = ["--html-in-header", …]` and
-  upgrades the `.faf-live` placeholder divs in the crate docs into wasm
-  canvases from `https://meawoppl.github.io/faf-text/demo/pkg/`
-  (`window.FAF_DEMO_PKG` overrides). Test it locally by rewriting that URL to
-  a path under `target/doc/` and serving `target/doc`: the four cells do come
-  up headless under SwiftShader, on the WebGL2 fallback.
+  `scripts/build-site.sh` assembles the gh-pages tree (landing page +
+  `docs-loader.js` + `demo/` from `web/` + `gallery/`) and never runs the
+  release wasm build itself.
+- Live docs are split so behaviour is **evergreen**:
+  `crates/faf-text/docs-header.html` is injected by
+  `[package.metadata.docs.rs] rustdoc-args = ["--html-in-header", …]` and is
+  frozen at publish time, so it carries only the cell CSS plus a stub that
+  `import()`s `window.FAF_DOCS_LOADER ||
+  https://meawoppl.github.io/faf-text/docs-loader.js` with `.catch(() => {})`.
+  The driver itself is `web/docs-loader.js`, deployed to the *site root* and
+  live for every published version at once: it upgrades the `.faf-live`
+  placeholder divs into wasm canvases from
+  `https://meawoppl.github.io/faf-text/demo/pkg/` (`window.FAF_DEMO_PKG`
+  overrides). The frozen interface between them is the class names
+  (`.faf-live` + `data-demo`/`data-height`/its `img` fallback,
+  `.faf-live-grid`, `.faf-live-caption`) — new demo kinds are safe, renaming
+  those is not. Both URLs are overridable, so a local test is: build docs with
+  `RUSTDOCFLAGS="--html-in-header $(pwd)/crates/faf-text/docs-header.html"`,
+  serve a tree holding `doc/`, `docs-loader.js` and `pkg/`, and inject a
+  classic `<script>` setting the two globals (classic scripts run before the
+  deferred module stub). The four cells do come up headless under SwiftShader,
+  on the WebGL2 fallback; a 404 loader leaves the APNGs visible with no
+  unhandled rejection.
+- `--screenshot` + `--virtual-time-budget` is *unreliable* for the live-docs
+  page: the cells' IntersectionObserver and the wasm boot race virtual time and
+  half the runs capture zero canvases. Drive it over CDP in real time instead
+  (`--remote-debugging-port=9222` + a node script over `/tmp/node_modules/ws`,
+  navigate, wait ~20 s, `Runtime.evaluate` a DOM probe, then
+  `Page.captureScreenshot` with `captureBeyondViewport`). Note `Runtime.enable`
+  replays the *previous* page's console messages, so trust the probe's return
+  value over the log order.
 - No `include` list in `crates/faf-text/Cargo.toml` on purpose — the default
   (everything not gitignored) already ships `assets/`, both `.wgsl` files and
   `docs-header.html`; an `include` would silently drop them. `README.md` there

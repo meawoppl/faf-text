@@ -2,9 +2,10 @@
 #
 # Assemble the gh-pages tree into site/.
 #
-#   site/index.html   landing page (written below)
-#   site/demo/        the interactive demo: web/index.html + web/pkg
-#   site/gallery/     hero.png plus the four APNG animations and their stills
+#   site/index.html      landing page (written below)
+#   site/docs-loader.js  the driver docs.rs pages import for their live cells
+#   site/demo/           the interactive demo: web/index.html + web/pkg
+#   site/gallery/        hero.png plus the four APNG animations and their stills
 #
 # The demo's wasm bundle is *copied*, never built here — a release wasm-pack
 # build spends minutes in wasm-opt, which has no business inside a site script.
@@ -17,6 +18,7 @@
 # README point at assume that layout:
 #
 #   https://meawoppl.github.io/faf-text/demo/
+#   https://meawoppl.github.io/faf-text/docs-loader.js
 #   https://raw.githubusercontent.com/meawoppl/faf-text/gh-pages/gallery/hero.png
 #
 # Usage: scripts/build-site.sh [--skip-gallery]
@@ -60,7 +62,12 @@ else
   echo "          --out-dir ../../web/pkg --release"
 fi
 
-# 3. Landing page.
+# 3. Live-docs loader. Every published version's docs.rs pages import this from
+#    the site root, so it ships at the top level and its URL is permanent.
+echo "==> copying docs-loader.js"
+cp "$root/web/docs-loader.js" "$site/docs-loader.js"
+
+# 4. Landing page.
 echo "==> writing index.html"
 cat >"$site/index.html" <<'HTML'
 <!doctype html>
