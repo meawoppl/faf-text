@@ -200,6 +200,26 @@ export class FafTextDemo {
         wasm.faftextdemo_set_search_mode(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Draw a frame-rate readout in the top-right corner — a mono line on a
+     * rounded chip, rendered by this renderer in a block of its own rather
+     * than by an HTML label over the canvas. It reads
+     * `webgpu · 62 fps · 16.1 ms`, leading with the backend
+     * [`FafTextDemo::backend`] reports, so a live cell says which of WebGPU
+     * and WebGL2 it is running on.
+     *
+     * It counts frames that were actually *presented*, so an idle demo reads
+     * `idle` instead of the rAF rate, and it does not count the frames its own
+     * 4 Hz refresh causes (the `stats` module documents that rule). It follows
+     * the pane through a resize and stays up in terminal mode; it takes no
+     * input.
+     *
+     * Idempotent, and the block is created on first enable.
+     * @param {boolean} on
+     */
+    set_stats_overlay(on) {
+        wasm.faftextdemo_set_stats_overlay(this.__wbg_ptr, on);
+    }
+    /**
      * Swap the editable pane for a live terminal grid: a synthetic colored
      * log streams into a [`TermGrid`] sized to the canvas, drawn out of one
      * retained block with the mono face and procedural box drawing.
@@ -1236,6 +1256,10 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(arg0, arg1 >>> 0, arg2 >>> 0);
             return ret;
         },
+        __wbg_now_2283802bfbda617e: function(arg0) {
+            const ret = arg0.now();
+            return ret;
+        },
         __wbg_of_0c6464fa8d2aa86d: function(arg0) {
             const ret = Array.of(arg0);
             return ret;
@@ -1243,6 +1267,10 @@ function __wbg_get_imports() {
         __wbg_onSubmittedWorkDone_270d6b5a45520e79: function(arg0) {
             const ret = arg0.onSubmittedWorkDone();
             return ret;
+        },
+        __wbg_performance_821a3767f0dce300: function(arg0) {
+            const ret = arg0.performance;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
         __wbg_pixelStorei_11bdfb5bc6a39d28: function(arg0, arg1, arg2) {
             arg0.pixelStorei(arg1 >>> 0, arg2);
@@ -2149,22 +2177,22 @@ function __wbg_get_imports() {
             arg0.writeTexture(arg1, getArrayU8FromWasm0(arg2, arg3), arg4, arg5);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2530, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2532, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6eb6ae39273879d5);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 300, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 302, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 300, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 302, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714_2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 300, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 302, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714_3);
             return ret;
         },

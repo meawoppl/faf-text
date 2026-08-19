@@ -79,6 +79,23 @@ export class FafTextDemo {
      */
     set_search_mode(mode: string): void;
     /**
+     * Draw a frame-rate readout in the top-right corner — a mono line on a
+     * rounded chip, rendered by this renderer in a block of its own rather
+     * than by an HTML label over the canvas. It reads
+     * `webgpu · 62 fps · 16.1 ms`, leading with the backend
+     * [`FafTextDemo::backend`] reports, so a live cell says which of WebGPU
+     * and WebGL2 it is running on.
+     *
+     * It counts frames that were actually *presented*, so an idle demo reads
+     * `idle` instead of the rAF rate, and it does not count the frames its own
+     * 4 Hz refresh causes (the `stats` module documents that rule). It follows
+     * the pane through a resize and stays up in terminal mode; it takes no
+     * input.
+     *
+     * Idempotent, and the block is created on first enable.
+     */
+    set_stats_overlay(on: boolean): void;
+    /**
      * Swap the editable pane for a live terminal grid: a synthetic colored
      * log streams into a [`TermGrid`] sized to the canvas, drawn out of one
      * retained block with the mono face and procedural box drawing.
@@ -142,6 +159,7 @@ export interface InitOutput {
     readonly faftextdemo_set_font_size: (a: number, b: number) => void;
     readonly faftextdemo_set_search: (a: number, b: number, c: number) => void;
     readonly faftextdemo_set_search_mode: (a: number, b: number, c: number) => void;
+    readonly faftextdemo_set_stats_overlay: (a: number, b: number) => void;
     readonly faftextdemo_set_terminal: (a: number, b: number) => void;
     readonly faftextdemo_set_text: (a: number, b: number, c: number) => void;
     readonly faftextdemo_set_tilt: (a: number, b: number) => void;

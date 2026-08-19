@@ -20,6 +20,7 @@ export const faftextdemo_set_caret_visible: (a: number, b: number) => void;
 export const faftextdemo_set_font_size: (a: number, b: number) => void;
 export const faftextdemo_set_search: (a: number, b: number, c: number) => void;
 export const faftextdemo_set_search_mode: (a: number, b: number, c: number) => void;
+export const faftextdemo_set_stats_overlay: (a: number, b: number) => void;
 export const faftextdemo_set_terminal: (a: number, b: number) => void;
 export const faftextdemo_set_text: (a: number, b: number, c: number) => void;
 export const faftextdemo_set_tilt: (a: number, b: number) => void;
