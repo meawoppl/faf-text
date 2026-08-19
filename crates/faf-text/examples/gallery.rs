@@ -8,7 +8,10 @@
 //!
 //! Output:
 //!
-//! - `hero.png` — a 1200×630 social card: the full feature set in one frame.
+//! - `hero.png` — the social card: the full feature set in one frame, rendered
+//!   at 2400×1260 (2× the 1200×630 it is displayed at, so it stays crisp on
+//!   HiDPI screens — the renderer is resolution-independent, so 2× is just a
+//!   bigger canvas, not an upscale).
 //! - `zoom.apng` / `zoom.png` — a font-size sweep, 10 → 80 px. Nothing
 //!   re-rasterizes between those frames; the curve data is identical.
 //! - `weight.apng` / `weight.png` — a `wght` sweep across Manrope's two
@@ -374,10 +377,15 @@ fn readout(font_system: &mut faf_text::FontSystem, text: &str, right: f32, top: 
 
 // ---- hero.png ----
 
-/// The social card: 1200×630, everything the renderer does in one frame.
+/// The social card: everything the renderer does in one frame, at 2× the
+/// 1200×630 display size so HiDPI screens get real pixels. Every layout
+/// number below is in 1× design units and multiplied by `S` — layout is
+/// linear in the scale, so wrapping and the weight-row step land identically.
 fn hero(gpu: &Gpu, out: &Path) {
-    const WIDTH: u32 = 1200;
-    const HEIGHT: u32 = 630;
+    const SCALE: u32 = 2;
+    const S: f32 = SCALE as f32;
+    const WIDTH: u32 = 1200 * SCALE;
+    const HEIGHT: u32 = 630 * SCALE;
 
     let mut font_system = gpu.fonts();
     let mut renderer = TextRenderer::new(&gpu.device, Target::FORMAT);
@@ -388,20 +396,20 @@ fn hero(gpu: &Gpu, out: &Path) {
 
     // The wordmark, in the variable face so the title itself is a GPU weight
     // blend rather than a second font file.
-    let mut title = line(&mut font_system, "faf-text", MANROPE, 112.0);
-    title.pos = [70.0, 44.0];
+    let mut title = line(&mut font_system, "faf-text", MANROPE, 112.0 * S);
+    title.pos = [70.0 * S, 44.0 * S];
 
     let mut tagline = line(
         &mut font_system,
         "a GPU text renderer that is fast as f***",
         Family::SansSerif,
-        27.0,
+        27.0 * S,
     );
-    tagline.pos = [76.0, 186.0];
+    tagline.pos = [76.0 * S, 186.0 * S];
 
     // The feature paragraph, decorating itself out of its own attributes.
-    let mut body = TextView::new(&mut font_system, Metrics::new(21.0, 31.0));
-    body.pos = [76.0, 248.0];
+    let mut body = TextView::new(&mut font_system, Metrics::new(21.0 * S, 31.0 * S));
+    body.pos = [76.0 * S, 248.0 * S];
     body.set_rich_text(
         &mut font_system,
         [
@@ -415,18 +423,18 @@ fn hero(gpu: &Gpu, out: &Path) {
         ],
         &sans,
     );
-    body.set_size(&mut font_system, Some(600.0), None);
+    body.set_size(&mut font_system, Some(600.0 * S), None);
 
     // Label + row for the weight gradient.
     let mut weight_label = line(
         &mut font_system,
         "one shaped buffer · five GPU weight blends",
         Family::SansSerif,
-        15.0,
+        15.0 * S,
     );
-    weight_label.pos = [76.0, 482.0];
-    let mut weight_word = line(&mut font_system, "weight", MANROPE, 40.0);
-    weight_word.pos = [76.0, 506.0];
+    weight_label.pos = [76.0 * S, 482.0 * S];
+    let mut weight_word = line(&mut font_system, "weight", MANROPE, 40.0 * S);
+    weight_word.pos = [76.0 * S, 506.0 * S];
     // The heaviest master is the widest one, so step by that and the row never
     // collides with itself.
     let weight_step = text_width(&weight_word) * 1.14;
@@ -435,17 +443,17 @@ fn hero(gpu: &Gpu, out: &Path) {
         &mut font_system,
         "native · WebGPU · WebGL2 · wasm — one code path",
         Family::SansSerif,
-        16.0,
+        16.0 * S,
     );
-    footer.pos = [76.0, 576.0];
+    footer.pos = [76.0 * S, 576.0 * S];
 
     // Right column: resolution independence, and the shader line that decides
     // every pixel of it.
-    let mut huge = line(&mut font_system, "Qg", Family::SansSerif, 300.0);
-    huge.pos = [792.0, 96.0];
+    let mut huge = line(&mut font_system, "Qg", Family::SansSerif, 300.0 * S);
+    huge.pos = [792.0 * S, 96.0 * S];
 
-    let mut mono = TextView::new(&mut font_system, Metrics::new(15.0, 23.0));
-    mono.pos = [772.0, 452.0];
+    let mut mono = TextView::new(&mut font_system, Metrics::new(15.0 * S, 23.0 * S));
+    mono.pos = [772.0 * S, 452.0 * S];
     mono.set_text(
         &mut font_system,
         "// one curve set, every size\nlet cov = clamp(winding, 0., 1.);",
@@ -480,12 +488,21 @@ fn hero(gpu: &Gpu, out: &Path) {
     }
     for (a, b) in body.find_all("TermGrid") {
         for r in body.decoration_rects(a, b, DecorationKind::Chip { radius_px: 0.0 }) {
-            renderer.chip([r[0] - 4.0, r[1] + 4.0, r[2] + 8.0, r[3] - 7.0], 6.0, CHIP);
+            renderer.chip(
+                [
+                    r[0] - 4.0 * S,
+                    r[1] + 4.0 * S,
+                    r[2] + 8.0 * S,
+                    r[3] - 7.0 * S,
+                ],
+                6.0 * S,
+                CHIP,
+            );
         }
     }
     // A caret parked in the code, the way a host would draw one.
     if let Some(r) = mono.cursor_rect(Cursor::new(1, 12)) {
-        renderer.rect([r[0], r[1]], [2.0, r[3]], ORANGE, RectLayer::Over);
+        renderer.rect([r[0], r[1]], [2.0 * S, r[3]], ORANGE, RectLayer::Over);
     }
 
     renderer.text_with_weight(
