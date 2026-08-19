@@ -175,6 +175,10 @@
 
       const demo = await mod.FafTextDemo.attach(canvas, dpr, gl);
       demo.set_caret_visible(false);
+      // The fps readout is drawn by the renderer, in a block of its own, and
+      // counts presented frames — so a cell the observer has stopped ticking
+      // reads `idle` rather than lying about a rAF rate it is not getting.
+      demo.set_stats_overlay(true);
       build(demo, el);
       live.push(demo);
       // Rustdoc pages reflow (sidebar toggles, window resizes); re-configure

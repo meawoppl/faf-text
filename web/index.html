@@ -60,6 +60,7 @@
   <label><input type="checkbox" id="wave"> weight wave</label>
   <label><input type="checkbox" id="tilt" title="stand the pane up in 3D — selection still works"> 3D tilt</label>
   <label><input type="checkbox" id="terminal" title="stream a synthetic colored log through a terminal grid — display only, editing is off"> terminal</label>
+  <label><input type="checkbox" id="stats" title="draw the frame rate with the renderer itself, in a block of its own — it counts presented frames, so it reads idle when nothing is animating"> stats</label>
   <label>highlight <input type="text" id="search" value="winding" placeholder="search text">
     <select id="mode" title="how matches are marked">
       <option value="highlight">highlight</option>
@@ -134,6 +135,10 @@ async function main() {
   // Terminal mode hides the editable blocks (it never destroys them), so the
   // page stops feeding it input while it is on — the grid is display-only.
   terminal.addEventListener('change', () => demo.set_terminal(terminal.checked));
+  // The same reading as the pill above, drawn on the canvas by the renderer
+  // instead of by the DOM — and measured from presented frames, in Rust.
+  const stats = document.getElementById('stats');
+  stats.addEventListener('change', () => demo.set_stats_overlay(stats.checked));
   const editing = () => !terminal.checked;
   // Caret blink is host-side: 530ms on/off, restarted on every edit or motion.
   const BLINK = 530;
