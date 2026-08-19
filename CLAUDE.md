@@ -420,6 +420,20 @@ algorithm change. Roadmap lives in issues #2–#11; Slug-paper (Lengyel 2017) pe
   with the 2D projection, so flat content does not move. A streaming log
   scrolls the header off the top every line, so the header is simply redrawn
   after each `scroll_up` — three rows, cheap, and always in frame.
+- The fps overlay (`faf-text-web/src/stats.rs`, `set_stats_overlay`) is drawn by
+  the renderer — a sixth block, created lazily on first enable so it is the
+  newest block and composites over the grid. It reads
+  `webgl2 · 62 fps · 16.1 ms`: the backend tag comes from the wgpu debug name
+  (`BrowserWebGpu` → `webgpu`, `Gl` → `webgl2`), so every docs.rs cell says
+  which backend it got. It measures **presented**
+  frames, which makes it circular: refreshing the readout dirties a block,
+  which is damage, which presents, which would be a sample. The rule that
+  breaks the loop is an *ordering* in `render_frame`: sync everything else,
+  read `damaged()` (at that point it can only be about other content), pass
+  that bool to `StatsOverlay::record`, and only then let the overlay touch its
+  own block. So the readout's own 4 Hz updates present frames but never count
+  themselves, and an idle demo falls to `idle` via the 600 ms gap rule and then
+  stops presenting entirely (the label stops changing → nothing dirty).
 - Driving the demo page for a browser check *interactively* (toggle a control,
   then screenshot) needs CDP, not `--screenshot`: `google-chrome --headless=new
   --use-angle=swiftshader --enable-unsafe-swiftshader --remote-debugging-port=

@@ -72,6 +72,11 @@
 //! - **Frames** — [`render`](FafTextDemo::render) returns `false` when the
 //!   scene graph reports no damage: nothing was recorded and nothing was
 //!   presented, so an idle demo really does cost zero draw calls.
+//!   [`set_stats_overlay`](FafTextDemo::set_stats_overlay) draws the rate those
+//!   frames arrive at *with the renderer itself*, in one more block — see the
+//!   `stats` module for how it avoids measuring the frames it causes.
+
+mod stats;
 
 use std::ops::Range;
 
@@ -82,6 +87,7 @@ use faf_text::{
     BlockContent, BlockId, Cell, CellStyle, Color, DecorationKind, FontSystem, GridFont, GridScene,
     Rect, TermGrid, TextRenderer, TextView,
 };
+use stats::StatsOverlay;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -441,6 +447,10 @@ pub struct FafTextDemo {
     terminal: bool,
     term: Option<Terminal>,
     grid_block: BlockId,
+    /// The renderer-drawn fps readout. Built on first enable so that its block
+    /// is the newest one and composites over everything, including the grid.
+    stats: Option<StatsOverlay>,
+    stats_on: bool,
 }
 
 #[wasm_bindgen]
@@ -577,6 +587,8 @@ impl FafTextDemo {
             terminal: false,
             term: None,
             grid_block,
+            stats: None,
+            stats_on: false,
         })
     }
 
@@ -714,6 +726,40 @@ impl FafTextDemo {
     /// Whether terminal mode is on.
     pub fn terminal(&self) -> bool {
         self.terminal
+    }
+
+    /// Draw a frame-rate readout in the top-right corner — a mono line on a
+    /// rounded chip, rendered by this renderer in a block of its own rather
+    /// than by an HTML label over the canvas. It reads
+    /// `webgpu · 62 fps · 16.1 ms`, leading with the backend
+    /// [`FafTextDemo::backend`] reports, so a live cell says which of WebGPU
+    /// and WebGL2 it is running on.
+    ///
+    /// It counts frames that were actually *presented*, so an idle demo reads
+    /// `idle` instead of the rAF rate, and it does not count the frames its own
+    /// 4 Hz refresh causes (the `stats` module documents that rule). It follows
+    /// the pane through a resize and stays up in terminal mode; it takes no
+    /// input.
+    ///
+    /// Idempotent, and the block is created on first enable.
+    pub fn set_stats_overlay(&mut self, on: bool) {
+        if self.stats_on == on {
+            return;
+        }
+        self.stats_on = on;
+        if on && self.stats.is_none() {
+            // Created after every other block, so it composites on top of all
+            // of them — the terminal grid included.
+            self.stats = Some(StatsOverlay::new(
+                &mut self.renderer,
+                &mut self.font_system,
+                self.dpr,
+                &self.backend,
+            ));
+        }
+        if let Some(stats) = self.stats.as_mut() {
+            stats.set_visible(&mut self.renderer, on);
+        }
     }
 
     /// Pointer coordinates are CSS px relative to the canvas.
@@ -1297,12 +1343,40 @@ impl FafTextDemo {
         }
     }
 
+    /// Feed the overlay this frame: one sample if the frame is being presented
+    /// for someone else's sake, then a chance to re-anchor and (four times a
+    /// second, at most) change what it says.
+    fn sync_stats(&mut self, external_damage: bool) {
+        if !self.stats_on {
+            return;
+        }
+        let surface = self.surface();
+        let dpr = self.dpr;
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        stats.record(external_damage);
+        stats.refresh(
+            &mut self.renderer,
+            &self.queue,
+            &mut self.font_system,
+            surface,
+            dpr,
+        );
+    }
+
     fn render_frame(&mut self) -> Result<bool, JsValue> {
         self.renderer.begin_frame();
         if self.terminal {
             self.terminal_tick();
         }
         self.sync_blocks();
+        // Damage caused by anything that is *not* the stats overlay, read
+        // before the overlay is given a chance to dirty its own block. That
+        // ordering is the whole trick behind an honest fps readout: see the
+        // `stats` module docs.
+        let external_damage = self.renderer.damaged();
+        self.sync_stats(external_damage);
         // Nothing changed: what is on the canvas is still right, so there is
         // no pass to record and no frame to present.
         if !self.renderer.damaged() {
