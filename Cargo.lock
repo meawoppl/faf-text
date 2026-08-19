@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "faf-text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "faf-text-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "console_error_panic_hook",
  "faf-text",
