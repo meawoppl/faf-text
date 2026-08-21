@@ -189,6 +189,7 @@ mod colr;
 mod curves;
 mod document;
 mod grid;
+pub mod inspect;
 pub mod math;
 mod renderer;
 #[cfg(test)]

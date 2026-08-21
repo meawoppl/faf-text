@@ -76,7 +76,10 @@
 //!   frames arrive at *with the renderer itself*, in one more block — see the
 //!   `stats` module for how it avoids measuring the frames it causes.
 
+mod inspect;
 mod stats;
+
+pub use inspect::{inspect_glyph, list_families};
 
 use std::ops::Range;
 

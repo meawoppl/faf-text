@@ -84,13 +84,13 @@ pub const CURVE_TEX_MAX_HEIGHT: u32 = 8192;
 // alone and the shader reaches B by adding it.
 
 /// Halves per RGBA16F texel.
-const FLOATS_PER_TEXEL: usize = 4;
+pub(crate) const FLOATS_PER_TEXEL: usize = 4;
 /// Bytes one texel occupies in the texture.
 const BYTES_PER_TEXEL: usize = FLOATS_PER_TEXEL * 2;
 /// Two RGBA16F texels (8 halves) per quadratic in a flat block:
 /// [p0.xy p1.xy] [p2.xy pad pad].
 const TEXELS_PER_CURVE: usize = 2;
-const FLOATS_PER_CURVE: usize = TEXELS_PER_CURVE * FLOATS_PER_TEXEL;
+pub(crate) const FLOATS_PER_CURVE: usize = TEXELS_PER_CURVE * FLOATS_PER_TEXEL;
 /// Largest integer an f16 lane holds exactly (2^11; 2049 is not
 /// representable). Band headers and index lists are integers in lanes, so a
 /// block whose offsets would pass this cannot be banded — it falls back to the
@@ -107,15 +107,15 @@ pub const BANDS: usize = 8;
 /// `BAND_ENTRY_TEXELS` in `shaders.wgsl`.
 pub const BAND_ENTRY_TEXELS: usize = 1;
 /// Texels the band header occupies: 2*BANDS entries, one texel each.
-const HEADER_TEXELS: usize = BANDS * 2 * BAND_ENTRY_TEXELS;
+pub(crate) const HEADER_TEXELS: usize = BANDS * 2 * BAND_ENTRY_TEXELS;
 /// Glyphs with more curves than this get band tables; at or below it the flat
 /// loop is cheaper than the indirection.
-const BAND_MIN_CURVES: u32 = 16;
+pub(crate) const BAND_MIN_CURVES: u32 = 16;
 /// A band's interval is widened by this fraction of a band's height before
 /// curve overlap is tested. Control-point ranges already bound the curve, so
 /// the test is conservative; the slack only has to cover fp disagreement
 /// between these boundaries and the shader's interpolated band coordinate.
-const BAND_EPSILON: f32 = 0.05;
+pub(crate) const BAND_EPSILON: f32 = 0.05;
 /// Set in the vector instance's `count` field when the glyph's block is
 /// banded. Must match `BANDED_FLAG` in `shaders.wgsl`.
 pub const BANDED_FLAG: u32 = 0x8000_0000;
@@ -422,16 +422,14 @@ impl CurveStore {
         weight: fontdb::Weight,
         flags: CacheKeyFlags,
     ) -> Option<Box<[Command]>> {
-        let (cache_key, _, _) = CacheKey::new(
+        glyph_outline(
+            &mut self.swash,
+            font_system,
             font_id,
             glyph_id,
-            1.0,
-            (0.0, 0.0),
             weight,
-            flags | CacheKeyFlags::DISABLE_HINTING,
-        );
-        self.swash
-            .get_outline_commands_uncached(font_system, cache_key)
+            flags,
+        )
     }
 
     fn extract(
@@ -468,25 +466,8 @@ impl CurveStore {
             None => None,
         };
 
-        // Flattened into scratch buffers first: the band tables go in front of
-        // the records, and the curve count decides whether there are any.
-        let (records, contours, mut bbox) = flatten(&a_commands);
-        let b_records = b_commands.map(|commands| {
-            let (b_records, _, b_bbox) = flatten(&commands);
-            // The quad has to cover every weight the glyph can be drawn at.
-            for i in 0..2 {
-                bbox[i] = bbox[i].min(b_bbox[i]);
-                bbox[2 + i] = bbox[2 + i].max(b_bbox[2 + i]);
-            }
-            b_records
-        });
-        // Same commands in, same records out — this only guards the layout
-        // invariant the shader's fixed A→B stride depends on. The contours are
-        // the same for the same reason, so one packing serves both masters.
-        let b_records = b_records.filter(|b| b.len() == records.len());
-
-        let count = (records.len() / FLOATS_PER_CURVE) as u32;
-        if count == 0 {
+        let built = build_block(&a_commands, b_commands.as_deref(), self.band_min_curves);
+        if built.count == 0 {
             return Extracted::Done(Some(GlyphCurves {
                 first: 0,
                 count: 0,
@@ -499,37 +480,25 @@ impl CurveStore {
                 texels: 0,
             }));
         }
-
-        // A block whose offsets outgrow f16's exact integers keeps the flat
-        // layout, which stores no integers at all.
-        let block = (count > self.band_min_curves)
-            .then(|| banded_block(&records, b_records.as_deref(), &contours, bbox))
-            .flatten();
-        let (block, banded, record_texels) = match block {
-            Some(block) => {
-                let record_texels = shared_texels(count as usize, contours.len());
-                (block, true, record_texels)
-            }
-            None => (
-                flat_block(&records, b_records.as_deref()),
-                false,
-                count * TEXELS_PER_CURVE as u32,
-            ),
-        };
-        let (dual_master, weight_t) = match (&b_records, axis) {
+        let (dual_master, weight_t) = match (&built.b_records, axis) {
             (Some(_), Some((min, max))) => (true, weight_blend(weight, min, max)),
             _ => (false, 0.0),
         };
-        debug_assert_eq!(block.len() % FLOATS_PER_CURVE, 0, "blocks are even texels");
+        debug_assert_eq!(
+            built.block.len() % FLOATS_PER_CURVE,
+            0,
+            "blocks are even texels"
+        );
 
         // Every block is an even number of texels long, so this base is even
         // and no curve record ever straddles a texture row.
         let first = (self.data.len() / FLOATS_PER_TEXEL) as u32;
-        let texels = (block.len() / FLOATS_PER_TEXEL) as u32;
+        let texels = (built.block.len() / FLOATS_PER_TEXEL) as u32;
         // Control points were rounded to f16 as they were flattened, so this
         // conversion is exact for them; the integers the band tables carry are
         // exact by construction (see F16_EXACT_INT).
-        self.data.extend(block.iter().map(|&v| f16::from_f32(v)));
+        self.data
+            .extend(built.block.iter().map(|&v| f16::from_f32(v)));
         let used = self.data.len() / FLOATS_PER_TEXEL;
         if used > self.capacity() && !self.grow_to_fit(used) {
             self.data.truncate(first as usize * FLOATS_PER_TEXEL);
@@ -537,13 +506,13 @@ impl CurveStore {
         }
         Extracted::Done(Some(GlyphCurves {
             first,
-            count,
-            bbox,
-            banded,
-            clips: corner_clips(&records, b_records.as_deref(), bbox),
+            count: built.count,
+            bbox: built.bbox,
+            banded: built.banded,
+            clips: built.clips,
             dual_master,
             weight_t,
-            record_texels,
+            record_texels: built.record_texels,
             texels,
         }))
     }
@@ -678,7 +647,7 @@ impl CurveStore {
 /// The `wght` variation axis of a face, in user units (min, max). `None` for a
 /// static face — or one whose axis is a single point — which keeps the
 /// single-master path and the `b_first == 0` fast path in the shader.
-fn wght_axis(
+pub(crate) fn wght_axis(
     font_system: &mut FontSystem,
     font_id: fontdb::ID,
     weight: fontdb::Weight,
@@ -692,21 +661,21 @@ fn wght_axis(
 /// The `Weight` that pins the `wght` axis to `value`; cosmic-text clamps the
 /// weight into the axis range when it builds the scaler, so the ends land
 /// exactly on the masters.
-fn axis_weight(value: f32) -> fontdb::Weight {
+pub(crate) fn axis_weight(value: f32) -> fontdb::Weight {
     fontdb::Weight(value.clamp(0.0, u16::MAX as f32) as u16)
 }
 
 /// Where a shaped weight falls on the `min..max` axis: 0 at the minimum,
 /// 1 at the maximum. This is the blend the GPU defaults to, so a glyph looks
 /// like the weight it was shaped with unless a caller overrides it.
-fn weight_blend(weight: fontdb::Weight, min: f32, max: f32) -> f32 {
+pub(crate) fn weight_blend(weight: fontdb::Weight, min: f32, max: f32) -> f32 {
     ((f32::from(weight.0) - min) / (max - min)).clamp(0.0, 1.0)
 }
 
 /// Whether two masters interpolate: same commands, same order. The blend is
 /// per control point, so a differing command sequence would pair up unrelated
 /// points and produce a shape belonging to neither master.
-fn masters_compatible(a: &[Command], b: &[Command]) -> bool {
+pub(crate) fn masters_compatible(a: &[Command], b: &[Command]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b.iter())
@@ -725,13 +694,145 @@ fn warn_incompatible_masters(font_id: fontdb::ID) {
     });
 }
 
+/// A glyph's outline in em units at one point on the `wght` axis. Size 1.0
+/// with hinting off yields pure em coordinates. Shared by
+/// [`CurveStore::extract`] and [`crate::inspect`], so inspection reports the
+/// very commands production flattens.
+pub(crate) fn glyph_outline(
+    swash: &mut SwashCache,
+    font_system: &mut FontSystem,
+    font_id: fontdb::ID,
+    glyph_id: u16,
+    weight: fontdb::Weight,
+    flags: CacheKeyFlags,
+) -> Option<Box<[Command]>> {
+    let (cache_key, _, _) = CacheKey::new(
+        font_id,
+        glyph_id,
+        1.0,
+        (0.0, 0.0),
+        weight,
+        flags | CacheKeyFlags::DISABLE_HINTING,
+    );
+    swash.get_outline_commands_uncached(font_system, cache_key)
+}
+
+/// The pure-CPU half of an extraction: one glyph's masters flattened,
+/// quantized and packed into the texel block the shader will read.
+///
+/// [`CurveStore::extract`] is `build_block` plus allocation; [`crate::inspect`]
+/// calls it directly, which is what guarantees the introspection output is the
+/// production data and not a parallel implementation of it.
+pub(crate) struct BuiltBlock {
+    /// Master A's flat quadratic records (8 f32 lanes per curve, f16-rounded).
+    pub(crate) records: Vec<f32>,
+    /// Master B's records, when the face is variable and the masters are
+    /// point-compatible. Same length as `records`.
+    pub(crate) b_records: Option<Vec<f32>>,
+    /// Curves per contour, in emission order.
+    pub(crate) contours: Vec<u32>,
+    /// Em-space bounds over both masters.
+    pub(crate) bbox: [f32; 4],
+    /// Quadratics per master.
+    pub(crate) count: u32,
+    /// Whether `block` starts with band tables.
+    pub(crate) banded: bool,
+    /// Texels one master's records occupy (also the A→B stride).
+    pub(crate) record_texels: u32,
+    /// Corner clip legs, in em (see [`corner_clips`]).
+    pub(crate) clips: [f32; 4],
+    /// The packed block, as f32 lanes about to be rounded to f16 (every value
+    /// already survives that rounding exactly — coordinates were quantized in
+    /// the flattener and the integers are under [`F16_EXACT_INT`]).
+    pub(crate) block: Vec<f32>,
+}
+
+/// Flatten both masters and pack them into a block. This is the whole of what
+/// extraction computes per glyph; only where the block lands in the texture is
+/// decided elsewhere.
+pub(crate) fn build_block(
+    a_commands: &[Command],
+    b_commands: Option<&[Command]>,
+    band_min_curves: u32,
+) -> BuiltBlock {
+    // Flattened into scratch buffers first: the band tables go in front of
+    // the records, and the curve count decides whether there are any.
+    let (records, contours, mut bbox) = flatten(a_commands);
+    let b_records = b_commands.map(|commands| {
+        let (b_records, _, b_bbox) = flatten(commands);
+        // The quad has to cover every weight the glyph can be drawn at.
+        for i in 0..2 {
+            bbox[i] = bbox[i].min(b_bbox[i]);
+            bbox[2 + i] = bbox[2 + i].max(b_bbox[2 + i]);
+        }
+        b_records
+    });
+    // Same commands in, same records out — this only guards the layout
+    // invariant the shader's fixed A→B stride depends on. The contours are
+    // the same for the same reason, so one packing serves both masters.
+    let b_records = b_records.filter(|b| b.len() == records.len());
+
+    let count = (records.len() / FLOATS_PER_CURVE) as u32;
+    if count == 0 {
+        return BuiltBlock {
+            records,
+            b_records,
+            contours,
+            bbox: [0.0; 4],
+            count: 0,
+            banded: false,
+            record_texels: 0,
+            clips: [0.0; 4],
+            block: Vec::new(),
+        };
+    }
+
+    // A block whose offsets outgrow f16's exact integers keeps the flat
+    // layout, which stores no integers at all.
+    let block = (count > band_min_curves)
+        .then(|| banded_block(&records, b_records.as_deref(), &contours, bbox))
+        .flatten();
+    let (block, banded, record_texels) = match block {
+        Some(block) => {
+            let record_texels = shared_texels(count as usize, contours.len());
+            (block, true, record_texels)
+        }
+        None => (
+            flat_block(&records, b_records.as_deref()),
+            false,
+            count * TEXELS_PER_CURVE as u32,
+        ),
+    };
+    let clips = corner_clips(&records, b_records.as_deref(), bbox);
+    BuiltBlock {
+        records,
+        b_records,
+        contours,
+        bbox,
+        count,
+        banded,
+        record_texels,
+        clips,
+        block,
+    }
+}
+
 /// Flatten one master's path into padded quadratic records, with the curve
 /// count of each contour (in emission order) and the bbox. The contours are
 /// what endpoint sharing packs against: within one, the next record's p0 *is*
 /// this record's p2.
 fn flatten(commands: &[Command]) -> (Vec<f32>, Vec<u32>, [f32; 4]) {
+    flatten_with(commands, true)
+}
+
+/// [`flatten`] with the f16 rounding switchable off, which is how
+/// [`crate::inspect`] reports the pre-quantization control points a delta can
+/// be measured against. Production always rounds (`quantize == true`); the
+/// two runs emit the same curves in the same order either way, so records
+/// pair up index for index.
+pub(crate) fn flatten_with(commands: &[Command], quantize: bool) -> (Vec<f32>, Vec<u32>, [f32; 4]) {
     let mut records = Vec::new();
-    let mut flat = Flattener::new(&mut records);
+    let mut flat = Flattener::new(&mut records, quantize);
     for command in commands {
         match *command {
             Command::MoveTo(p) => flat.move_to([p.x, p.y]),
@@ -875,7 +976,7 @@ fn corner_clips(records: &[f32], b_records: Option<&[f32]>, bbox: [f32; 4]) -> [
 /// A blended control point is a lerp of the two masters' and so never leaves
 /// their per-coordinate hull: one span bounds the glyph at every `weight_t`.
 /// Both band membership and the early-out sort keys ride on that.
-fn spans(records: &[f32], b_records: Option<&[f32]>, axis: usize) -> Vec<(f32, f32)> {
+pub(crate) fn spans(records: &[f32], b_records: Option<&[f32]>, axis: usize) -> Vec<(f32, f32)> {
     records
         .chunks_exact(FLOATS_PER_CURVE)
         .enumerate()
@@ -925,18 +1026,18 @@ fn band_lists(
 
 /// One band's membership, ordered for both ray directions, plus the
 /// coordinate that decides which direction a sample fires in.
-struct Band {
+pub(crate) struct Band {
     /// Members ordered by *decreasing* maximum coordinate along the ray axis.
     /// A ray fired in the +axis direction meets them far end first, so the
     /// first curve whose maximum has dropped behind the sample's antialiasing
     /// window ends the loop: every curve after it is further behind still.
-    descending: Vec<u32>,
+    pub(crate) descending: Vec<u32>,
     /// The same members ordered by *increasing* minimum coordinate, for the
     /// rays the median split fires in the -axis direction.
-    ascending: Vec<u32>,
+    pub(crate) ascending: Vec<u32>,
     /// Median of the members' ray-axis midpoints; samples past it fire
     /// backwards.
-    split: f32,
+    pub(crate) split: f32,
 }
 
 /// The bands along one axis of `[min, max]`, with each band's list sorted for
@@ -947,7 +1048,13 @@ struct Band {
 /// two-master extreme, and the blended outline can only sit inside it. Sorting
 /// on master A alone would let a blend toward B put a curve that still crosses
 /// the ray behind the curve that ends the loop.
-fn bands(records: &[f32], b_records: Option<&[f32]>, axis: usize, min: f32, max: f32) -> Vec<Band> {
+pub(crate) fn bands(
+    records: &[f32],
+    b_records: Option<&[f32]>,
+    axis: usize,
+    min: f32,
+    max: f32,
+) -> Vec<Band> {
     // Rays run across the banding axis: y-bands are crossed by horizontal
     // rays, x-bands by vertical ones.
     let spans = spans(records, b_records, 1 - axis);
@@ -1131,10 +1238,13 @@ struct Flattener<'a> {
     contours: Vec<u32>,
     /// Curves pushed since the last contour ended.
     in_contour: u32,
+    /// Whether control points are rounded to f16 on the way in. Always true in
+    /// production; [`flatten_with`] turns it off for inspection only.
+    quantize: bool,
 }
 
 impl<'a> Flattener<'a> {
-    fn new(out: &'a mut Vec<f32>) -> Self {
+    fn new(out: &'a mut Vec<f32>, quantize: bool) -> Self {
         Self {
             out,
             start: [0.0; 2],
@@ -1143,6 +1253,7 @@ impl<'a> Flattener<'a> {
             bbox: [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
             contours: Vec::new(),
             in_contour: 0,
+            quantize,
         }
     }
 
@@ -1152,7 +1263,11 @@ impl<'a> Flattener<'a> {
     /// value, so a point carried from one record's p2 to the next record's p0
     /// rounds to the same number in both, and endpoint sharing stays exact.
     fn push(&mut self, p0: [f32; 2], p1: [f32; 2], p2: [f32; 2]) {
-        let points = [p0, p1, p2].map(|p| [quantize(p[0]), quantize(p[1])]);
+        let points = if self.quantize {
+            [p0, p1, p2].map(|p| [quantize(p[0]), quantize(p[1])])
+        } else {
+            [p0, p1, p2]
+        };
         for p in points {
             self.bbox[0] = self.bbox[0].min(p[0]);
             self.bbox[1] = self.bbox[1].min(p[1]);
@@ -2306,7 +2421,7 @@ mod tests {
     #[test]
     fn lines_become_degenerate_quads_and_contours_close() {
         let mut data = Vec::new();
-        let mut f = Flattener::new(&mut data);
+        let mut f = Flattener::new(&mut data, true);
         f.move_to([0.0, 0.0]);
         f.line_to([1.0, 0.0]);
         f.line_to([1.0, 1.0]);
@@ -2325,7 +2440,7 @@ mod tests {
     #[test]
     fn unterminated_contour_is_closed_by_move_to() {
         let mut data = Vec::new();
-        let mut f = Flattener::new(&mut data);
+        let mut f = Flattener::new(&mut data, true);
         f.move_to([0.0, 0.0]);
         f.line_to([1.0, 0.0]);
         f.move_to([5.0, 5.0]); // implicit close of the open contour
@@ -2340,7 +2455,7 @@ mod tests {
     #[test]
     fn cubic_splits_into_four_quads_hitting_endpoints() {
         let mut data = Vec::new();
-        let mut f = Flattener::new(&mut data);
+        let mut f = Flattener::new(&mut data, true);
         f.move_to([0.0, 0.0]);
         f.cubic_to([0.0, 1.0], [1.0, 1.0], [1.0, 0.0]);
 
