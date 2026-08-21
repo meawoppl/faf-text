@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How faf-text works</title>
+<meta name="description" content="How a GPU text renderer draws glyph outlines per pixel: the winding rule in a fragment shader, band tables, f16 quantization, corner clipping, variable weight and COLR emoji — with live figures driven by the renderer's real data.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231a1b26'/%3E%3Ctext x='8' y='12' font-size='11' font-family='monospace' fill='%237aa2f7' text-anchor='middle'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header class="hiw-header">
+    <nav class="hiw-nav">
+      <a href="https://meawoppl.github.io/faf-text/">faf-text</a>
+      <a href="https://meawoppl.github.io/faf-text/demo/">Live demo</a>
+      <a href="https://docs.rs/faf-text">docs.rs</a>
+      <a href="https://github.com/meawoppl/faf-text">Source</a>
+    </nav>
+    <p class="hiw-kicker">faf-text</p>
+    <h1>How it works</h1>
+    <p class="hiw-lede">Every glyph on this page is a set of quadratic Bézier
+    curves living in a GPU texture, and every pixel of every glyph decides
+    inside-or-outside for itself, per frame, in a fragment shader. No atlas
+    for outlines, no signed-distance bake, no MSAA. That one decision — made
+    robust at exact edges, made fast with band tables and early-outs, made
+    cheap to feed with a retained scene — <em>is</em> the renderer, and this
+    page walks it end to end: from the bytes of a font file, through the
+    winding rule and its failure modes, to the memory layout, the geometry
+    around the glyphs, variable weight and color emoji, and finally 3D panes,
+    the terminal grid, and the benchmark scorecard.</p>
+    <p class="hiw-lede">Nothing here is an artist's impression. Every figure
+    draws the renderer's <em>actual</em> data, pulled through
+    <code>faf_text::inspect</code> — the same flattener, band builder and
+    clip solver that feed the GPU — and every live cell is the real renderer
+    compiled to WebAssembly, running on WebGPU where the browser has it and
+    on WebGL2 where it does not. Sections boot their figures as you reach
+    them; the prose needs no GPU at all.</p>
+  </header>
+
+  <nav class="hiw-toc" id="toc" hidden>
+    <h2>Contents</h2>
+    <ol id="toc-list"></ol>
+  </nav>
+
+  <div id="sections"></div>
+
+  <footer class="hiw-footer">
+    <p><strong>Further reading.</strong> The sign-class winding test and the
+    band-table idea descend from Eric&nbsp;Lengyel,
+    <a href="https://jcgt.org/published/0006/02/02/">&ldquo;GPU-Centered Font
+    Rendering Directly from Glyph Outlines&rdquo;</a>, <em>Journal of Computer
+    Graphics Techniques</em> vol.&nbsp;6 no.&nbsp;2 (2017) — the sections
+    above spell out where faf-text follows the paper and where it diverges.
+    The renderer itself is the
+    <a href="https://crates.io/crates/faf-text"><code>faf-text</code></a>
+    crate (<a href="https://docs.rs/faf-text">API docs</a>, with live cells of
+    their own); the measurements quoted on this page have their full history
+    in the <a href="https://github.com/meawoppl/faf-text/issues">issue
+    tracker</a>.</p>
+    <p>Figures are generated from the renderer's own extraction code via
+    <code>faf_text::inspect</code>; nothing on this page is an artist's
+    impression.</p>
+    <p>
+      <a href="https://meawoppl.github.io/faf-text/">Landing page</a> ·
+      <a href="https://meawoppl.github.io/faf-text/demo/">Live demo</a> ·
+      <a href="https://docs.rs/faf-text">docs.rs</a> ·
+      <a href="https://github.com/meawoppl/faf-text">Source</a>
+    </p>
+  </footer>
+</main>
+
+<script type="module">
+  // Section manifest, in reading order. Prose for every section is injected
+  // immediately (find-in-page and anchors work from first paint); figures
+  // mount lazily as their section approaches the viewport, so the page never
+  // boots eight wasm canvases at once.
+  const SECTIONS = [
+    "01-from-font-to-curves.js",
+    "02-the-winding-rule.js",
+    "03-exact-at-the-edges.js",
+    "04-finding-curves-fast.js",
+    "05-memory-and-caching.js",
+    "06-geometry-and-damage.js",
+    "07-weight-color-and-text.js",
+    "08-third-dimension-and-speed.js",
+  ];
+
+  import * as fig from "./lib/figure.js";
+  import * as renderer from "./lib/renderer.js";
+
+  const main = document.getElementById("sections");
+  const toc = document.getElementById("toc");
+  const tocList = document.getElementById("toc-list");
+
+  // One ctx for every section: wasm plumbing, the inspector, and the figure
+  // toolkit. See CONTRACT.md for the full API reference.
+  const ctx = {
+    pkgUrl: null, // set once the wasm bundle resolves
+    fig,
+    palette: fig.PALETTE,
+    loadWasm: renderer.loadWasm,
+    attachDemo: renderer.attachDemo,
+    animate: renderer.animate,
+    inspect: renderer.inspect,
+    listFamilies: renderer.listFamilies,
+  };
+
+  // Start resolving the wasm bundle immediately, but never block prose on
+  // it. A failure is survivable: prose still renders, figures degrade to
+  // per-section banners.
+  const wasmReady = renderer
+    .loadWasm()
+    .then(({ pkgUrl }) => {
+      ctx.pkgUrl = pkgUrl;
+    })
+    .catch((e) => {
+      console.warn(e);
+      main.before(
+        fig.el(
+          "p",
+          { class: "hiw-banner" },
+          "The wasm bundle is missing, so live figures are disabled. " +
+            "Build it with wasm-pack (see CONTRACT.md) and reload.",
+        ),
+      );
+    });
+
+  // Mounts run one at a time (a queue, not a gate): two sections attaching
+  // GPU canvases concurrently is legal but pointlessly contended.
+  let mountQueue = Promise.resolve();
+  const pending = new Map(); // section root -> { section, num }
+
+  async function mountSection(root) {
+    const { section, num } = pending.get(root);
+    pending.delete(root);
+    try {
+      await wasmReady;
+      if (section.mount) await section.mount(root, ctx);
+      // Figure numbering happens here, after mount, so every figure the
+      // section built exists. Labels are separate elements (not caption
+      // prefixes) because some figures rebuild their captions on
+      // interaction.
+      root.querySelectorAll(".hiw-figure").forEach((f, i) => {
+        f.prepend(fig.el("p", { class: "hiw-figlabel" }, `Figure ${num}.${i + 1}`));
+      });
+    } catch (e) {
+      console.error(`section ${section.slug} failed:`, e);
+      root.append(
+        fig.el(
+          "p",
+          { class: "hiw-banner" },
+          `This section's figures failed to load: ${e.message ?? e}`,
+        ),
+      );
+    }
+  }
+
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting || !pending.has(en.target)) continue;
+        io.unobserve(en.target);
+        const root = en.target;
+        mountQueue = mountQueue.then(() => mountSection(root));
+      }
+    },
+    // Generous lead so figures are usually ready before they scroll in.
+    { rootMargin: "900px 0px" },
+  );
+
+  const only = new URLSearchParams(location.search).get("section");
+  const files = only ? [only.endsWith(".js") ? only : `${only}.js`] : SECTIONS;
+
+  const roots = [];
+  const tocLinks = new Map(); // slug -> <a>
+
+  for (const file of files) {
+    try {
+      const section = (await import(`./sections/${file}`)).default;
+      const num = parseInt(file, 10) || roots.length + 1;
+      const root = fig.el("section", { class: "hiw-section", id: section.slug });
+      root.innerHTML = `<h2><a href="#${section.slug}">${section.title}</a></h2>${section.html}`;
+      main.append(root);
+      roots.push(root);
+      toc.hidden = false;
+      const link = fig.el("a", { href: `#${section.slug}` }, section.title);
+      tocLinks.set(section.slug, link);
+      tocList.append(fig.el("li", {}, link));
+      pending.set(root, { section, num });
+      io.observe(root);
+    } catch (e) {
+      console.error(`section ${file} failed:`, e);
+      main.append(
+        fig.el("p", { class: "hiw-banner" }, `Section ${file} failed to load: ${e.message ?? e}`),
+      );
+    }
+  }
+
+  // If the URL carries an anchor, honor it once the prose exists (the
+  // browser's own attempt fired before injection).
+  if (location.hash) {
+    document.querySelector(location.hash.replace(/[^#\w-]/g, ""))?.scrollIntoView();
+  }
+
+  // Scroll-position highlighting: the active section is the last one whose
+  // top has passed the reading line. Cheap enough at eight sections to run
+  // on raw scroll events.
+  const spy = () => {
+    let current = null;
+    for (const root of roots) {
+      if (root.getBoundingClientRect().top <= 140) current = root.id;
+    }
+    for (const [slug, link] of tocLinks) {
+      link.classList.toggle("active", slug === current);
+    }
+  };
+  addEventListener("scroll", spy, { passive: true });
+  addEventListener("resize", spy, { passive: true });
+  spy();
+</script>
+</body>
+</html>

@@ -67,6 +67,13 @@ fi
 echo "==> copying docs-loader.js"
 cp "$root/web/docs-loader.js" "$site/docs-loader.js"
 
+# 3b. The how-it-works explainer. Static files only; its wasm imports resolve
+#     to the demo bundle copied above (lib/renderer.js tries ../pkg/ first for
+#     local serving, then ../demo/pkg/ — the deployed layout).
+echo "==> copying how-it-works"
+rm -rf "$site/how-it-works"
+cp -r "$root/web/how-it-works" "$site/how-it-works"
+
 # 4. Landing page.
 echo "==> writing index.html"
 cat >"$site/index.html" <<'HTML'
@@ -107,6 +114,11 @@ cat >"$site/index.html" <<'HTML'
   .links a:hover { border-color: #7aa2f7; color: #7aa2f7; }
   .links a.primary { background: #7aa2f7; border-color: #7aa2f7; color: #15161e; }
   .links a.primary:hover { background: #9ab4f9; border-color: #9ab4f9; color: #15161e; }
+  .card { display: block; margin: 24px 0 0; padding: 18px 22px; border-radius: 10px;
+          background: #1a1b26; border: 1px solid #2a2c3a; text-decoration: none; }
+  .card:hover { border-color: #7aa2f7; }
+  .card strong { color: #7aa2f7; font-size: 17px; }
+  .card p { color: #a9b1d6; margin: 8px 0 0; font-size: 15px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
   figure { margin: 0; }
   figcaption { color: #565f89; font-size: 14px; margin-top: 8px; }
@@ -131,11 +143,21 @@ cat >"$site/index.html" <<'HTML'
 
   <ul class="links">
     <li><a class="primary" href="demo/">Live demo</a></li>
+    <li><a href="how-it-works/">How it works</a></li>
     <li><a href="https://docs.rs/faf-text">Documentation</a></li>
     <li><a href="https://github.com/meawoppl/faf-text">Source</a></li>
   </ul>
   <p><small style="color:#565f89">The demo needs WebGPU or WebGL2; it is
   editable — click the text and type.</small></p>
+
+  <a class="card" href="how-it-works/">
+    <strong>How it works — the full explainer</strong>
+    <p>Eight sections, from the bytes of a font file to the fragment shader's
+    winding loop, band tables, f16 texels, corner clipping, variable weight,
+    COLR emoji, 3D panes and the benchmark scorecard. Every figure is drawn
+    from the renderer's real data, and the live cells are the renderer itself
+    running in your browser.</p>
+  </a>
 
   <h2>What it does</h2>
   <div class="grid">
