@@ -136,6 +136,21 @@ export class FafTextDemo {
     text(): string;
 }
 
+/**
+ * Inspect one character of one family at one weight, as a JSON string.
+ *
+ * The schema is documented in `web/how-it-works/CONTRACT.md`; the data is
+ * [`faf_text::inspect::character`]'s, produced by the production extraction
+ * code paths. Returns the string `"null"` when the family is unknown or the
+ * face has no glyph for the character.
+ */
+export function inspect_glyph(ch: string, family: string, weight: number): string;
+
+/**
+ * The family names inspection can resolve, as a JSON array of strings.
+ */
+export function list_families(): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -166,6 +181,8 @@ export interface InitOutput {
     readonly faftextdemo_set_weight_blend: (a: number, b: number) => void;
     readonly faftextdemo_terminal: (a: number) => number;
     readonly faftextdemo_text: (a: number) => [number, number];
+    readonly inspect_glyph: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly list_families: () => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6eb6ae39273879d5: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h2cdb68df6893a714_2: (a: number, b: number, c: any) => [number, number];

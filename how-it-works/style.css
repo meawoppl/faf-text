@@ -1,0 +1,285 @@
+/* How-it-works page styles — Tokyo Night, shared by index.html and every
+ * section. Class names here are the interface section authors write against;
+ * see CONTRACT.md before renaming anything. */
+
+:root {
+  color-scheme: dark;
+  --bg: #1a1b26;
+  --bg-dark: #15161e;
+  --bg-raised: #1f2130;
+  --border: #2a2c3a;
+  --text: #c0caf5;
+  --text-dim: #a9b1d6;
+  --muted: #565f89;
+  --blue: #7aa2f7;
+  --green: #9ece6a;
+  --red: #f7768e;
+  --orange: #e0af68;
+  --purple: #bb9af7;
+  --teal: #7dcfff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg-dark);
+  color: var(--text);
+  font: 17px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 48px 24px 96px;
+}
+
+/* --- Compact header nav --- */
+
+.hiw-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  font-size: 14px;
+  margin: 0 0 32px;
+}
+
+.hiw-nav a { color: var(--muted); text-decoration: none; font-weight: 600; }
+.hiw-nav a:hover { color: var(--teal); }
+.hiw-nav a:first-child { color: var(--text-dim); }
+
+/* --- Title block --- */
+
+.hiw-header h1 {
+  font-size: 34px;
+  line-height: 1.2;
+  margin: 0 0 8px;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.hiw-header .hiw-kicker {
+  font-size: 14px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+.hiw-header .hiw-lede {
+  font-size: 19px;
+  color: var(--text-dim);
+  margin: 0 0 12px;
+}
+
+/* --- Table of contents --- */
+
+.hiw-toc {
+  margin: 32px 0 8px;
+  padding: 16px 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.hiw-toc h2 {
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.hiw-toc ol {
+  margin: 0;
+  padding-left: 22px;
+  color: var(--text-dim);
+}
+
+.hiw-toc a { color: var(--teal); text-decoration: none; }
+.hiw-toc a:hover { text-decoration: underline; }
+.hiw-toc a.active { color: var(--blue); font-weight: 600; }
+
+/* Wide screens: the TOC leaves the flow and rides along as a sidebar. The
+ * breakpoint keeps it clear of the 860px column at 50% ± 430px. */
+@media (min-width: 1380px) {
+  .hiw-toc {
+    position: fixed;
+    top: 28px;
+    left: calc(50% - 680px);
+    width: 224px;
+    margin: 0;
+    max-height: calc(100vh - 56px);
+    overflow-y: auto;
+    font-size: 14px;
+  }
+  .hiw-toc li { margin-bottom: 4px; }
+}
+
+/* --- Sections --- */
+
+.hiw-section { margin-top: 56px; }
+
+.hiw-section h2 {
+  font-size: 25px;
+  color: var(--blue);
+  margin: 0 0 16px;
+  font-weight: 650;
+}
+
+.hiw-section h2 a { color: inherit; text-decoration: none; }
+.hiw-section h2 a:hover::after { content: " #"; color: var(--muted); }
+
+.hiw-section h3 {
+  font-size: 19px;
+  color: var(--purple);
+  margin: 28px 0 10px;
+  font-weight: 600;
+}
+
+.hiw-section p { color: var(--text-dim); margin: 0 0 14px; }
+.hiw-section p strong { color: var(--text); }
+.hiw-section a { color: var(--teal); }
+.hiw-section ul, .hiw-section ol { color: var(--text-dim); padding-left: 24px; }
+.hiw-section li { margin-bottom: 6px; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  color: var(--green);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+}
+
+pre code { border: none; background: none; padding: 0; color: var(--text-dim); }
+
+/* --- Figures --- */
+
+.hiw-figure {
+  margin: 24px 0;
+  padding: 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.hiw-figure svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+
+/* Figure numbers ("Figure 4.2") are injected by index.html after a section
+ * mounts, as their own element so dynamically rebuilt captions keep them. */
+.hiw-figlabel {
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.hiw-caption {
+  color: var(--muted);
+  font-size: 14.5px;
+  line-height: 1.5;
+  margin: 12px 0 0;
+  text-align: center;
+}
+
+/* Live renderer canvases. Height comes from the attachDemo options. */
+.hiw-canvas {
+  display: block;
+  width: 100%;
+  border-radius: 6px;
+  background: var(--bg-dark);
+  touch-action: none;
+}
+
+/* --- Controls (sliders, toggles) --- */
+
+.hiw-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  align-items: center;
+  margin: 14px 0 0;
+}
+
+.hiw-slider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: 14.5px;
+}
+
+.hiw-slider label { color: var(--muted); white-space: nowrap; }
+
+.hiw-slider input[type="range"] {
+  accent-color: var(--blue);
+  width: 180px;
+}
+
+.hiw-slider output {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  color: var(--orange);
+  min-width: 5ch;
+  text-align: right;
+}
+
+/* --- Collapsible "the gory details" blocks --- */
+
+.hiw-details {
+  margin: 18px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.hiw-details > summary {
+  cursor: pointer;
+  padding: 10px 16px;
+  color: var(--orange);
+  font-weight: 600;
+  font-size: 15px;
+  list-style-position: inside;
+}
+
+.hiw-details > summary:hover { color: var(--text); }
+
+.hiw-details > .hiw-details-body { padding: 4px 16px 14px; }
+.hiw-details > .hiw-details-body > p { color: var(--text-dim); margin: 0 0 12px; }
+
+/* --- Status banner (wasm failed to load, etc.) --- */
+
+.hiw-banner {
+  margin: 24px 0;
+  padding: 12px 16px;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  color: var(--red);
+  background: var(--bg);
+}
+
+/* --- Footer --- */
+
+.hiw-footer {
+  color: var(--muted);
+  font-size: 14.5px;
+  margin-top: 72px;
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+}
+
+.hiw-footer a { color: var(--teal); }

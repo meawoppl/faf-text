@@ -1,7 +1,7 @@
 {
   "name": "faf-text-web",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "files": [
     "faf_text_web_bg.wasm",
     "faf_text_web.js",
